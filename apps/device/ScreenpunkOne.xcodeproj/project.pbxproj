@@ -1,0 +1,57 @@
+// !$*UTF8*$!
+{archiveVersion = 1; classes = {}; objectVersion = 56; objects = {
+A44D00000000000000000001 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "NewRequestRoutePolicy.swift"; sourceTree = "<group>"; };
+A44D00000000000000000002 = { isa = PBXBuildFile; fileRef = A44D00000000000000000001; };
+A33D00000000000000000001 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "LocalComputerDiscovery.swift"; sourceTree = "<group>"; };
+A33D00000000000000000002 = { isa = PBXBuildFile; fileRef = A33D00000000000000000001; };
+A22D00000000000000000001 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "LocalAgentSettingsModel.swift"; sourceTree = "<group>"; };
+A22D00000000000000000011 = { isa = PBXBuildFile; fileRef = A22D00000000000000000001; };
+A22D00000000000000000002 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "LocalAgentSetupView.swift"; sourceTree = "<group>"; };
+A22D00000000000000000012 = { isa = PBXBuildFile; fileRef = A22D00000000000000000002; };
+A22D00000000000000000003 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "LocalAgentMacSetup.swift"; sourceTree = "<group>"; };
+A22D00000000000000000013 = { isa = PBXBuildFile; fileRef = A22D00000000000000000003; };
+A22D00000000000000000022 = { isa = XCLocalSwiftPackageReference; relativePath = "../../packages/ScreenpunkLocalAuthoring"; };
+A22D00000000000000000032 = { isa = XCSwiftPackageProductDependency; productName = ScreenpunkLocalAuthoring; };
+A22D00000000000000000042 = { isa = PBXBuildFile; productRef = A22D00000000000000000032; };
+A22D00000000000000000023 = { isa = XCLocalSwiftPackageReference; relativePath = "../../packages/ScreenpunkLocalTransport"; };
+A22D00000000000000000033 = { isa = XCSwiftPackageProductDependency; productName = ScreenpunkLocalTransport; };
+A22D00000000000000000043 = { isa = PBXBuildFile; productRef = A22D00000000000000000033; };
+A11D00000000000000000001 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DeviceAuthoringTypes.swift"; sourceTree = "<group>"; };
+A11D00000000000000000002 = { isa = PBXBuildFile; fileRef = A11D00000000000000000001; };
+0B0D40ACF3C34F43953C35E1 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DeviceDisplaySettings.swift"; sourceTree = "<group>"; };
+C0438766B04444A8909A429B = { isa = PBXBuildFile; fileRef = 0B0D40ACF3C34F43953C35E1; };
+AA990D6B995B342F558BF9A8 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ScreenLibrary.swift"; sourceTree = "<group>"; };
+FBD35AAA78F68568BE28B9EC = { isa = PBXBuildFile; fileRef = AA990D6B995B342F558BF9A8; };
+ACCD6627EBE68502AD43A789 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DeviceModel.swift"; sourceTree = "<group>"; };
+3AB1FDBFDF516489849DC4FB = { isa = PBXBuildFile; fileRef = ACCD6627EBE68502AD43A789; };
+00C5AECB934C56331887087B = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "CloudClient.swift"; sourceTree = "<group>"; };
+A7A95FA9A8ACD70FBF6213D2 = { isa = PBXBuildFile; fileRef = 00C5AECB934C56331887087B; };
+0737DD43FF4F67C22B2C68F0 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SpeechCapture.swift"; sourceTree = "<group>"; };
+FD13F2B59891ADD6EF1BE760 = { isa = PBXBuildFile; fileRef = 0737DD43FF4F67C22B2C68F0; };
+A2A8D61402BC6F16F8925433 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ScreenpunkApp.swift"; sourceTree = "<group>"; };
+8EAA95F0DEF9DCCBC3446876 = { isa = PBXBuildFile; fileRef = A2A8D61402BC6F16F8925433; };
+5319FC568781152B2330471B = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DeviceGestures.swift"; sourceTree = "<group>"; };
+6CA426ED61925A8A8F56959C = { isa = PBXBuildFile; fileRef = 5319FC568781152B2330471B; };
+38A007151ABE87CC01A5B6E9 = { isa = PBXFileReference; explicitFileType = wrapper.application; path = ScreenpunkOne.app; sourceTree = BUILT_PRODUCTS_DIR; };
+BCE16DD0260827ECF338C787 = { isa = PBXGroup; path = Sources; sourceTree = "<group>"; children = (A44D00000000000000000001,A33D00000000000000000001,A22D00000000000000000003,A22D00000000000000000002,A22D00000000000000000001,A11D00000000000000000001,0B0D40ACF3C34F43953C35E1,AA990D6B995B342F558BF9A8,ACCD6627EBE68502AD43A789,00C5AECB934C56331887087B,0737DD43FF4F67C22B2C68F0,A2A8D61402BC6F16F8925433,5319FC568781152B2330471B); };
+F8995BA5891B07E328C60D6B = { isa = PBXFileReference; lastKnownFileType = wrapper.icon; path = "../../assets/brand/app-icon/Screenpunk.icon"; sourceTree = SOURCE_ROOT; };
+74C2431FE30C4A47C8443B80 = { isa = PBXBuildFile; fileRef = F8995BA5891B07E328C60D6B; };
+FBDC4F23F93125BBEEAE800C = { isa = PBXGroup; name = Products; sourceTree = "<group>"; children = (38A007151ABE87CC01A5B6E9); };
+B28B7AF69320201D1CF206EB = { isa = PBXGroup; sourceTree = "<group>"; children = (BCE16DD0260827ECF338C787,F8995BA5891B07E328C60D6B,FBDC4F23F93125BBEEAE800C); };
+F4C4D19FFF6FFB098F253F29 = { isa = XCLocalSwiftPackageReference; relativePath = "../../packages/ScreenpunkCore"; };
+70A794B2ECD5B699F3353BC3 = { isa = XCSwiftPackageProductDependency; productName = ScreenpunkCore; };
+1B51742B8E8F74499EEBC1A4 = { isa = PBXBuildFile; productRef = 70A794B2ECD5B699F3353BC3; };
+D5AAD2432C4ACFC14EF994A3 = { isa = XCLocalSwiftPackageReference; relativePath = "../../packages/ScreenpunkApple"; };
+E6B2EEFB7E0A1720828E0A2A = { isa = XCSwiftPackageProductDependency; productName = ScreenpunkApple; };
+733219D3873D48369F23BD60 = { isa = PBXBuildFile; productRef = E6B2EEFB7E0A1720828E0A2A; };
+D3C3E067FC1BBCCEAA4D9313 = { isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A44D00000000000000000002,A33D00000000000000000002,A22D00000000000000000013,A22D00000000000000000012,A22D00000000000000000011,A11D00000000000000000002,C0438766B04444A8909A429B,FBD35AAA78F68568BE28B9EC,3AB1FDBFDF516489849DC4FB,A7A95FA9A8ACD70FBF6213D2,FD13F2B59891ADD6EF1BE760,8EAA95F0DEF9DCCBC3446876,6CA426ED61925A8A8F56959C); runOnlyForDeploymentPostprocessing = 0; };
+0189424A5A60FED329FA868E = { isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (74C2431FE30C4A47C8443B80); runOnlyForDeploymentPostprocessing = 0; };
+7561BFB015D8F536760CB671 = { isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A22D00000000000000000043,A22D00000000000000000042,1B51742B8E8F74499EEBC1A4,733219D3873D48369F23BD60); runOnlyForDeploymentPostprocessing = 0; };
+BD604D99E75E45D38BC7AC8F = { isa = XCBuildConfiguration; name = Debug; buildSettings = {
+ SCREENPUNK_API_ORIGIN = "https://staging.screenpunk.xyz"; PRODUCT_BUNDLE_IDENTIFIER = xyz.screenpunk.ios; PRODUCT_NAME = ScreenpunkOne; SWIFT_VERSION = 5.9; IPHONEOS_DEPLOYMENT_TARGET = 16.0; SDKROOT = iphoneos; TARGETED_DEVICE_FAMILY = "1,2"; CODE_SIGN_STYLE = Automatic; PROVISIONING_PROFILE_SPECIFIER = "$(SCREENPUNK_PROVISIONING_PROFILE)"; DEVELOPMENT_TEAM = 77KASWDGM6; GENERATE_INFOPLIST_FILE = YES; INFOPLIST_FILE = Info.plist; ASSETCATALOG_COMPILER_APPICON_NAME = Screenpunk; INFOPLIST_KEY_CFBundleDisplayName = "Screenpunk One"; INFOPLIST_KEY_UILaunchScreen_Generation = YES; CURRENT_PROJECT_VERSION = 1; MARKETING_VERSION = 0.1.0; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; CLANG_ENABLE_MODULES = YES; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; }; };
+D41F56CEA1AC933D25C57AEB = { isa = XCBuildConfiguration; name = Release; buildSettings = {
+ SCREENPUNK_API_ORIGIN = "https://staging.screenpunk.xyz"; PRODUCT_BUNDLE_IDENTIFIER = xyz.screenpunk.ios; PRODUCT_NAME = ScreenpunkOne; SWIFT_VERSION = 5.9; IPHONEOS_DEPLOYMENT_TARGET = 16.0; SDKROOT = iphoneos; TARGETED_DEVICE_FAMILY = "1,2"; CODE_SIGN_STYLE = Automatic; PROVISIONING_PROFILE_SPECIFIER = "$(SCREENPUNK_PROVISIONING_PROFILE)"; DEVELOPMENT_TEAM = 77KASWDGM6; GENERATE_INFOPLIST_FILE = YES; INFOPLIST_FILE = Info.plist; ASSETCATALOG_COMPILER_APPICON_NAME = Screenpunk; INFOPLIST_KEY_CFBundleDisplayName = "Screenpunk One"; INFOPLIST_KEY_UILaunchScreen_Generation = YES; CURRENT_PROJECT_VERSION = 1; MARKETING_VERSION = 0.1.0; SWIFT_OPTIMIZATION_LEVEL = "-O"; CLANG_ENABLE_MODULES = YES; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; }; };
+5FB66943637FEB59E5652D81 = { isa = XCConfigurationList; buildConfigurations = (BD604D99E75E45D38BC7AC8F,D41F56CEA1AC933D25C57AEB); defaultConfigurationIsVisible = 0; defaultConfigurationName = Debug; };
+0E8A3AD980EC179856012B7E = { isa = PBXNativeTarget; name = ScreenpunkOne; productName = ScreenpunkOne; productReference = 38A007151ABE87CC01A5B6E9; productType = "com.apple.product-type.application"; buildConfigurationList = 5FB66943637FEB59E5652D81; buildPhases = (D3C3E067FC1BBCCEAA4D9313,7561BFB015D8F536760CB671,0189424A5A60FED329FA868E); buildRules = (); dependencies = (); packageProductDependencies = (A22D00000000000000000033,A22D00000000000000000032,70A794B2ECD5B699F3353BC3,E6B2EEFB7E0A1720828E0A2A); };
+98F54143AB4E86B28C3AFEE0 = { isa = PBXProject; attributes = { LastUpgradeCheck = 2600; }; buildConfigurationList = 5FB66943637FEB59E5652D81; compatibilityVersion = "Xcode 14.0"; developmentRegion = en; knownRegions = (en,Base); mainGroup = B28B7AF69320201D1CF206EB; productRefGroup = FBDC4F23F93125BBEEAE800C; projectDirPath = ""; projectRoot = ""; targets = (0E8A3AD980EC179856012B7E); packageReferences = (A22D00000000000000000023,A22D00000000000000000022,F4C4D19FFF6FFB098F253F29,D5AAD2432C4ACFC14EF994A3); };
+}; rootObject = 98F54143AB4E86B28C3AFEE0;}

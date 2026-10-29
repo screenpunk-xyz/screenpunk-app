@@ -1,0 +1,17 @@
+node_modules/
+.wrangler/
+.task/
+.dev.vars*
+.env*
+coverage/
+
+# Native local build and user state
+.build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+.DS_Store
+
+# Developer configuration and generated release artifacts
+config/Local.xcconfig
+.artifacts/

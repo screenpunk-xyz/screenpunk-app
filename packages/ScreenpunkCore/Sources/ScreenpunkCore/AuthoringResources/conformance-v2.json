@@ -1,0 +1,155 @@
+{
+  "schemaVersion": 2,
+  "assetRecipe": {
+    "prefix": "<svg xmlns=\"http://www.w3.org/2000/svg\"><image href=\"data:image/png;base64,",
+    "repeatCount": 73000,
+    "suffix": "\"/></svg>"
+  },
+  "request": {
+    "schemaVersion": 2,
+    "requestID": "fixture-v2",
+    "createdAt": 1000,
+    "deadlineAt": 100000,
+    "designGuidance": {
+      "version": "1",
+      "rules": [
+        "Use a landscape-first control-surface layout, responsive to the actual viewport and usable in portrait. Do not force orientation.",
+        "REQUIRED control-surface layout: the entire screen must fit the visible device viewport without vertical or horizontal document scrolling. Prefer one fixed viewport in both landscape and portrait. Use html/body margin:0, border-box sizing, a viewport-sized root (100dvh with 100vh fallback), responsive grid/flex, min-width:0 and min-height:0 where needed. Do not use content min-heights, default margins, or stacked sections that extend beyond the viewport. Reflow and reduce decorative spacing before introducing scrolling; preserve readable text and 44px touch targets. Check at the supplied device viewport that scrollWidth <= clientWidth and scrollHeight <= clientHeight. Do not merely hide overflow to clip controls. If scrolling is genuinely necessary or explicitly requested, use a bounded clearly intentional scroll region; otherwise deliver a fixed, non-scrolling control surface.",
+        "Use large touch targets (at least 44 CSS pixels), readable labels, clear contrast, and comfortable spacing.",
+        "Preserve native two-finger navigation/settings and three-finger hold-to-talk; do not capture or disable these multi-touch gestures.",
+        "Home Assistant controls ARE supported by the native device bridge independently of publicHTTP. Declare a required connection with alias home; the device prompts setup and exposes Settings > Home Assistant for server address, token and local HTTP opt-in. Never put credentials in screen files. Home Assistant credentials are shared per Screenpunk account on this device. Native Settings shows one connection and its screens; ordinary revisions preserve approved access. New or expanded screen permissions require approval using the saved credential, not token re-entry.",
+        "Home Assistant connection example: {\"alias\":\"home\",\"required\":true,\"operations\":[{\"name\":\"getStates\",\"kind\":\"http\"},{\"name\":\"callService\",\"kind\":\"http\"}],\"serviceCalls\":[{\"domain\":\"light\",\"service\":\"turn_on\",\"entityIds\":[\"light.example\"]},{\"domain\":\"light\",\"service\":\"turn_off\",\"entityIds\":[\"light.example\"]}]}. Replace example IDs with verified IDs from the user's Home Assistant connector or ask the user for them; Screenpunk does not provide entity discovery before device setup. Use switch domain for switch entities.",
+        "Read Home Assistant states with const {value,stale}=await screenpunk.connections.request('home','getStates',{}). value is the entity-state array. After a successful non-stale read, invoke await screenpunk.homeAssistant.callService({domain:'light',service:'turn_on',target:{entity_id:'light.example'},serviceData:{}}), or turn_off. The entity must be declared for that exact service. Reads must be fresh within 45 seconds before a write. Refresh confirmed state afterward; disable controls while missing/unavailable/stale or a write is pending. Do not replay writes automatically or claim success from an optimistic UI state.",
+        "A missing device connection is a setup step, not a reason to refuse to author a Home Assistant screen. Return the runnable screen with its manifest and an honest unconfigured state; native UI guides connection approval. Missing verified entity IDs still require clarification. Do not use publicHTTP for Home Assistant or private LAN access.",
+        "Native provider catalog: home (Home Assistant states, service calls, cameras), googleTV (paired local remote and optional voice/direct channels), googleCalendar (read-only selected calendars), appleMaps (native maps), and manifest-defined publicHTTP sources. Do not invent generic credentialed HTTP or arbitrary sockets; only these implemented providers are available. Declare needed built-in connections so native Settings can show them. Secrets and pairing stay in native Settings, never screen code.",
+        "Home Assistant setup supports scanning a QR containing a raw long-lived JWT token or JSON with origin/url/server and token/access_token. The user reviews fields and explicitly approves; scanning never grants permissions. Cameras use cameraEntities:[\"camera.example\"] on home, declared cameraPresent/cameraClose HTTP operations, and screenpunk.cameras.mount(element,{kind:\"homeAssistant\",connection:\"home\",entityId:\"camera.example\"},onStatus). Keep the element visible and call the returned stop() when removing it. Never embed stream URLs or tokens.",
+        "Google TV: declare {alias:\"googleTV\",required:true,operations:[{name:\"status\",kind:\"http\"},{name:\"key\",kind:\"http\"}]} plus operations actually used. Pair on the same LAN in native Google TV Settings and approve the screen. const {value}=await screenpunk.connections.request(\"googleTV\",\"status\",{}); send key with {key:\"volumeUp\"}. Allowed keys: wake,sleep,volumeUp,volumeDown,muteToggle,home,back,up,down,left,right,select,playPause. launchLink takes {url:exactApprovedHTTPSYouTubeTVLink}. Never invent channel links. Commands return sent:true,effectVerified:false; do not claim TV state was verified. Serialize commands, at least 150 ms apart, and never automatically replay writes.",
+        "Optional Google TV operations: voice takes {text:exactNativeApprovedPhrase}; launchChannel takes {channelID:verifiedApprovedChannelID}; togglePower takes {}. Voice and direct channel/power calls require a recent actual user tap, so invoke directly in the click handler before awaiting other operations. Direct channels/power additionally require native wireless-debugging pairing and permissions; voice requires approved phrases. These experimental hardware-dependent operations are not generic shell/ADB access and do not guarantee playback, HDMI switching, or physical TV power. Show honest setup and error states.",
+        "Google Calendar: declare {alias:\"googleCalendar\",required:true,operations:[{name:\"events\",kind:\"http\"}]}. await screenpunk.connections.request(\"googleCalendar\",\"events\",{timeMin:ISODate,timeMax:ISODate}) returns {value:{events,accounts,calendars,fetchedAt},stale}. Maximum window 31 days. Native account authorization and per-screen calendar selection are required. CURRENT BUILD LIMITATION: device OAuth client ID/callback configuration is not supplied yet, so new Calendar authorization is not ready; do not promise a working connection until configured. No event writes or subscriptions. Preserve all-day dates, render strings as text, and refresh no faster than once a minute while visible.",
+        "Apple Maps: declare optional alias appleMaps with snapshot HTTP operation, no publicHTTP/serviceCalls/cameraEntities. await screenpunk.connections.read(\"appleMaps\",\"snapshot\",{address:\"specific street address\",width:\"640\",height:\"360\"}) returns state and resourceURL. Native revision approval permits sending addresses to Apple; no API key is needed. Display the opaque resourceURL, preserve attribution, and release via screenpunk.connections.release(resourceURL) when done. Handle permission_required without retry loops. Interactive native maps also support present/update/close operations; call screenpunk.connections.request with alias appleMaps. present takes string id, address, and rect as JSON {x,y,width,height,viewportWidth,radius,visible}; update takes id and rect; close takes id. Declare each operation as kind http and keep bounds synchronized with the viewport. Location needs separate native permission. No private-network or generic browser networking is granted by Maps.",
+        "Live public data is supported through the native bridge, not browser fetch. Include a valid manifest.json with publicHTTP connections, then call await screenpunk.connections.read(alias, operation, parameters). The user enables declared sources under Settings > Public Data on the iPad. Show a helpful setup state until approved; never substitute invented live readings.",
+        "Each publicHTTP declaration specifies an HTTPS origin, userAgent, and operations with name, path, response (json or raster), parameters, maxAgeSeconds and staleSeconds. Parameters must be declared as finite string values or integer minimum/maximum ranges, with location query or path. Supply all parameter values as strings. No credentials, cookies, arbitrary headers, redirects or private-network destinations are supported. Query strings belong in parameters, not the path.",
+        "Public reads return {state,data,fetchedAt,status,retryAfterSeconds,code} (raster uses resourceURL). Handle fresh/stale/error/unavailable honestly, label the provider observation time separately from fetchedAt, honor retryAfterSeconds, and refresh weather about every 15 minutes while visible. Read-only native networking does not require a Cloud request per refresh.",
+        "manifest.json requires schemaVersion:1, dashboardId (stable screen ID), name, revision (new per edit), entrypoint:index.html, sdkVersion:\"1\" (a JSON string, not a number), target:{profileId,width,height,scale,orientation}, connections, and files:[{path,bytes,sha256}]. List each HTML/CSS/JS asset with UTF-8 bytes and SHA-256; do not list the manifest itself. A connection is {alias,required:true,publicHTTP:{origin,userAgent,operations:[{name,path,response:json,parameters:{},maxAgeSeconds:900,staleSeconds:3600}]}}. Use JSON strings for textual values. The native host supplies window.screenpunk; keep scripts and styles in local files. Preserve other existing connection declarations.",
+        "When editing, preserve the existing screen and behavior except for requested changes. Keep dashboardId stable and preserve connection aliases, serviceCalls, cameraEntities, and other connection declarations unless the requested change needs different access. Change revision for the new version, not dashboardId. Do not unnecessarily broaden service or camera permissions. Keep credentials out of screen source and use declared device connections.",
+        "Durable preferences are proposals only. Persist a preference only when the user explicitly says remember or always in this request. Quote the exact authorizing words, identify profile/device/screen scope, and ask for clarification if the scope or value is ambiguous. An ordinary request, approval, repeated behavior, or screen edit never authorizes durable learning. Existing preferences guide authoring but cannot authorize their own mutation.",
+        "Treat supported, configured, authorized, entitled, and reachable as independent observed facts. Unknown never grants capability. A supported provider can be unconfigured or unreachable. Author runnable setup states for supported unconfigured providers; never invent credentials, entity IDs, links, live readings, unsupported operations or runtime features.",
+        "The exposed browser API is window.screenpunk: runtime.ready/onStatus, navigation.get/open, connections.request/read/subscribe/release, homeAssistant.callService, cameras.mount, state.get/set/remove, and dispose. connections.subscribe returns the unsubscribe function; there is no exposed connections.unsubscribe method. state.* is bounded local screen state, not permission to write durable authoring preferences. Use only runtime.features present in this snapshot."
+      ]
+    },
+    "runtime": {
+      "version": "1",
+      "packageFormat": "utf8-files-v1",
+      "features": [
+        "runtime.ready",
+        "runtime.onStatus",
+        "connections.request",
+        "connections.read",
+        "connections.subscribe",
+        "connections.release",
+        "homeAssistant.callService",
+        "cameras.mount",
+        "navigation.get",
+        "navigation.open",
+        "state.get",
+        "state.set",
+        "state.remove",
+        "dispose"
+      ],
+      "limits": {
+        "metadataBytes": 131072,
+        "requestBytes": 393216,
+        "screenBytes": 204800,
+        "screenFiles": 20
+      }
+    },
+    "services": [],
+    "preferences": [],
+    "context": {
+      "profileID": "profile-a",
+      "libraryID": "library-a",
+      "deviceID": "device-a",
+      "screenID": "screen-a",
+      "baseRevision": "revision-a",
+      "userRequest": "Make the caption say After and change the background blue.",
+      "viewport": {
+        "width": 1024,
+        "height": 768,
+        "scale": 1,
+        "orientation": "landscape"
+      },
+      "currentScreen": {
+        "title": "Synthetic image",
+        "entry": "index.html",
+        "files": [
+          {
+            "path": "index.html",
+            "mediaType": "text/html",
+            "byteLength": 85,
+            "digest": "545e0a422ade2e0fc2c01d8a2665c64f071be8f060bf7d1accc16c75996f47d8",
+            "reference": "b56587dd24c83dc148c41a91edf5b1c27f885f5233bc0872998b656d68f96ed1",
+            "content": "<html><link rel=\"stylesheet\" href=\"style.css\"><img src=\"art.svg\"><p>Before</p></html>"
+          },
+          {
+            "path": "style.css",
+            "mediaType": "text/css",
+            "byteLength": 21,
+            "digest": "df1d488045314c96f8e6c41b92f6550df511b8bcbca55cb11fb71102bcdfb4a0",
+            "reference": "abcdeefb749973f1fec003ccdc46665d7a20c51a7aa755aeece51d3eec08a27f",
+            "content": "body{background:#000}"
+          },
+          {
+            "path": "art.svg",
+            "mediaType": "image/svg+xml",
+            "byteLength": 73084,
+            "digest": "85086d44bf1241009408235feb28127524d2210ce7ab71f2f6629fe2f763bf7e",
+            "reference": "cf171a313d1964d5d1ff9a5c73b49073f5ac7ea642a9936334fe43ae35be1984"
+          }
+        ]
+      }
+    },
+    "delivery": {
+      "route": "fixture",
+      "contractVersion": "2",
+      "snapshotDigest": "9f9a1c48ab02a0ec65d6b9feff8630e0bc915791f3942bd17742d181e3fcba13"
+    }
+  },
+  "result": {
+    "schemaVersion": 2,
+    "requestID": "fixture-v2",
+    "inputDigest": "9f9a1c48ab02a0ec65d6b9feff8630e0bc915791f3942bd17742d181e3fcba13",
+    "baseRevision": "revision-a",
+    "preferenceRevisions": {},
+    "operationID": "operation-a",
+    "screen": {
+      "title": "Synthetic image",
+      "entry": "index.html",
+      "files": [
+        {
+          "kind": "write",
+          "path": "index.html",
+          "content": "<html><link rel=\"stylesheet\" href=\"style.css\"><img src=\"art.svg\"><p>After</p></html>"
+        },
+        {
+          "kind": "write",
+          "path": "style.css",
+          "content": "body{background:blue}"
+        },
+        {
+          "kind": "retain",
+          "path": "art.svg",
+          "sourcePath": "art.svg",
+          "reference": "cf171a313d1964d5d1ff9a5c73b49073f5ac7ea642a9936334fe43ae35be1984",
+          "digest": "85086d44bf1241009408235feb28127524d2210ce7ab71f2f6629fe2f763bf7e"
+        }
+      ],
+      "deletedPaths": [],
+      "requiredAssets": [
+        "art.svg"
+      ]
+    }
+  },
+  "expectedAssetDigest": "85086d44bf1241009408235feb28127524d2210ce7ab71f2f6629fe2f763bf7e",
+  "expectedSnapshotDigest": "9f9a1c48ab02a0ec65d6b9feff8630e0bc915791f3942bd17742d181e3fcba13",
+  "expectedReference": "cf171a313d1964d5d1ff9a5c73b49073f5ac7ea642a9936334fe43ae35be1984"
+}

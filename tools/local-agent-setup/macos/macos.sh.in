@@ -1,0 +1,324 @@
+#!/bin/sh
+# Screenpunk Mac setup v6. User reviewed, optional per-user background startup. No network upload or installer.
+# Generated self-contained macos.sh; audit source tools/local-agent-setup/macos/.
+set -eu
+umask 077
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+SP_CODEX='/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex'
+SP_OSASCRIPT=/usr/bin/osascript
+SP_LAUNCHCTL=/bin/launchctl
+SP_SUDO=/usr/bin/sudo
+SP_SSHD=/usr/sbin/sshd
+SP_POLICY=/etc/ssh/sshd_config.d/090-screenpunk-local.conf
+SP_HOSTKEY=/etc/ssh/ssh_host_ed25519_key.pub
+SP_SSHCONFIG=/etc/ssh/sshd_config
+SP_SSHDIR=/etc/ssh/sshd_config.d
+SP_CRYPTO=/etc/ssh/crypto.conf
+SP_SHA=a04752e4d46a4d89e53e6f61c59c5349a638c8ce172ffbf391fd482b4d902a4e
+SP_VERSION=0.164.0-alpha.11.1
+fail() { printf '%s\n' "$1" >&2; exit 1; }
+# BEGIN SCREENPUNK READ-ONLY SSH AUDIT
+@@SSH_AUDIT@@
+# END SCREENPUNK READ-ONLY SSH AUDIT
+@@SERVICE_SHELL@@
+@@SERVICE_UPGRADE@@
+[ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ] || fail 'This reviewed setup supports Apple Silicon macOS only.'
+sp_os=$(sw_vers -productVersion); [ "${sp_os%%.*}" -ge 13 ] || fail 'macOS 13 or later is required.'
+[ -x "$SP_CODEX" ] || fail 'Install the supported ChatGPT Mac app; the bundled Codex was not found.'
+[ "$(shasum -a 256 "$SP_CODEX" | awk '{print $1}')" = "$SP_SHA" ] || fail 'Codex binary changed. Use the reviewed supported build; no software was installed or downgraded.'
+[ "$("$SP_CODEX" --version | awk '{print $NF}')" = "$SP_VERSION" ] || fail 'Codex version is unsupported.'
+sp_uid=$(id -u); sp_user=$(id -un)
+case "$sp_user" in ''|-*|*[!A-Za-z0-9._-]*) fail 'Unsupported account short name.';; esac
+[ "${#sp_user}" -le 64 ] || fail 'Unsupported account short name.'
+case "$HOME" in /*) ;; *) fail 'An absolute Mac home directory is required.';; esac
+[ "$(cd "$HOME" && pwd -P)" = "$HOME" ] || fail 'The home directory must not contain symbolic links.'
+private_dir() {
+  [ ! -L "$1" ] || fail 'A Screenpunk directory is a symbolic link; review it before continuing.'
+  if [ -e "$1" ]; then
+    [ -d "$1" ] && [ "$(stat -f '%u:%Lp' "$1")" = "$sp_uid:700" ] || fail 'Existing Screenpunk directories must be owned by this account with mode 700. Review permissions; setup will not repair unknown files.'
+  else mkdir "$1"; fi
+}
+private_file() { [ -f "$1" ] && [ ! -L "$1" ] && [ "$(stat -f '%u:%Lp:%l' "$1")" = "$sp_uid:600:1" ] || fail 'Expected a private, singly linked, account-owned Screenpunk file.'; }
+if [ -e "$HOME/.codex" ] || [ -L "$HOME/.codex" ]; then
+  [ -d "$HOME/.codex" ] && [ ! -L "$HOME/.codex" ] && [ "$(stat -f '%u' "$HOME/.codex")" = "$sp_uid" ] || fail 'Review the Codex home directory ownership/symlink.'
+  sp_parentmode=$(stat -f '%Lp' "$HOME/.codex"); [ "$((0$sp_parentmode & 022))" -eq 0 ] || fail 'Codex home must not be writable by other accounts.'
+else mkdir "$HOME/.codex"; fi
+export CODEX_HOME="$HOME/.codex/screenpunk-local"
+private_dir "$CODEX_HOME"; private_dir "$CODEX_HOME/workspace"; private_dir "$CODEX_HOME/setup-receipts"
+for sp_sensitive in auth.json config.toml; do [ ! -L "$CODEX_HOME/$sp_sensitive" ] || fail 'Dedicated Codex authentication/configuration must not link to another home.'; done
+# Kernel-held descriptor lease: no stale directory to delete after SIGKILL/power loss.
+sp_lock="$CODEX_HOME/.setup.lock"
+if [ -e "$sp_lock" ] || [ -L "$sp_lock" ]; then private_file "$sp_lock"; fi
+exec 9<> "$sp_lock"
+/usr/bin/lockf -t 0 9 || fail 'Another setup is running. Wait for its connection display to close, then retry.'
+sp_lock_held=1
+sp_session=$(mktemp -d "$CODEX_HOME/setup-session.XXXXXX")
+sp_policy_added=0; sp_key_added=0; sp_token_created=0; sp_started=0; sp_handoff=0; sp_pid=''; sp_start=''
+sp_token="$CODEX_HOME/transport-token"; sp_server_receipt="$CODEX_HOME/setup-server.json"; sp_token_receipt="$CODEX_HOME/setup-token.json"
+sp_keys="$HOME/.ssh/authorized_keys"
+sp_server_lifecycle=foreground; sp_service_started_by_setup=0; sp_service_migrated=0; sp_service_plist_published=0; sp_foreground_ready=0
+sp_migration_token_identity=''; sp_migration_token_hash=''
+sp_policyhash=''; sp_keyline=''; sp_newreceipt_hash=''; sp_tokenidentity=''; sp_tokenhash=''; sp_tokenreceipt_hash=''
+process_start() { ps -p "$1" -o lstart= 2>/dev/null | sed 's/^ *//;s/ *$//'; }
+cleanup() {
+  sp_status=$?
+  set +e
+  sp_restore_failed=0
+  trap - EXIT
+  # Cleanup can itself restore a foreground child. Cover that startup window,
+  # not only the later wait, without recursing into the main EXIT handler.
+  cleanup_interrupted() {
+    trap - HUP INT TERM
+    if [ "$sp_started" -eq 1 ]; then service_terminate_owned_child "$sp_pid" "$sp_start"; fi
+    rm -f "$sp_session/private-reply.json" "$sp_session/connection.png" "$sp_session/new-token"
+    if [ "$sp_lock_held" -eq 1 ]; then exec 9>&-; fi
+    printf '%s\n' 'Setup cleanup was interrupted. Saved credentials and ownership evidence were retained for review.' >&2
+    exit 130
+  }
+  trap cleanup_interrupted HUP INT TERM
+  # A verified migrated service preserves the old pair even if a new reply fails.
+  sp_keep_restored_foreground=0
+  if [ "$sp_handoff" -eq 0 ] && [ "$sp_service_migrated" -eq 1 ] && [ "$sp_server_lifecycle" = background ] && service_query_job && service_verify_job_process && [ "$(lsof -nP -a -p "$sp_service_job_pid" -iTCP:4500 -sTCP:LISTEN -Fn 2>/dev/null | sed -n 's/^n//p')" = '127.0.0.1:4500' ]; then
+    sp_service_started_by_setup=0; sp_service_plist_published=0; sp_newreceipt_hash=''; sp_policy_added=0
+    printf '%s\n' 'The verified background server remains enabled for the existing connection. This new pairing did not complete.' >&2
+  fi
+  if [ "$sp_handoff" -eq 0 ] && [ "$sp_service_migrated" -eq 1 ] && [ "$sp_server_lifecycle" = foreground ] && [ "$sp_foreground_ready" -eq 1 ]; then
+    sp_keep_restored_foreground=1; sp_newreceipt_hash=''
+  fi
+  if [ "$sp_started" -eq 1 ] && [ "$sp_keep_restored_foreground" -eq 0 ] && [ "$(process_start "$sp_pid")" = "$sp_start" ]; then service_terminate_owned_child "$sp_pid" "$sp_start"; fi
+  if [ "$sp_handoff" -eq 0 ]; then
+    if [ "$sp_service_started_by_setup" -eq 1 ]; then
+      if service_bootout_owned; then
+        sp_service_started_by_setup=0
+        if [ "$sp_service_migrated" -eq 1 ]; then sp_server_lifecycle=foreground; sp_foreground_ready=0; sp_pid=''; sp_start=''; fi
+      else
+        printf '%s\n' 'The new background job could not be safely unloaded. Saved credential and ownership receipt were retained for review.' >&2
+        sp_token_created=0; sp_newreceipt_hash=''; sp_service_plist_published=0
+      fi
+    fi
+    if [ "$sp_service_plist_published" -eq 1 ] && [ -f "$sp_service_plist" ] && [ ! -L "$sp_service_plist" ] && cmp -s "$sp_service_plist" "$sp_service_dir/agent-v4.plist"; then
+      rm -f "$sp_service_plist"; native service-state "$sp_service_manifest" failed
+    fi
+    if [ "$sp_service_migrated" -eq 1 ] && [ "$sp_keep_restored_foreground" -eq 0 ] && [ "$sp_service_started_by_setup" -eq 0 ] && [ "$sp_server_lifecycle" != background ]; then
+      sp_pid=''; sp_start=''
+      if service_start_foreground; then sp_keep_restored_foreground=1; sp_newreceipt_hash=''; else
+        sp_restore_failed=1
+        if [ "$sp_started" -eq 1 ]; then service_terminate_owned_child "$sp_pid" "$sp_start"; fi
+        printf '%s\n' 'Saved credentials and the receipt backup were retained, but foreground restoration needs review; no unknown listener was stopped.' >&2
+      fi
+    fi
+    if [ "$sp_key_added" -eq 1 ] && [ -f "$sp_keys" ] && [ ! -L "$sp_keys" ]; then
+      grep -Fvx -- "$sp_keyline" "$sp_keys" > "$sp_session/keys.rollback" || [ "$?" -eq 1 ]
+      cat "$sp_session/keys.rollback" > "$sp_keys"
+    fi
+    if [ "$sp_policy_added" -eq 1 ] && [ ! -L "$SP_POLICY" ] && [ -f "$SP_POLICY" ] && [ "$(shasum -a 256 "$SP_POLICY" | awk '{print $1}')" = "$sp_policyhash" ]; then "$SP_SUDO" rm -f "$SP_POLICY" || :; fi
+    if [ "$sp_token_created" -eq 1 ] && [ -f "$sp_token" ] && [ ! -L "$sp_token" ] && [ "$(stat -f '%u:%Lp:%i' "$sp_token")" = "$sp_tokenidentity" ] && [ "$(shasum -a 256 "$sp_token" | awk '{print $1}')" = "$sp_tokenhash" ]; then
+      rm -f "$sp_token"
+      if [ -n "$sp_tokenreceipt_hash" ] && [ -f "$sp_token_receipt" ] && [ ! -L "$sp_token_receipt" ] && [ "$(shasum -a 256 "$sp_token_receipt" | awk '{print $1}')" = "$sp_tokenreceipt_hash" ]; then rm -f "$sp_token_receipt"; fi
+    fi
+    if [ "$sp_started" -eq 1 ] && [ -n "$sp_newreceipt_hash" ] && [ -f "$sp_server_receipt" ] && [ ! -L "$sp_server_receipt" ] && [ "$(shasum -a 256 "$sp_server_receipt" | awk '{print $1}')" = "$sp_newreceipt_hash" ]; then
+      if [ -f "$sp_session/server-original.json" ]; then native restore-server "$sp_session/server-original.json" "$sp_server_receipt" || sp_restore_failed=1; else rm -f "$sp_server_receipt"; fi
+    fi
+  fi
+  rm -f "$sp_session/native.js" "$sp_session/request-path" "$sp_session/request.json" "$sp_session/key.pub" "$sp_session/key-digest" "$sp_session/policy" "$sp_session/authorized-line" "$sp_session/keys.rollback" "$sp_session/private-reply.json" "$sp_session/connection.png" "$sp_session/metadata.json" "$sp_session/server-pid" "$sp_session/server-start" "$sp_session/server-tokenIdentity" "$sp_session/server-tokenSHA256" "$sp_session/server-serverLifecycle" "$sp_session/new-token" "$sp_session/start-server" "$sp_session/.screenpunk-session.json" "$sp_session/service-control.sh" "$sp_session/service.plist" "$sp_session/service-job.plist" "$sp_session/service-job-pid"
+  if [ "$sp_restore_failed" -eq 0 ]; then rm -f "$sp_session/server-original.json"; fi
+  rmdir "$sp_session" 2>/dev/null || :
+  if [ "$sp_lock_held" -eq 1 ]; then exec 9>&-; fi
+  if [ "$sp_keep_restored_foreground" -eq 1 ]; then
+    printf '%s\n' 'The existing connection was restored in this Terminal. Keep it open; the new pairing did not complete.' >&2
+    stop_restored_foreground() {
+      trap - HUP INT TERM
+      service_terminate_owned_child "$sp_pid" "$sp_start"
+      exit "$sp_status"
+    }
+    trap stop_restored_foreground HUP INT TERM
+    wait "$sp_pid" 2>/dev/null || :
+    trap - HUP INT TERM
+  fi
+  exit "$sp_status"
+}
+trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
+cat > "$sp_session/native.js" <<'SCREENPUNK_NATIVE_JS'
+@@NATIVE_JS@@
+SCREENPUNK_NATIVE_JS
+cat > "$sp_session/service-control.sh" <<'SCREENPUNK_SERVICE_CONTROL'
+@@SERVICE_CONTROL@@
+SCREENPUNK_SERVICE_CONTROL
+native() { "$SP_OSASCRIPT" -l JavaScript "$sp_session/native.js" "$@"; }
+# An acquired kernel lease proves no other setup display still owns the lease.
+# Clear only declared private display files from verified prior script-owned sessions.
+for sp_prior in "$CODEX_HOME"/setup-session.*; do
+  [ -d "$sp_prior" ] && [ ! -L "$sp_prior" ] && [ "$sp_prior" != "$sp_session" ] || continue
+  private_dir "$sp_prior"
+  if [ -e "$sp_prior/.screenpunk-session.json" ] || [ -L "$sp_prior/.screenpunk-session.json" ]; then
+    private_file "$sp_prior/.screenpunk-session.json"
+    for sp_private in private-reply.json connection.png new-token; do
+      if [ -e "$sp_prior/$sp_private" ] || [ -L "$sp_prior/$sp_private" ]; then private_file "$sp_prior/$sp_private"; fi
+    done
+    native session-clean "$sp_prior"
+  fi
+done
+native session-start "$sp_session" "$$"
+printf '%s\n' 'Select the PUBLIC setup request received from iPad. Nothing is uploaded.'
+native choose "$sp_session/request-path"
+sp_request=$(cat "$sp_session/request-path")
+[ -f "$sp_request" ] && [ ! -L "$sp_request" ] || fail 'Select a regular public setup-request JSON file.'
+[ "$(stat -f '%z' "$sp_request")" -le 8192 ] || fail 'Selected file is too large for the public iPad request. Choose Screenpunk-setup-request.json sent from the iPad, not the downloaded Mac setup script.'
+native request "$sp_request" "$sp_session"
+[ "$(ssh-keygen -lf "$sp_session/key.pub" -E sha256 | awk '{print $2}')" = "$(cat "$sp_session/key-digest")" ] || fail 'The public key digest does not match the request.'
+# Check an already active Remote Login listener without enabling or restarting the service.
+nc -z -G 2 127.0.0.1 22 >/dev/null 2>&1 || fail 'Turn on Remote Login in System Settings > General > Sharing, allow this account, then run setup again. Screenpunk does not enable it.'
+if dscl . -read /Groups/com.apple.access_ssh RecordName >/dev/null 2>&1; then
+  dsmemberutil checkmembership -U "$sp_user" -G com.apple.access_ssh | grep -q 'is a member' || fail 'Allow this Mac account in Remote Login settings, then retry.'
+fi
+[ ! -L "$SP_HOSTKEY" ] || fail 'The public host key must not be a symbolic link.'
+if [ ! -f "$SP_HOSTKEY" ]; then
+  native consent 'The Mac has no public Ed25519 SSH host key. Continue authorizes sudo ssh-keygen -A to create missing system host keys only. Existing keys are never regenerated. Remote Login remains under your control.'
+  "$SP_SUDO" ssh-keygen -A
+fi
+[ -f "$SP_HOSTKEY" ] && [ ! -L "$SP_HOSTKEY" ] && [ "$(stat -f '%u' "$SP_HOSTKEY")" = 0 ] || fail 'No public SSH host key is available. Review Remote Login and system host keys.'
+sp_hostmode=$(stat -f '%Lp' "$SP_HOSTKEY"); [ "$((0$sp_hostmode & 022))" -eq 0 ] || fail 'The public host key is writable by another account.'
+sp_hostpin=$(ssh-keygen -lf "$SP_HOSTKEY" -E sha256 | awk '{print $2}')
+# Authentication is scoped to the dedicated home. Never copy global credentials.
+if "$SP_CODEX" login status >/dev/null 2>&1; then printf '%s\n' 'Already signed in to the dedicated Screenpunk Codex home.'
+else
+  printf '%s\n' 'Sign in using the standard Codex browser flow for this dedicated Screenpunk home.'
+  "$SP_CODEX" login
+  "$SP_CODEX" login status >/dev/null 2>&1 || fail 'Codex sign-in was not confirmed. Retry after completing browser sign-in.'
+fi
+# Reuse a stopped earlier setup only after explicit review of its unchanged private bearer.
+# Running unowned servers remain untouched; no creation history is inferred.
+if { [ -e "$sp_token" ] || [ -L "$sp_token" ]; } && [ ! -e "$sp_server_receipt" ] && [ ! -L "$sp_server_receipt" ] && [ ! -e "$sp_token_receipt" ] && [ ! -L "$sp_token_receipt" ]; then
+  private_file "$sp_token"
+  [ "$(wc -c < "$sp_token" | tr -d '[:space:]')" -eq 65 ] && LC_ALL=C grep -Eq '^[0-9a-f]{64}$' "$sp_token" || fail 'The earlier saved bearer has an unexpected format; it was not changed.'
+  sp_legacy_pid=$(lsof -nP -a -iTCP:4500 -sTCP:LISTEN -t 2>/dev/null | sort -u || :)
+  if [ -z "$sp_legacy_pid" ]; then
+    if nc -z -G 1 127.0.0.1 4500 >/dev/null 2>&1; then fail 'A live server cannot be identified for ownership review. Keep the working connection unchanged; setup did not stop anything.'; fi
+    sp_legacy_identity=$(stat -f '%u:%Lp:%i' "$sp_token"); sp_legacy_hash=$(shasum -a 256 "$sp_token" | awk '{print $1}')
+    native consent 'Reuse your saved Screenpunk connection credential? The earlier setup saved a private bearer but no ownership receipt, and no App Server is listening now. Continue records your approval to reuse this exact file unchanged and start the supported server using the startup mode you choose. Existing iPad credentials are not reset. Cancel keeps all saved data. No model request is sent.'
+    private_file "$sp_token"
+    [ "$(stat -f '%u:%Lp:%i' "$sp_token")" = "$sp_legacy_identity" ] && [ "$(shasum -a 256 "$sp_token" | awk '{print $1}')" = "$sp_legacy_hash" ] || fail 'The saved credential changed during review; nothing was adopted.'
+    [ -z "$(lsof -nP -a -iTCP:4500 -sTCP:LISTEN -t 2>/dev/null || :)" ] || fail 'A listener appeared during review; no server was stopped.'
+    if nc -z -G 1 127.0.0.1 4500 >/dev/null 2>&1; then fail 'A listener appeared during review; no server was stopped.'; fi
+    [ ! -e "$sp_server_receipt" ] && [ ! -L "$sp_server_receipt" ] && [ ! -e "$sp_token_receipt" ] && [ ! -L "$sp_token_receipt" ] || fail 'Ownership changed during review; no receipt was overwritten.'
+    native token-adopt "$sp_token_receipt" 0 not-started "$sp_legacy_identity" "$sp_legacy_hash" "$SP_SHA"
+    printf '%s\n' 'Reusing the saved Screenpunk bearer unchanged; setup will start its foreground server.'
+  else
+    fail 'The earlier App Server is already running without ownership receipts. Keep it and your working connection unchanged. This upgrade needs manual ownership review; setup did not stop the server, rotate its bearer or add a key.'
+  fi
+fi
+native consent "Authorize this iPad public key for this Mac account? Setup adds one restricted line to ~/.ssh/authorized_keys and, if absent, $SP_POLICY. The account-wide policy disables reverse TCP and Unix-socket forwarding for ALL SSH keys on $sp_user. The iPad key allows only local forwarding to 127.0.0.1:4500, with no shell, PTY or agent forwarding. Setup uses sudo for SSH policy validation, reuses an owned bearer/server, and asks separately whether to enable per-user background startup or keep App Server in this Terminal. No system daemon or helper app is installed."
+printf 'Match User %s\n    AllowTcpForwarding local\n    PermitListen none\n    AllowStreamLocalForwarding no\nMatch all\n' "$sp_user" > "$sp_session/policy"
+sp_policyhash=$(shasum -a 256 "$sp_session/policy" | awk '{print $1}')
+private_dir "$HOME/.ssh"
+if [ -e "$sp_keys" ] || [ -L "$sp_keys" ]; then private_file "$sp_keys"; fi
+sp_keyline="restrict,port-forwarding,permitopen=\"127.0.0.1:4500\",command=\"/usr/bin/false\" $(cat "$sp_session/key.pub") Screenpunk-iPad"
+printf '%s' "$sp_keyline" > "$sp_session/authorized-line"
+sp_keyid=$(shasum -a 256 "$sp_session/key.pub" | awk '{print $1}')
+sp_receipt="$CODEX_HOME/setup-receipts/$sp_keyid.json"
+sp_keyplanned=0; sp_policyplanned=0; sp_tokenplanned=0
+grep -Fqx -- "$sp_keyline" "$sp_keys" 2>/dev/null || sp_keyplanned=1
+if [ ! -e "$SP_POLICY" ] && [ ! -L "$SP_POLICY" ]; then sp_policyplanned=1; fi
+if [ ! -e "$sp_token" ] && [ ! -L "$sp_token" ]; then sp_tokenplanned=1; fi
+if [ -e "$sp_receipt" ] || [ -L "$sp_receipt" ]; then private_file "$sp_receipt"; fi
+# Durable nonsecret intent precedes privileged policy/key/token changes.
+native receipt "$sp_receipt" "$sp_session" "$sp_keyplanned" "$SP_POLICY" "$sp_policyhash" "$sp_policyplanned" "$sp_server_receipt" "$sp_token" "$sp_tokenplanned"
+if [ -e "$SP_POLICY" ] || [ -L "$SP_POLICY" ]; then
+  [ ! -L "$SP_POLICY" ] && cmp -s "$sp_session/policy" "$SP_POLICY" || fail 'Existing Screenpunk SSH policy differs. No key was added; review that policy.'
+else "$SP_SUDO" install -m 644 "$sp_session/policy" "$SP_POLICY"; sp_policy_added=1; native sync "$SP_POLICY"; fi
+# A loopback-only -T check cannot prove restrictions across conditional LAN Match rules.
+# Refuse unsupported conditionals/includes rather than granting a key under an unproved policy.
+audit_ssh_configuration
+"$SP_SUDO" "$SP_SSHD" -t || fail 'SSH configuration validation failed; check host keys and configuration.'
+sp_effective=$("$SP_SUDO" "$SP_SSHD" -T -C "user=$sp_user,host=localhost,addr=127.0.0.1")
+printf '%s\n' "$sp_effective" | awk '
+$1 == "allowtcpforwarding" { tcp = ($2 == "local" && NF == 2) }
+$1 == "permitlisten" { listen = ($2 == "none" && NF == 2) }
+$1 == "allowstreamlocalforwarding" { stream = ($2 == "no" && NF == 2) }
+$1 == "disableforwarding" { disabled = ($2 != "no") }
+$1 == "pubkeyauthentication" { key = ($2 == "yes") }
+END { exit !(tcp && listen && stream && !disabled && key) }' || fail 'Effective SSH policy is incompatible. No iPad key was added.'
+# Never follow a symlink or replace an unknown token/receipt/listener.
+if [ -e "$sp_token" ] || [ -L "$sp_token" ]; then
+  private_file "$sp_token"
+  if [ -e "$sp_server_receipt" ] || [ -L "$sp_server_receipt" ]; then private_file "$sp_server_receipt"; sp_readreceipt=$sp_server_receipt
+  else private_file "$sp_token_receipt"; sp_readreceipt=$sp_token_receipt; fi
+else
+  [ ! -e "$sp_server_receipt" ] && [ ! -L "$sp_server_receipt" ] || fail 'Server receipt exists without its token. Review ownership before continuing.'
+fi
+sp_listener=$(lsof -nP -a -iTCP:4500 -sTCP:LISTEN -t 2>/dev/null | sort -u || :)
+if [ -e "$sp_token" ]; then
+  [ "$(wc -c < "$sp_token" | tr -d '[:space:]')" -eq 65 ] && LC_ALL=C grep -Eq '^[0-9a-f]{64}$' "$sp_token" || fail 'Saved bearer has an unexpected format; it was not rotated.'
+  native server-read "$sp_readreceipt" "$sp_session"
+  [ "$(cat "$sp_session/server-tokenIdentity")" = "$(stat -f '%u:%Lp:%i' "$sp_token")" ] && [ "$(cat "$sp_session/server-tokenSHA256")" = "$(shasum -a 256 "$sp_token" | awk '{print $1}')" ] || fail 'Saved bearer no longer matches its ownership receipt.'
+  sp_savedpid=$(cat "$sp_session/server-pid"); sp_savedstart=$(cat "$sp_session/server-start")
+  if [ -f "$sp_session/server-serverLifecycle" ]; then sp_server_lifecycle=background; fi
+  if [ -n "$sp_listener" ]; then
+    [ "$sp_listener" = "$sp_savedpid" ] && [ "$(process_start "$sp_savedpid")" = "$sp_savedstart" ] || fail 'Port 4500 belongs to an unverified process; nothing was stopped.'
+    [ "$(lsof -nP -a -p "$sp_savedpid" -iTCP:4500 -sTCP:LISTEN -Fn 2>/dev/null | sed -n 's/^n//p')" = '127.0.0.1:4500' ] || fail 'Owned listener is not exclusively loopback.'
+    sp_pid=$sp_savedpid; sp_start=$sp_savedstart
+  else
+    [ "$sp_savedpid" -eq 0 ] || [ -z "$(process_start "$sp_savedpid")" ] || fail 'Saved App Server is alive without its expected listener. Review it before retrying.'
+  fi
+else
+  [ -z "$sp_listener" ] || fail 'Port 4500 is already occupied by an unknown process. Setup did not stop it.'
+  native prepared-receipts "$CODEX_HOME/setup-receipts"
+  if [ -e "$sp_token_receipt" ] || [ -L "$sp_token_receipt" ]; then
+    private_file "$sp_token_receipt"; native server-read "$sp_token_receipt" "$sp_session"
+    [ "$(cat "$sp_session/server-pid")" -eq 0 ] || fail 'Token provenance is not a prepared install.'
+  fi
+  openssl rand -hex 32 > "$sp_session/new-token"
+  native sync "$sp_session/new-token"
+  # A no-secret prepared receipt is durable BEFORE publishing the token inode.
+  native server-write "$sp_token_receipt" 0 not-started "$(stat -f '%u:%Lp:%i' "$sp_session/new-token")" "$(shasum -a 256 "$sp_session/new-token" | awk '{print $1}')" "$SP_SHA"
+  sp_tokenreceipt_hash=$(shasum -a 256 "$sp_token_receipt" | awk '{print $1}')
+  mv -n "$sp_session/new-token" "$sp_token"
+  [ ! -e "$sp_session/new-token" ] || fail 'A token appeared during setup; review its ownership.'
+  sp_token_created=1
+  native sync-rename "$sp_token" "$sp_session"
+  sp_tokenidentity=$(stat -f '%u:%Lp:%i' "$sp_token"); sp_tokenhash=$(shasum -a 256 "$sp_token" | awk '{print $1}')
+fi
+[ -e "$sp_keys" ] || : > "$sp_keys"
+if ! grep -Fqx -- "$sp_keyline" "$sp_keys"; then printf '\n%s\n' "$sp_keyline" >> "$sp_keys"; sp_key_added=1; native sync "$sp_keys"; fi
+service_paths
+sp_service_uninstalled=0
+if [ -f "$sp_service_manifest" ] && [ ! -L "$sp_service_manifest" ] && [ "$(plutil -extract lifecycle raw -o - "$sp_service_manifest" 2>/dev/null || :)" = uninstalled ]; then sp_service_uninstalled=1; fi
+if [ "$sp_server_lifecycle" = background ] && [ "$sp_service_uninstalled" -eq 0 ]; then
+  sp_service_mode=background
+else
+  sp_service_mode=$(native service-choice) || fail 'Background startup choice was cancelled; existing connection remains unchanged.'
+fi
+case "$sp_service_mode" in
+  background) service_upgrade_v4_if_needed || fail 'Background helper repair did not complete. The existing server was not changed.'; service_start_background;;
+  foreground) ;;
+  *) fail 'Unknown server startup choice; nothing was stopped.';;
+esac
+if [ "$sp_server_lifecycle" = background ]; then
+  sp_started=0
+  if [ "$sp_service_started_by_setup" -eq 1 ]; then sp_newreceipt_hash=$(service_hash "$sp_server_receipt"); fi
+fi
+if [ -z "$sp_pid" ]; then service_start_foreground || fail 'App Server did not open its authenticated loopback listener.'; fi
+
+sp_name=$(scutil --get ComputerName 2>/dev/null || printf '%s' "$sp_user Mac")
+sp_localhost=$(scutil --get LocalHostName 2>/dev/null || :)
+case "$sp_localhost" in ''|-*|*[!A-Za-z0-9-]*) fail 'Set a valid Mac LocalHostName in Sharing settings, then retry.';; esac
+native metadata "$sp_session" "$sp_name" "$sp_localhost.local" "$sp_user" "$sp_hostpin" "$CODEX_HOME/workspace" "$sp_server_lifecycle"
+native reply "$sp_session" "$sp_token"
+native receipt-complete "$sp_receipt"
+# Display dismissal/expiry is not authenticated iPad acknowledgement and never revokes access.
+sp_handoff=1
+printf '%s\n' 'Connection code is displayed locally. No bearer was printed, copied or uploaded.'
+native display "$sp_session" || printf '%s\n' 'The local display closed. Rerun setup to create a new code; the selected server startup mode is unchanged.'
+rm -f "$sp_session/private-reply.json" "$sp_session/connection.png"
+if [ "$sp_server_lifecycle" = background ]; then
+  printf '%s\n' 'Background startup is verified. Terminal can close. Keep this Mac signed in, awake and reachable. After reboot, sign in to the Mac before connecting.'
+  printf 'Manage background startup: /bin/sh "%s/manage-v4.sh" status|start|restart|uninstall\n' "$sp_service_dir"
+else
+  printf '%s\n' 'Private display material cleared. Keep this Terminal open for App Server. Access persists until explicitly revoked using the private setup receipt.'
+fi
+exec 9>&-; sp_lock_held=0
+if [ "$sp_server_lifecycle" = background ]; then
+  : # The verified LaunchAgent owns the process; setup exits without stopping it.
+elif [ "$sp_started" -eq 1 ]; then wait "$sp_pid"; else printf '%s\n' 'Reused the verified foreground App Server; keep its original Terminal open.'; fi

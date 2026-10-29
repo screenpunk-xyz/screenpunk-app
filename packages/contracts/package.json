@@ -1,0 +1,11 @@
+{
+  "name": "@screenpunk/contracts",
+  "version": "0.1.0-migration.1",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "exports": {
+    "./authoring": "./authoring.ts",
+    "./authoring-v2": "./authoring-v2.ts"
+  }
+}

@@ -1,0 +1,33 @@
+#!/bin/sh
+# Screenpunk v4 per-user LaunchAgent controller. User-installed, no private token in argv/plist.
+set -eu
+umask 077
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+SP_CODEX='/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex'
+SP_OSASCRIPT=/usr/bin/osascript
+SP_LAUNCHCTL=/bin/launchctl
+SP_SHA=a04752e4d46a4d89e53e6f61c59c5349a638c8ce172ffbf391fd482b4d902a4e
+SP_VERSION=0.164.0-alpha.11.1
+fail() { printf '%s\n' "$1" >&2; exit 1; }
+sp_uid=$(id -u)
+[ "$(cd "$HOME" && pwd -P)" = "$HOME" ] || fail 'Background home must not contain symbolic links.'
+export CODEX_HOME="$HOME/.codex/screenpunk-local"
+sp_token="$CODEX_HOME/transport-token"; sp_server_receipt="$CODEX_HOME/setup-server.json"
+sp_pid=''; sp_start=''; sp_server_lifecycle=background
+private_dir() { [ -d "$1" ] && [ ! -L "$1" ] && [ "$(stat -f '%u:%Lp' "$1")" = "$sp_uid:700" ] || fail 'Expected a private owned Screenpunk directory.'; }
+private_file() { [ -f "$1" ] && [ ! -L "$1" ] && [ "$(stat -f '%u:%Lp:%l' "$1")" = "$sp_uid:600:1" ] || fail 'Expected a private singly-linked owned Screenpunk file.'; }
+process_start() { ps -p "$1" -o lstart= 2>/dev/null | sed 's/^ *//;s/ *$//'; }
+private_dir "$CODEX_HOME"; private_dir "$CODEX_HOME/workspace"
+@@SERVICE_SHELL@@
+service_paths
+native() { "$SP_OSASCRIPT" -l JavaScript "$sp_service_dir/native-v4.js" "$@"; }
+if [ "${1:-}" = run ]; then service_run; fi
+sp_session=$(mktemp -d "$sp_service_dir/manage-session.XXXXXX")
+cleanup() { sp_result=$?; rm -f "$sp_session/service-job.plist" "$sp_session/service-job-pid"; rmdir "$sp_session" 2>/dev/null || :; exit "$sp_result"; }
+trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
+if [ -e "$CODEX_HOME/.setup.lock" ] || [ -L "$CODEX_HOME/.setup.lock" ]; then private_file "$CODEX_HOME/.setup.lock"; fi
+exec 8<> "$CODEX_HOME/.setup.lock"
+/usr/bin/lockf -t 0 8 || fail 'Another Screenpunk background-management action is running.'
+service_manage "${1:-status}"

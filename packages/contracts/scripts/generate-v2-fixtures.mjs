@@ -1,0 +1,18 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import {fileURLToPath} from 'node:url';
+const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
+const definition=JSON.parse(fs.readFileSync(path.join(root,'definitions/authoring-v1.json'),'utf8'));
+const canonical=v=>Array.isArray(v)?'['+v.map(canonical).join(',')+']':v!==null&&typeof v==='object'?'{'+Object.keys(v).sort().map(k=>JSON.stringify(k)+':'+canonical(v[k])).join(',')+'}':JSON.stringify(v);
+const digest=v=>crypto.createHash('sha256').update(v).digest('hex');
+const assetRecipe={prefix:'<svg xmlns="http://www.w3.org/2000/svg"><image href="data:image/png;base64,',repeatCount:73000,suffix:'"/></svg>'};
+const asset=assetRecipe.prefix+'A'.repeat(assetRecipe.repeatCount)+assetRecipe.suffix;
+const sources=[{path:'index.html',content:'<html><link rel="stylesheet" href="style.css"><img src="art.svg"><p>Before</p></html>'},{path:'style.css',content:'body{background:#000}'},{path:'art.svg',content:asset}];
+const request={schemaVersion:2,requestID:'fixture-v2',createdAt:1000,deadlineAt:100000,designGuidance:definition.designGuidance,runtime:definition.runtime,services:[],preferences:[],context:{profileID:'profile-a',libraryID:'library-a',deviceID:'device-a',screenID:'screen-a',baseRevision:'revision-a',userRequest:'Make the caption say After and change the background blue.',viewport:{width:1024,height:768,scale:1,orientation:'landscape'},currentScreen:{title:'Synthetic image',entry:'index.html',files:sources.map(f=>({path:f.path,mediaType:f.path.endsWith('html')?'text/html':f.path.endsWith('css')?'text/css':'image/svg+xml',byteLength:Buffer.byteLength(f.content),digest:digest(f.content),reference:'',...(f.path.endsWith('svg')?{}:{content:f.content})}))}},delivery:{route:'fixture',contractVersion:'2',snapshotDigest:''}};
+for(const f of request.context.currentScreen.files)f.reference=digest(canonical({version:2,requestID:request.requestID,profileID:request.context.profileID,libraryID:request.context.libraryID,screenID:request.context.screenID,baseRevision:request.context.baseRevision,path:f.path,mediaType:f.mediaType,byteLength:f.byteLength,digest:f.digest}));
+const input=structuredClone(request);delete input.delivery.snapshotDigest;request.delivery.snapshotDigest=digest(canonical(input));
+const file=request.context.currentScreen.files[2];
+const result={schemaVersion:2,requestID:request.requestID,inputDigest:request.delivery.snapshotDigest,baseRevision:request.context.baseRevision,preferenceRevisions:{},operationID:'operation-a',screen:{title:'Synthetic image',entry:'index.html',files:[{kind:'write',path:'index.html',content:sources[0].content.replace('Before','After')},{kind:'write',path:'style.css',content:'body{background:blue}'},{kind:'retain',path:'art.svg',sourcePath:'art.svg',reference:file.reference,digest:file.digest}],deletedPaths:[],requiredAssets:['art.svg']}};
+const fixture={schemaVersion:2,assetRecipe,request,result,expectedAssetDigest:file.digest,expectedSnapshotDigest:request.delivery.snapshotDigest,expectedReference:file.reference};
+fs.writeFileSync(path.join(root,'fixtures/conformance-v2.json'),JSON.stringify(fixture,null,2)+'\n');

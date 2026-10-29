@@ -1,0 +1,80 @@
+name: Public app checks
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: public-checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  contracts:
+    name: Contracts and setup (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Select run-owned scratch root
+        shell: bash
+        run: echo "CI_SCRATCH_ROOT=$RUNNER_TEMP/screenpunk-public-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB" >> "$GITHUB_ENV"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      - run: node tools/ci/storage.mjs init
+      - name: Locked contracts and setup checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts 2>&1 | tee "$CI_SCRATCH_ROOT/evidence/npm-ci.log"
+          npm run check 2>&1 | tee "$CI_SCRATCH_ROOT/evidence/check.log"
+          npm test 2>&1 | tee "$CI_SCRATCH_ROOT/evidence/tests.log"
+          npm run test:public-artifacts 2>&1 | tee "$CI_SCRATCH_ROOT/evidence/artifact-tests.log"
+          version=$(node -p 'JSON.parse(require("fs").readFileSync("packages/contracts/package.json")).version')
+          node tools/public-artifacts/pack.mjs --source-revision "$(git rev-parse HEAD)" --output "$CI_SCRATCH_ROOT/evidence/screenpunk-public-artifacts-$version.json"
+      - name: Clean owned scratch output
+        if: always()
+        run: node tools/ci/storage.mjs cleanup
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: public-contract-evidence-${{ github.run_attempt }}
+          path: |
+            ${{ env.CI_SCRATCH_ROOT }}/evidence
+            ${{ env.CI_SCRATCH_ROOT }}/ownership.json
+          retention-days: 7
+          if-no-files-found: warn
+  apple:
+    name: Unsigned Apple build and regressions
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - name: Select run-owned scratch root
+        shell: bash
+        run: echo "CI_SCRATCH_ROOT=$RUNNER_TEMP/screenpunk-public-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB" >> "$GITHUB_ENV"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      - run: node tools/ci/storage.mjs init
+      - name: Swift regressions and unsigned device/Simulator builds
+        run: bash tools/ci/apple.sh
+      - name: Clean owned scratch output
+        if: always()
+        run: node tools/ci/storage.mjs cleanup
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: public-apple-evidence-${{ github.run_attempt }}
+          path: |
+            ${{ env.CI_SCRATCH_ROOT }}/evidence
+            ${{ env.CI_SCRATCH_ROOT }}/ownership.json
+          retention-days: 7
+          if-no-files-found: warn

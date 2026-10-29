@@ -1,0 +1,24 @@
+{
+  "name": "screenpunk-app",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "check": "npm run contracts:check && npm run local-setup:check && tsc --noEmit",
+    "test": "vitest run packages/contracts",
+    "contracts:check": "node packages/contracts/scripts/sync-authoring.mjs --check",
+    "contracts:generate": "node packages/contracts/scripts/sync-authoring.mjs",
+    "local-setup:check": "node tools/local-agent-setup/generate.mjs --check",
+    "test:local-setup": "node --test tools/local-agent-setup/tests.mjs",
+    "artifacts:pack": "node tools/public-artifacts/pack.mjs",
+    "test:public-artifacts": "node --test tools/public-artifacts/tests.mjs"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2",
+    "vitest": "5.0.5"
+  }
+}

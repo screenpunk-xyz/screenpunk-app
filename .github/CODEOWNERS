@@ -1,0 +1,8 @@
+# @guysuter admin access was verified through the GitHub plugin during migration.
+/.github/ @guysuter
+/tools/ci/ @guysuter
+/packages/contracts/ @guysuter
+/packages/ScreenpunkCore/ @guysuter
+/packages/ScreenpunkApple/ @guysuter
+/packages/ScreenpunkLocalAuthoring/ @guysuter
+/packages/ScreenpunkLocalTransport/ @guysuter

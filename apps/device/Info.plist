@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>ScreenpunkAPIOrigin</key><string>$(SCREENPUNK_API_ORIGIN)</string>
+<key>CFBundleURLTypes</key><array><dict><key>CFBundleURLSchemes</key><array><string>screenpunk-one</string></array></dict></array>
+<key>NSCameraUsageDescription</key><string>Scan connection codes for your computer and Home Assistant. Codes are processed on this device.</string>
+<key>NSMicrophoneUsageDescription</key><string>Hold three fingers to speak instructions to your Screenpunk agent.</string>
+<key>NSSpeechRecognitionUsageDescription</key><string>Screenpunk transcribes your instructions so your agent can create and change screens. Speech may be processed by Apple when on-device recognition is unavailable.</string>
+<key>NSLocalNetworkUsageDescription</key><string>Find your computer during agent setup and connect to services you approve, such as Home Assistant and Google TV.</string>
+<key>NSBonjourServices</key><array><string>_ssh._tcp</string></array>
+<key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string><string>UIInterfaceOrientationPortraitUpsideDown</string></array>
+<key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
+<key>NSLocationWhenInUseUsageDescription</key><string>Show your location when you request it in a screen’s map.</string>
+</dict></plist>

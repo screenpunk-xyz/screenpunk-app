@@ -1,0 +1,5 @@
+// Copy to ignored config/Local.xcconfig; fill in your own identifiers.
+DEVELOPMENT_TEAM = YOURTEAMID
+PRODUCT_BUNDLE_IDENTIFIER = com.example.screenpunk
+// xcconfig URL slashes need an expansion to avoid comment parsing.
+SCREENPUNK_API_ORIGIN = https:/$()/your-server.example

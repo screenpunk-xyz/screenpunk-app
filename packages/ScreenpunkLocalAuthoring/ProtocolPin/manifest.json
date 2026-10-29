@@ -1,0 +1,29 @@
+{
+  "version": "0.164.0-alpha.11.1",
+  "binarySHA256": "a04752e4d46a4d89e53e6f61c59c5349a638c8ce172ffbf391fd482b4d902a4e",
+  "experimental": true,
+  "support": "personal local prototype only; unsupported production; requested priority is not proof of actual served tier",
+  "schemas": {
+    "ModelListParams.json": "de29a536c00a5b8f46f34dba417dabd93365305571a8ed200e33bea85db68b5a",
+    "ModelListResponse.json": "2fb387a2ed258fc74258828ea342d68f89ce4e8e22cd0329ca59d2b423f9108b",
+    "GetAccountParams.json": "30b545275f60975b55bd6fbaafd70f15505801d14168ee82d3931b6e93c78aab",
+    "GetAccountResponse.json": "03fa0cbf2d7483fdb96eee6e4c8cb3692404cefd125b24187ca4d2e63fd7fbda",
+    "ThreadStartParams.json": "e9c6d3cc18d049bfbc0249add3808fb8e5a27e1a0b5a423767aafbc3859a9428",
+    "ThreadStartResponse.json": "5c52c38fc5a0f7937ba84cf370d39d877211628e7e8e766187efbe9eddf80bdd",
+    "ThreadResumeParams.json": "8dceca415b2c16693b55658ea629cba5ffc82ac300dcd403db0ba7455e491496",
+    "ThreadResumeResponse.json": "03e34c14e83b7729a3b80d8f35375af35200cd9dcba9d9dbde8b19b374e54680",
+    "TurnStartParams.json": "835e0d4ca1a0ddc4fb6db1e2b3249dd67f07c50ac2506092ba81543efc92829b",
+    "TurnStartResponse.json": "6ce0f9ca622a54830c523793d841318f09c604211ec0d24b315c75edd7ffcbfa",
+    "ThreadTurnsListParams.json": "2a8b93d7d4437cc25e16a1dde16d8db3c338d39e16c5eece2a56e943a21577d7",
+    "ThreadTurnsListResponse.json": "340d0a2ae04f6466f307d8adc92b0b006506bdb0e6c234acb06d992295b15717",
+    "ThreadItemsListParams.json": "d5cf9784413f1d1abba756e04e48b273a9d12ab2c5675442e91b6a4ee55e19f0",
+    "ThreadItemsListResponse.json": "fa5a85adff4a594f6c7183aca89414338fbe51b692d5f5ff8edd88d01f51dc4d",
+    "TurnInterruptParams.json": "6dff382dae73d1dbc58406ed045605f647e7a49660e2540fbd2c6c24d60c5f2b",
+    "TurnInterruptResponse.json": "531de6be06fe979b5963f249bab82498a175e614bf65ac12fb2e849dfe60bcf1",
+    "TurnStartedNotification.json": "2b1b825106ad82509e31836fae7b82acb309a7043137f59fa6066be13c57cf73",
+    "TurnCompletedNotification.json": "963c4b492eecd8975a3134200b9a2b834f82841243736283c9c18d88d60106a8",
+    "ItemCompletedNotification.json": "2b80261a0bdb2c6fa2ffd97584ae3fb7979f2105614b395ef66375bc10b4e69b",
+    "InitializeParams.json": "b55124e7c0f36a1789396daa5578217a92be67f053903696236686e59f6f212e",
+    "InitializeResponse.json": "62ad689c2cb6379913c1d72749cfd8de5089d35760214123518eb92eef11acc9"
+  }
+}
