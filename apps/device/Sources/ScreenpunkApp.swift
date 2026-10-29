@@ -9,11 +9,6 @@ struct DeviceRootView: View {
     @StateObject private var model = DeviceModel()
     @StateObject private var speech = SpeechCapture()
     @StateObject private var display = DeviceDisplayPreferences()
-    @State private var setupRequestCopied = false
-    private var setupRequest: String {
-        let plugin = CloudClient.originScope.permitsLegacyMigration ? "Screenpunk Staging" : "Screenpunk Production"
-        return "Please use the \(plugin) plugin to listen for requests from my Screenpunk devices. Subscribe to screenpunk.request.created, keep the subscription active, and handle incoming device requests. Confirm which Screenpunk account you are connected to."
-    }
     @Environment(\.scenePhase) private var scenePhase
     var body: some View {
         ZStack {
@@ -92,22 +87,7 @@ struct DeviceRootView: View {
                 Button("Settings") { model.settingsOpen = true }
             }
         } else if !model.agentReady {
-            introduction(title: "Ask your agent to listen", detail: "You’re signed in to Screenpunk. In ChatGPT, open your dot and ask it to listen for Screenpunk device requests.") {
-                Text(setupRequest)
-                    .font(.body)
-                    .multilineTextAlignment(.leading)
-                    .textSelection(.enabled)
-                    .padding(16)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 12))
-                    .overlay(alignment: .leading) { RoundedRectangle(cornerRadius: 2).fill(.orange).frame(width: 3).padding(.vertical, 12) }
-                Button(setupRequestCopied ? "Request copied" : "Copy setup request") {
-                    UIPasteboard.general.string = setupRequest
-                    setupRequestCopied = true
-                }.buttonStyle(.borderedProminent)
-                Link("Open ChatGPT", destination: URL(string: "https://chatgpt.com/")!)
-                Text("Paste and send the request in your dot’s chat, then return here. This screen updates automatically when your agent starts listening.").font(.caption).foregroundStyle(.secondary)
-            }
+            CloudListenerSetupView(scope: CloudClient.originScope, email: model.email)
         } else {
             introduction(title: "What would you like on this screen?", detail: "Hold three fingers on the screen and tell your agent what you’d like to see. Lift your fingers to send.") {
                 Image(systemName: "hand.raised.fingers.spread.fill").font(.system(size: 54))
@@ -124,6 +104,94 @@ struct DeviceRootView: View {
         speech.begin { text in Task { await model.send(text) } }
     }
 }
+
+/// Shared by the waiting screen and Settings; no authentication or network work
+/// happens in this view. The user completes the normal plugin consent journey.
+struct CloudListenerSetupView: View {
+    let scope: CloudOriginScope
+    let email: String?
+    @State private var copied = false
+    private var pluginName: String { scope.permitsLegacyMigration ? "Screenpunk Staging" : "Screenpunk Production" }
+    private var pluginURL: URL? {
+        switch scope.canonicalOrigin {
+        case "https://staging.screenpunk.xyz": return URL(string: "https://chatgpt.com/plugins/plugin_asdk_app_6ad8cebcf03481918fa9078644568bee")
+        case "https://api.screenpunk.xyz": return URL(string: "https://chatgpt.com/plugins/plugin_asdk_app_6ae3926704588191b0eee33944373ddc")
+        default: return nil
+        }
+    }
+    private var setupRequest: String {
+        let account = email.map { "Confirm you’re connected as \($0). Stop if the account differs." }
+            ?? "Confirm your Screenpunk account matches my iPad."
+        return "Use @\(pluginName). \(account) Subscribe to screenpunk.request.created, keep listening, and handle my device requests. Confirm when the subscription is active. If subscriptions aren’t available, tell me to use Work + Cloud or a dot."
+    }
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("SCREENPUNK").font(.caption.weight(.bold)).tracking(4).foregroundStyle(.orange)
+                    Text("Connect your Cloud agent").font(.largeTitle.bold())
+                }
+                step(1, "Connect the plugin", email.map { "Use \($0) in ChatGPT too." } ?? "Sign in on this iPad first, then use the same account in ChatGPT.")
+                if let pluginURL { Link("Connect \(pluginName)", destination: pluginURL).buttonStyle(.bordered) }
+                else { Text("Use the plugin link from your Screenpunk provider.").font(.callout) }
+                step(2, "Start the listener", "Open Work → Cloud (or your dot), select @\(pluginName), and send this request.")
+                Button(copied ? "Copied" : "Copy listener request") {
+                    UIPasteboard.general.string = setupRequest; copied = true
+                }.buttonStyle(.borderedProminent)
+                step(3, "Make your first screen", "After ChatGPT confirms it’s listening, return here. Hold three fingers, say what you want, then lift to send.")
+                DisclosureGroup("Need help?") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("No subscription support? Use Work + Cloud or a dot. Local Codex tasks cannot run the listener.")
+                        Text("Still waiting? Check that both apps use the same email.")
+                        Text("Earlier screens: Settings → Account → Saved libraries.")
+                    }.font(.callout).padding(.top, 8)
+                }
+                Text("Invited preview · Screenpunk and plugin access required.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            .padding(28).frame(maxWidth: 680).frame(maxWidth: .infinity)
+        }
+        .background(Color.black).foregroundStyle(.white)
+        .onChange(of: email) { _ in copied = false }
+    }
+    private func step(_ number: Int, _ title: String, _ detail: String) -> some View {
+        HStack(alignment: .top, spacing: 14) {
+            Text(String(number)).font(.headline).foregroundStyle(.orange)
+                .frame(width: 30, height: 30).background(.orange.opacity(0.15), in: Circle())
+            VStack(alignment: .leading, spacing: 5) {
+                Text(title).font(.headline)
+                Text(detail).font(.callout).foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+struct CloudListenerSetupSheet: View {
+    let scope: CloudOriginScope
+    let email: String?
+    @Environment(\.dismiss) private var dismiss
+    var body: some View {
+        NavigationStack {
+            CloudListenerSetupView(scope: scope, email: email)
+                .navigationTitle("Cloud setup").navigationBarTitleDisplayMode(.inline)
+                .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+        }
+    }
+}
+
+#if DEBUG
+struct CloudListenerSetupView_Previews: PreviewProvider {
+    static var previews: some View {
+        Group {
+            CloudListenerSetupView(scope: CloudOriginScope(origin: "https://api.screenpunk.xyz")!, email: "preview@example.com")
+                .previewDisplayName("Production · signed in")
+            CloudListenerSetupView(scope: CloudOriginScope(origin: "https://staging.screenpunk.xyz")!, email: nil)
+                .previewDisplayName("Staging · before sign-in")
+        }
+    }
+}
+#endif
+
 enum DeviceSettingsPage: String, Hashable {
     case overview = "Overview", guidedAccess = "Guided Access", display = "Display", account = "Account", screens = "Screens"
     case preferences = "Preferences", agents = "Agents"

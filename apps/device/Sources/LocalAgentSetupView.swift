@@ -8,7 +8,7 @@ struct DeviceAgentsSettings: View {
     @ObservedObject var model: LocalAgentSettingsModel
     @State private var setup: SetupSheet?
     @State private var forgetting = false
-    private enum SetupSheet: String, Identifiable { case pairing, address; var id: String { rawValue } }
+    private enum SetupSheet: String, Identifiable { case pairing, address, cloud; var id: String { rawValue } }
     var body: some View {
         Form {
             Section("Cloud agent") {
@@ -17,6 +17,7 @@ struct DeviceAgentsSettings: View {
                 if device.email == nil {
                     Button("Sign in to Screenpunk Cloud") { Task { await device.signIn() } }.disabled(device.routeChangeBlocked || device.accountOperationInProgress)
                 }
+                Button("Set up Cloud listener") { setup = .cloud }
             }
             Section("Local agent") {
                 if let config = model.configuration {
@@ -63,6 +64,7 @@ struct DeviceAgentsSettings: View {
             switch sheet {
             case .pairing: LocalAgentSetupView(model: model, device: device)
             case .address: LocalAgentAddressRecoveryView(model: model)
+            case .cloud: CloudListenerSetupSheet(scope: CloudClient.originScope, email: device.email)
             }
         }
         .alert("Forget local agent?", isPresented: $forgetting) {
