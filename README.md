@@ -20,6 +20,8 @@ xcodebuild -project apps/device/ScreenpunkOne.xcodeproj -scheme ScreenpunkOne \
 
 No private repository, cloud account, signing key, or Google developer password is required for an unsigned build or local use. See [developer configuration](docs/development.md), [CI](docs/ci.md), and [local Mac setup](tools/local-agent-setup/README.md). Setup tests use synthetic data; never execute the setup installer as a test.
 
+For the invited Cloud preview, follow the three-step [Cloud setup guide](docs/cloud-onboarding.md).
+
 Canonical contracts live in `packages/contracts`. Generated Swift resources must pass `npm run contracts:check`. Contract/setup bundles are versioned and checksummed for private cloud consumption; see `tools/public-artifacts`.
 
 Software and public contracts are Apache License 2.0. Preserve [LICENSE](LICENSE), [NOTICE](NOTICE), third-party notices, and [brand terms](docs/brand-policy.md). Screenpunk trademarks and artwork have separate reserved rights. Forks should use their own app identity, OAuth registration, signing, and branding.
