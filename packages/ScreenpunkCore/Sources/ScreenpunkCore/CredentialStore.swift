@@ -29,9 +29,10 @@ public struct CloudOriginScope: Equatable, Sendable {
     }
 
     /// Restoring a session must also restore its Cloud library after an origin/account
-    /// switch. An intentionally selected, unlinked local library stays available locally.
+    /// switch. Libraries explicitly selected for Local use remain available locally.
     public func shouldRestoreAccountProfile(activeProfile: LocalProfileDescriptor?, serverUserID: String) -> Bool {
         guard let activeProfile else { return true }
+        if activeProfile.routePreference == .local { return false }
         if activeProfile.cloudBinding == nil, activeProfile.libraryOwner.hasPrefix("local:") { return false }
         let activeAccountID = activeProfile.cloudBinding?.accountID ?? activeProfile.libraryOwner
         return activeAccountID != localAccountID(serverUserID: serverUserID)
