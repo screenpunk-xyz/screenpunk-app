@@ -24,17 +24,20 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
-      - run: node tools/ci/storage.mjs init
+      - run: node tools/ci/storage.mjs init --portable
       - name: Locked contracts and setup checks
         shell: bash
         run: |
           set -euo pipefail
+          export npm_config_cache="$CI_SCRATCH_ROOT/build/npm-cache"
           npm ci --ignore-scripts 2>&1 | tee "$CI_SCRATCH_ROOT/evidence/npm-ci.log"
+          node tools/ci/storage.mjs budget
           npm run check 2>&1 | tee "$CI_SCRATCH_ROOT/evidence/check.log"
           npm test 2>&1 | tee "$CI_SCRATCH_ROOT/evidence/tests.log"
           npm run test:public-artifacts 2>&1 | tee "$CI_SCRATCH_ROOT/evidence/artifact-tests.log"
           version=$(node -p 'JSON.parse(require("fs").readFileSync("packages/contracts/package.json")).version')
           node tools/public-artifacts/pack.mjs --source-revision "$(git rev-parse HEAD)" --output "$CI_SCRATCH_ROOT/evidence/screenpunk-public-artifacts-$version.json"
+          node tools/ci/storage.mjs budget
       - name: Clean owned scratch output
         if: always()
         run: node tools/ci/storage.mjs cleanup

@@ -144,7 +144,7 @@ test('completed install receipts forbid fresh bearer creation even when all toke
 });
 test('generated script/hash/page/CSP are reproducible and public page has no upload channels',()=>{
  const r=spawnSync(process.execPath,['tools/local-agent-setup/generate.mjs','--check'],{encoding:'utf8'});assert.equal(r.status,0,r.stderr);
- const source=readFileSync('services/cloud/src/generated/local-agent-setup.ts','utf8'),script=readFileSync('tools/local-agent-setup/macos/macos.sh','utf8'),generatedHash=createHash('sha256').update(script).digest('hex');assert.ok(source.includes(generatedHash));assert.ok(source.includes('localAgentSetupCSP'));assert.ok(source.includes("connect-src 'none'"));assert.ok(!script.includes('pbcopy'));assert.ok(!script.includes('curl '));assert.ok(!script.includes('python'));assert.ok(!script.includes('node '));assert.match(script,/sp_handoff=1/);
+ const source=readFileSync('tools/local-agent-setup/generated/local-agent-setup.ts','utf8'),script=readFileSync('tools/local-agent-setup/macos/macos.sh','utf8'),generatedHash=createHash('sha256').update(script).digest('hex');assert.ok(source.includes(generatedHash));assert.ok(source.includes('localAgentSetupCSP'));assert.ok(source.includes("connect-src 'none'"));assert.ok(!script.includes('pbcopy'));assert.ok(!script.includes('curl '));assert.ok(!script.includes('python'));assert.ok(!script.includes('node '));assert.match(script,/sp_handoff=1/);
 });
 
 // All LaunchAgent calls below use the fixture's fake launchctl and synthetic processes.
