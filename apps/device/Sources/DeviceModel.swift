@@ -68,12 +68,12 @@ import ScreenpunkLocalTransport
         return selectedRoute
     }
     private var cloudAccountMatches: Bool {
-        guard let profile = activeProfile, let session = cloud.session else { return false }
-        return profile.libraryOwner == session.user.id || profile.cloudBinding?.accountID == session.user.id
+        guard let profile = activeProfile, let accountID = cloud.localAccountID else { return false }
+        return profile.libraryOwner == accountID || profile.cloudBinding?.accountID == accountID
     }
     private var cloudBindingMatches: Bool {
         guard let binding = activeProfile?.cloudBinding, let session = cloud.session else { return false }
-        return binding.accountID == session.user.id && binding.deviceID == session.deviceId && (session.profileID == nil || binding.profileID == session.profileID)
+        return binding.accountID == cloud.localAccountID && binding.deviceID == session.deviceId && (session.profileID == nil || binding.profileID == session.profileID)
     }
     private var lastProgressAt = Date()
     private var warningDismissedAt = Date.distantPast
@@ -115,7 +115,7 @@ import ScreenpunkLocalTransport
     private let preferenceSyncFlight = PreferenceSyncSingleFlight<PreferenceSyncBinding>()
     private var preferenceSyncBinding: PreferenceSyncBinding? {
         guard foreground, connectionActive,
-              CloudPreferenceSyncEligibility.matches(profile: activeProfile, accountID: cloud.session?.user.id, deviceID: cloud.session?.deviceId, profileID: cloud.session?.profileID),
+              CloudPreferenceSyncEligibility.matches(profile: activeProfile, accountID: cloud.localAccountID, deviceID: cloud.session?.deviceId, profileID: cloud.session?.profileID),
               let profile = activeProfile, let binding = profile.cloudBinding,
               let library, let session = cloud.session else { return nil }
         return .init(generation: connectionGeneration, library: ObjectIdentifier(library), profileID: profile.id, libraryOwner: profile.libraryOwner, cloud: binding, credential: session.accessToken, sessionProfileID: session.profileID)
@@ -142,7 +142,7 @@ import ScreenpunkLocalTransport
         do {
             let authenticated = try await cloud.signIn()
             detachAccountLibrary()
-            _ = try profileRepository?.activateAccountProfile(accountID: authenticated.user.id, deviceID: authenticated.deviceId)
+            _ = try profileRepository?.activateAccountProfile(accountID: CloudClient.originScope.localAccountID(serverUserID: authenticated.user.id), deviceID: authenticated.deviceId)
             email = authenticated.user.email; message = nil
             try openLibrary(); startConnection()
         }
@@ -154,6 +154,9 @@ import ScreenpunkLocalTransport
         accountOperationInProgress = true; defer { accountOperationInProgress = false }
         stopConnection()
         do { try await cloud.signOut(); message = nil }
+        catch CloudSignOutError.secureCredentialsNotCleared {
+            message = "Disconnected for now. This device could not clear its saved sign-in, so it may return after restarting the app. Unlock and restart the app, then sign out again."
+        }
         catch { message = "Signed out on this device. Cloud revocation could not be confirmed; disconnect it from your account when online." }
         email = nil
         do { try profileRepository?.signOut(); try openLibrary(); startConnection() }
@@ -200,12 +203,12 @@ import ScreenpunkLocalTransport
             }
             if let profileID = status.profileID, let session = cloud.session {
                 if let profile = activeProfile, profile.cloudBinding == nil, let library {
-                    let binding = LocalCloudBinding(accountID: session.user.id, profileID: profileID, deviceID: session.deviceId)
+                    let binding = LocalCloudBinding(accountID: CloudClient.originScope.localAccountID(serverUserID: session.user.id), profileID: profileID, deviceID: session.deviceId)
                     try profileRepository?.validateLink(profileID: profile.id, binding: binding)
                     let linked = try library.linkLocalProfile(profile, to: binding)
                     try profileRepository?.adoptLinkedProfile(linked); activeProfile = linked
                 } else {
-                    activeProfile = try profileRepository?.activateCloudProfile(accountID: session.user.id, profileID: profileID, deviceID: session.deviceId)
+                    activeProfile = try profileRepository?.activateCloudProfile(accountID: CloudClient.originScope.localAccountID(serverUserID: session.user.id), profileID: profileID, deviceID: session.deviceId)
                 }
             }
             refreshPreferences()
@@ -951,8 +954,12 @@ import ScreenpunkLocalTransport
     private func openLibrary() throws {
         guard let profileRepository else { throw DeviceError.message("Local identity storage is unavailable.") }
         var profile: LocalProfileDescriptor
-        if let selected = try profileRepository.snapshot().activeProfile { profile = selected }
-        else if let session = cloud.session { profile = try profileRepository.activateAccountProfile(accountID: session.user.id, deviceID: session.deviceId) }
+        let selected = try profileRepository.snapshot().activeProfile
+        if let session = cloud.session,
+           CloudClient.originScope.shouldRestoreAccountProfile(activeProfile: selected, serverUserID: session.user.id) {
+            profile = try profileRepository.activateAccountProfile(accountID: CloudClient.originScope.localAccountID(serverUserID: session.user.id), deviceID: session.deviceId)
+        }
+        else if let selected { profile = selected }
         else { profile = try profileRepository.createLocalProfile() }
         let opened = try ScreenLibrary(profile: profile)
         if var linked = opened.linkedProfile {
@@ -965,14 +972,14 @@ import ScreenpunkLocalTransport
             }
         }
         if let session = cloud.session, let profileID = session.profileID,
-           profile.libraryOwner == session.user.id || profile.cloudBinding?.accountID == session.user.id {
+           profile.libraryOwner == cloud.localAccountID || profile.cloudBinding?.accountID == cloud.localAccountID {
             if profile.cloudBinding == nil {
-                let binding = LocalCloudBinding(accountID: session.user.id, profileID: profileID, deviceID: session.deviceId)
+                let binding = LocalCloudBinding(accountID: CloudClient.originScope.localAccountID(serverUserID: session.user.id), profileID: profileID, deviceID: session.deviceId)
                 try profileRepository.validateLink(profileID: profile.id, binding: binding)
                 profile = try opened.linkLocalProfile(profile, to: binding)
                 try profileRepository.adoptLinkedProfile(profile)
             } else {
-                profile = try profileRepository.activateCloudProfile(accountID: session.user.id, profileID: profileID, deviceID: session.deviceId)
+                profile = try profileRepository.activateCloudProfile(accountID: CloudClient.originScope.localAccountID(serverUserID: session.user.id), profileID: profileID, deviceID: session.deviceId)
             }
         }
         activeProfile = profile; selectedRoute = profile.preferredRoute; routePreference = profile.routePreference

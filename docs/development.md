@@ -1,6 +1,6 @@
 # Developer configuration
 
-The official identity remains `xyz.screenpunk.ios`, Apple team `77KASWDGM6`, and callback scheme `screenpunk-one`. Migration does not change storage locations, Keychain identifiers, preferences, screen library layout, permission prompts, or local/cloud routing. Existing installations must be upgraded under the same official identity.
+The official identity remains `xyz.screenpunk.ios`, Apple team `77KASWDGM6`, and callback scheme `screenpunk-one`. Existing installations must be upgraded under the same official identity. Public-app Cloud credentials and non-staging local account libraries are scoped to the configured API origin; canonical staging safely adopts its earlier credentials and retains its existing library ownership. See [Cloud origin isolation](cloud-origin-isolation.md) for the migration behavior. Local-agent credentials and existing library contents keep their storage locations.
 
 The checked-in default API origin is `https://staging.screenpunk.xyz`. Build with `SCREENPUNK_API_ORIGIN=https://your-server.example` to select a compatible HTTPS origin. This is nonsecret configuration embedded in the app's Info.plist. Native Google OAuth client IDs are public configuration; each fork must register its own client and redirect scheme for its chosen bundle identifier. Backend OAuth client secrets belong on the server.
 
