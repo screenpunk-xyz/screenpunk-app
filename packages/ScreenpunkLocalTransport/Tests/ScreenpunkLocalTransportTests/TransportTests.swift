@@ -75,12 +75,20 @@ private final class FixtureFrames: ChannelInboundHandler, @unchecked Sendable {
 /// IPv4 only, so a successful connection must survive the failed IPv6 socket.
 private final class IPv6FirstResolver: Resolver, @unchecked Sendable {
     let loop: EventLoop
-    init(loop: EventLoop) { self.loop = loop }
+    let ipv4Gate: EventLoopFuture<Void>?
+    let ipv4LookupStarted: XCTestExpectation?
+    init(loop: EventLoop, ipv4Gate: EventLoopFuture<Void>? = nil, ipv4LookupStarted: XCTestExpectation? = nil) {
+        self.loop = loop; self.ipv4Gate = ipv4Gate; self.ipv4LookupStarted = ipv4LookupStarted
+    }
     func initiateAAAAQuery(host: String, port: Int) -> EventLoopFuture<[SocketAddress]> {
         loop.makeSucceededFuture([try! SocketAddress(ipAddress: "::1", port: port)])
     }
     func initiateAQuery(host: String, port: Int) -> EventLoopFuture<[SocketAddress]> {
-        loop.scheduleTask(in: .milliseconds(75)) { [try! SocketAddress(ipAddress: "127.0.0.1", port: port)] }.futureResult
+        if let ipv4Gate {
+            ipv4LookupStarted?.fulfill()
+            return ipv4Gate.map { [try! SocketAddress(ipAddress: "127.0.0.1", port: port)] }
+        }
+        return loop.scheduleTask(in: .milliseconds(75)) { [try! SocketAddress(ipAddress: "127.0.0.1", port: port)] }.futureResult
     }
     func cancelQueries() {}
 }
@@ -170,12 +178,18 @@ final class TransportTests: XCTestCase {
                 XCTAssertEqual(echoed, "after-ipv6-failure")
                 await connection.close()
             }
-            // Cancel while only the losing IPv6 address has been resolved and
-            // before IPv4 can be selected; the candidate registry owns cleanup.
-            let cancelled = Task { try await custom.connect(endpoint: endpoint, credentialReference: .init(rawValue: "fixture")) }
-            try await Task.sleep(nanoseconds: 20_000_000)
+            // Hold IPv4 until cancellation is requested. A timed sleep cannot
+            // guarantee ordering when a hosted runner delays the test task.
+            let loop = fixture.group.next()
+            let ipv4Gate = loop.makePromise(of: Void.self)
+            let lookupStarted = expectation(description: "IPv4 lookup is pending")
+            let cancellationTransport = SSHWebSocketTransport(credentialStore: MemoryStore(key: fixture.privateKey), timeout: .seconds(2), resolver: IPv6FirstResolver(loop: loop, ipv4Gate: ipv4Gate.futureResult, ipv4LookupStarted: lookupStarted))
+            let cancelled = Task { try await cancellationTransport.connect(endpoint: endpoint, credentialReference: .init(rawValue: "fixture")) }
+            await fulfillment(of: [lookupStarted], timeout: 2)
             cancelled.cancel()
-            do { _ = try await cancelled.value; XCTFail("Cancelled dual-stack dial succeeded") }
+            // Let the connector settle its outstanding lookup and reap channels.
+            ipv4Gate.succeed(())
+            do { let connection = try await cancelled.value; await connection.close(); XCTFail("Cancelled dual-stack dial succeeded") }
             catch { XCTAssertTrue(error is CancellationError) }
         } catch { await fixture.stop(); throw error }
         await fixture.stop()
