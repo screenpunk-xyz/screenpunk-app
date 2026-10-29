@@ -1043,13 +1043,20 @@ import ScreenpunkLocalTransport
         refreshScreen()
     }
     func profileLabel(_ profile: LocalProfileDescriptor) -> String {
-        let kind = profile.libraryOwner.hasPrefix("local:") ? (profile.cloudBinding == nil ? "Local library" : "Linked local library") : "Cloud account library"
+        let accountID = profile.cloudBinding?.accountID ?? profile.libraryOwner
+        let kind = profile.libraryOwner.hasPrefix("local:") ? (profile.cloudBinding == nil ? "Local library" : "Linked local library") : (accountID == cloud.localAccountID ? "Current Cloud library" : "Previous Cloud library")
         return kind + " · " + String(profile.id.prefix(6))
     }
     func selectProfile(_ id: String) {
         guard !routeChangeBlocked, id != activeProfile?.id else { return }
         do {
             guard let repository = profileRepository else { throw DeviceError.message("Local identity storage is unavailable.") }
+            guard let selected = try repository.snapshot().profiles.first(where: { $0.id == id }) else { throw DeviceError.message("This saved library is missing.") }
+            let accountID = selected.cloudBinding?.accountID ?? selected.libraryOwner
+            let isCloudLibrary = selected.cloudBinding != nil || !selected.libraryOwner.hasPrefix("local:")
+            if isCloudLibrary, accountID != cloud.localAccountID {
+                try repository.setRoutePreference(.local, profileID: id)
+            }
             try repository.activateProfile(id: id)
             stopConnection(); detachAccountLibrary()
             try openLibrary(); message = nil; startConnection()

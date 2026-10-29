@@ -128,6 +128,27 @@ final class CloudOriginScopeTests: XCTestCase {
         XCTAssertEqual(try repository.snapshot().profiles.count, 2)
     }
 
+    func testPreviousCloudLibraryRemainsSelectableForLocalUseAcrossLaunches() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("CloudOriginPreviousLibraryTests-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let repository = try LocalProfileRepository(rootDirectory: root)
+        let previous = try repository.activateCloudProfile(accountID: staging.localAccountID(serverUserID: "same-google-sub"), profileID: "previous-profile", deviceID: "previous-device")
+        let current = try repository.activateCloudProfile(accountID: production.localAccountID(serverUserID: "same-google-sub"), profileID: "current-profile", deviceID: "current-device")
+        XCTAssertTrue(production.shouldRestoreAccountProfile(activeProfile: previous, serverUserID: "same-google-sub"))
+        try repository.setRoutePreference(.local, profileID: previous.id)
+        try repository.activateProfile(id: previous.id)
+        let restarted = try LocalProfileRepository(rootDirectory: root).snapshot()
+        let selected = try XCTUnwrap(restarted.activeProfile)
+        XCTAssertEqual(selected.id, previous.id)
+        XCTAssertEqual(selected.cloudBinding, previous.cloudBinding)
+        XCTAssertEqual(selected.libraryOwner, previous.libraryOwner)
+        XCTAssertEqual(selected.permissionOwner, previous.permissionOwner)
+        XCTAssertEqual(selected.routePreference, .local)
+        XCTAssertFalse(production.shouldRestoreAccountProfile(activeProfile: selected, serverUserID: "same-google-sub"))
+        XCTAssertNotEqual(selected.cloudBinding?.accountID, current.cloudBinding?.accountID)
+        XCTAssertEqual(restarted.profiles.count, 2)
+    }
+
     func testRestoredSessionPreservesIntentionalLocalOnlySelectionButReselectsForeignLinkedProfiles() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("CloudOriginLocalSelectionTests-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

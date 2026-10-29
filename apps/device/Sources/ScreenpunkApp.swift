@@ -10,7 +10,10 @@ struct DeviceRootView: View {
     @StateObject private var speech = SpeechCapture()
     @StateObject private var display = DeviceDisplayPreferences()
     @State private var setupRequestCopied = false
-    private let setupRequest = "Please use the Screenpunk Staging plugin to listen for requests from my Screenpunk devices. Subscribe to screenpunk.request.created, keep the subscription active, and handle incoming device requests. Confirm which Screenpunk account you are connected to."
+    private var setupRequest: String {
+        let plugin = CloudClient.originScope.permitsLegacyMigration ? "Screenpunk Staging" : "Screenpunk Production"
+        return "Please use the \(plugin) plugin to listen for requests from my Screenpunk devices. Subscribe to screenpunk.request.created, keep the subscription active, and handle incoming device requests. Confirm which Screenpunk account you are connected to."
+    }
     @Environment(\.scenePhase) private var scenePhase
     var body: some View {
         ZStack {
@@ -311,6 +314,21 @@ struct DeviceSettingsView: View {
                     Label(model.agentReady ? "Agent ready" : "Waiting for agent", systemImage: model.agentReady ? "checkmark.circle" : "clock")
                     Button("Sign in again") { Task { await model.signIn() } }.disabled(model.accountOperationInProgress || model.routeChangeBlocked)
                     Button("Sign out", role: .destructive) { Task { await model.signOut() } }.disabled(model.accountOperationInProgress || model.routeChangeBlocked)
+                }
+                if model.availableProfiles.count > 1 {
+                    Section("Saved libraries") {
+                        ForEach(model.availableProfiles) { profile in
+                            Button { model.selectProfile(profile.id) } label: {
+                                HStack {
+                                    Text(model.profileLabel(profile))
+                                    Spacer()
+                                    if profile.id == model.activeProfile?.id { Image(systemName: "checkmark") }
+                                }
+                            }.disabled(model.accountOperationInProgress || model.routeChangeBlocked)
+                        }
+                        Text("Signing in opens that Cloud account’s library. Earlier libraries stay on this device. Selecting a previous Cloud library uses your local agent; its screens and permissions stay separate from the current Cloud account.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                 }
             }
         case .screens:
