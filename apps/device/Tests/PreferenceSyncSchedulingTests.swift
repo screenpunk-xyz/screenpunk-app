@@ -31,6 +31,18 @@ import ScreenpunkCore
 }
 
 final class PreferenceSyncSchedulingTests: XCTestCase {
+    func testCloudPreferenceEligibilityRequiresTheSameOriginEvenForTheSameServerUser() {
+        let staging = CloudOriginScope(origin: "https://staging.screenpunk.xyz")!
+        let production = CloudOriginScope(origin: "https://api.screenpunk.xyz")!
+        let stagingAccount = staging.localAccountID(serverUserID: "same-google-sub")
+        let productionAccount = production.localAccountID(serverUserID: "same-google-sub")
+        // Hold wire identifiers equal to prove the local account namespace is sufficient.
+        let binding = LocalCloudBinding(accountID: stagingAccount, profileID: "profile", deviceID: "device")
+        let profile = LocalProfileDescriptor(id: "staging", libraryOwner: stagingAccount, permissionOwner: stagingAccount, localDeviceID: "installation", cloudBinding: binding)
+        XCTAssertTrue(CloudPreferenceSyncEligibility.matches(profile: profile, accountID: stagingAccount, deviceID: "device", profileID: "profile"))
+        XCTAssertFalse(CloudPreferenceSyncEligibility.matches(profile: profile, accountID: productionAccount, deviceID: "device", profileID: "profile"))
+        XCTAssertFalse(CloudPreferenceSyncEligibility.matches(profile: profile, accountID: nil, deviceID: nil, profileID: nil))
+    }
     func testEveryAuthoringRouteCanSyncOnlyItsMatchingCloudBinding() {
         let binding = LocalCloudBinding(accountID: "account", profileID: "wire-profile", deviceID: "device")
         for route in AuthoringRoutePreference.allCases {

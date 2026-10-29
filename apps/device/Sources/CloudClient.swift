@@ -12,6 +12,7 @@ struct DeviceSession: Codable {
     var profileID: String?
     struct User: Codable { let id: String; let email: String; let name: String? }
 }
+enum CloudSignOutError: Error { case secureCredentialsNotCleared }
 struct AgentStatus: Decodable {
     let agentReady: Bool
     let profileID: String?
@@ -22,20 +23,21 @@ struct AgentStatus: Decodable {
     struct Summary: Decodable { let id: String; let status: String }
 }
 @MainActor final class CloudClient: NSObject, ASWebAuthenticationPresentationContextProviding {
-    static let origin: URL = {
+    static let originScope: CloudOriginScope = {
         let configured = Bundle.main.object(forInfoDictionaryKey: "ScreenpunkAPIOrigin") as? String
         let value = configured.flatMap { $0.isEmpty || $0.hasPrefix("$(") ? nil : $0 }
             ?? "https://staging.screenpunk.xyz"
-        guard let url = URL(string: value), url.scheme == "https", url.host != nil,
-              url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
-              url.path.isEmpty || url.path == "/" else {
+        guard let scope = CloudOriginScope(origin: value) else {
             preconditionFailure("ScreenpunkAPIOrigin must be an HTTPS origin")
         }
-        return url
+        return scope
     }()
+    static var origin: URL { originScope.url }
     private var authSession: ASWebAuthenticationSession?
     private var enrolledToken: String?
     var session: DeviceSession? = SessionKeychain.load()
+    /// Used only for local libraries, ownership, permissions and preference eligibility.
+    var localAccountID: String? { session.map { Self.originScope.localAccountID(serverUserID: $0.user.id) } }
     func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
         UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap(\.windows).first(where: \.isKeyWindow) ?? ASPresentationAnchor()
     }
@@ -126,8 +128,13 @@ struct AgentStatus: Decodable {
         return try JSONDecoder().decode(T.self, from: data.isEmpty ? Data("{}".utf8) : data)
     }
     func signOut() async throws {
-        defer { SessionKeychain.clear(); session = nil; enrolledToken = nil }
-        let _: EmptyResponse = try await call("api/device/session", method: "DELETE")
+        defer { session = nil; enrolledToken = nil }
+        var revocationError: Error?
+        do { let _: EmptyResponse = try await call("api/device/session", method: "DELETE") }
+        catch { revocationError = error }
+        do { try SessionKeychain.clear() }
+        catch { throw CloudSignOutError.secureCredentialsNotCleared }
+        if let revocationError { throw revocationError }
     }
     private static func randomToken() throws -> String {
         var bytes = [UInt8](repeating: 0, count: 32)
@@ -259,42 +266,63 @@ struct PreferenceSyncResponse: Decodable {
 }
 
 private extension Data { var base64URL: String { base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "") } }
-private enum SessionKeychain {
-    static let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "xyz.screenpunk.one.cloud", kSecAttrAccount as String: "session"]
+@MainActor private enum SessionKeychain {
+    private static var credentials: OriginScopedCloudCredentials { .init(scope: CloudClient.originScope) }
     static func load() -> DeviceSession? {
-        var request = query; request[kSecReturnData as String] = true; request[kSecMatchLimit as String] = kSecMatchLimitOne
-        var result: CFTypeRef?
-        guard SecItemCopyMatching(request as CFDictionary, &result) == errSecSuccess, let data = result as? Data else { return nil }
+        guard let data = try? credentials.load(account: "session", vault: CloudKeychainVault()) else { return nil }
         return try? JSONDecoder().decode(DeviceSession.self, from: data)
     }
     static func save(_ session: DeviceSession) throws {
-        let data = try JSONEncoder().encode(session)
+        try credentials.save(JSONEncoder().encode(session), account: "session", vault: CloudKeychainVault())
+    }
+    static func clear() throws { try credentials.clear(account: "session", vault: CloudKeychainVault()) }
+}
+
+/// Installation secret is scoped independently of sign-in credentials and survives sign-out.
+/// Only canonical staging can adopt the public app's earlier fixed installation identity.
+@MainActor private enum InstallationIdentity {
+    static func loadOrCreate() throws -> String {
+        let credentials = OriginScopedCloudCredentials(scope: CloudClient.originScope)
+        let vault = CloudKeychainVault()
+        if let data = try credentials.load(account: "installation-key", vault: vault) {
+            guard let key = String(data: data, encoding: .utf8), key.utf8.count == 43 else {
+                throw DeviceError.message("Could not read this device’s secure installation identity.")
+            }
+            return key
+        }
+        var bytes = [UInt8](repeating: 0, count: 32)
+        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else { throw DeviceError.message("Could not create this device’s secure installation identity.") }
+        let key = Data(bytes).base64URL
+        try credentials.save(Data(key.utf8), account: "installation-key", vault: vault)
+        return key
+    }
+}
+
+private struct CloudKeychainVault: CloudCredentialVault {
+    private func query(service: String, account: String) -> [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account]
+    }
+    func read(service: String, account: String) throws -> Data? {
+        var request = query(service: service, account: account)
+        request[kSecReturnData as String] = true; request[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(request as CFDictionary, &result)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess, let data = result as? Data else { throw DeviceError.message("Could not read your secure Cloud connection.") }
+        return data
+    }
+    func write(_ data: Data, service: String, account: String) throws {
+        let query = query(service: service, account: account)
         let updates: [String: Any] = [kSecValueData as String: data, kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly]
         let status = SecItemUpdate(query as CFDictionary, updates as CFDictionary)
         if status == errSecItemNotFound {
             var item = query; updates.forEach { item[$0.key] = $0.value }
-            guard SecItemAdd(item as CFDictionary, nil) == errSecSuccess else { throw DeviceError.message("Could not save your secure connection.") }
-        } else if status != errSecSuccess { throw DeviceError.message("Could not update your secure connection.") }
+            guard SecItemAdd(item as CFDictionary, nil) == errSecSuccess else { throw DeviceError.message("Could not save your secure Cloud connection.") }
+        } else if status != errSecSuccess { throw DeviceError.message("Could not update your secure Cloud connection.") }
     }
-    static func clear() { SecItemDelete(query as CFDictionary) }
-}
-
-/// Installation secret is separate from sign-in credentials and never leaves the
-/// authentication/enrollment flow. It is not authoring context or user preference data.
-private enum InstallationIdentity {
-    private static let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "xyz.screenpunk.one.cloud", kSecAttrAccount as String: "installation-key"]
-    static func loadOrCreate() throws -> String {
-        var request = query; request[kSecReturnData as String] = true; request[kSecMatchLimit as String] = kSecMatchLimitOne
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(request as CFDictionary, &result)
-        if status == errSecSuccess, let data = result as? Data, let key = String(data: data, encoding: .utf8), key.utf8.count == 43 { return key }
-        guard status == errSecItemNotFound else { throw DeviceError.message("Could not read this device’s secure installation identity.") }
-        var bytes = [UInt8](repeating: 0, count: 32)
-        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else { throw DeviceError.message("Could not create this device’s secure installation identity.") }
-        let key = Data(bytes).base64URL
-        var item = query; item[kSecValueData as String] = Data(key.utf8); item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        guard SecItemAdd(item as CFDictionary, nil) == errSecSuccess else { throw DeviceError.message("Could not save this device’s secure installation identity.") }
-        return key
+    func delete(service: String, account: String) throws {
+        let status = SecItemDelete(query(service: service, account: account) as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else { throw DeviceError.message("Could not remove your earlier secure Cloud connection.") }
     }
 }
 
