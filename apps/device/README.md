@@ -1,4 +1,4 @@
-# Screenpunk One device
+# Screenpunk device
 
 Universal iOS 16+ app, using the existing Screenpunk bundle identity (`xyz.screenpunk.ios`) and Screenpunk development team. Installing replaces the previous app on the selected device; it does not update other devices. Open `ScreenpunkOne.xcodeproj`, select the ScreenpunkOne scheme, choose your development team and a connected iPad, and Run. Signing keys and provisioning profiles remain local; only the public team identifier is stored in source.
 
