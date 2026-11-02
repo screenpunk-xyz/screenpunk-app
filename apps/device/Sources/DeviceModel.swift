@@ -171,6 +171,7 @@ import ScreenpunkLocalTransport
             email = authenticated.user.email; message = nil
             try openLibrary(); startConnection()
         }
+        catch is CancellationError { message = nil; startConnection() }
         catch { message = error.localizedDescription; startConnection() }
     }
     func signOut() async {

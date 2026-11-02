@@ -93,7 +93,7 @@ struct DeviceRootView: View {
             }
         } else if model.email == nil && model.routePreference == .cloud {
             introduction(title: "Connect Screenpunk Cloud", detail: "Sign in to use your Cloud agent. Your saved screens stay available on this device.") {
-                Button("Sign in with Google") { Task { await model.signIn() } }.buttonStyle(.borderedProminent).disabled(model.accountOperationInProgress || model.routeChangeBlocked)
+                Button("Sign in to Screenpunk") { Task { await model.signIn() } }.buttonStyle(.borderedProminent).disabled(model.accountOperationInProgress || model.routeChangeBlocked)
                 Button("Settings") { model.settingsOpen = true }
             }
         } else if !model.agentReady {
@@ -166,7 +166,7 @@ struct CloudListenerSetupView: View {
                     Text("SCREENPUNK").font(.caption.weight(.bold)).tracking(4).foregroundStyle(.orange)
                     Text("Connect your Cloud agent").font(.largeTitle.bold())
                 }
-                step(1, "Connect the plugin", email.map { "Use \($0) in ChatGPT too." } ?? "Sign in on this iPad first, then use the same account in ChatGPT.")
+                step(1, "Connect the plugin", email.map { "Use \($0) and the same sign-in option in ChatGPT." } ?? "Sign in on this iPad first, then use the same account and sign-in option in ChatGPT.")
                 if let pluginURL { Link("Connect \(pluginName)", destination: pluginURL).buttonStyle(.bordered) }
                 else { Text("Use the plugin link from your Screenpunk provider.").font(.callout) }
                 step(2, "Start the listener", "Open Work → Cloud (or your dot), select @\(pluginName), and send this request.")
@@ -177,7 +177,7 @@ struct CloudListenerSetupView: View {
                 DisclosureGroup("Need help?") {
                     VStack(alignment: .leading, spacing: 10) {
                         Text("No subscription support? Use Work + Cloud or a dot. Local Codex tasks cannot run the listener.")
-                        Text("Still waiting? Check that both apps use the same email.")
+                        Text("Still waiting? Use the same account and sign-in option in both apps.")
                         Text("Earlier screens: Settings → Account → Saved libraries.")
                     }.font(.callout).padding(.top, 8)
                 }

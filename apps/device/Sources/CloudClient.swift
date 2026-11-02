@@ -54,9 +54,11 @@ struct AgentStatus: Decodable {
         let challenge = Data(SHA256.hash(data: Data(verifier.utf8))).base64URL
         var url = URLComponents(url: Self.origin.appendingPathComponent("auth/device/authorize"), resolvingAgainstBaseURL: false)!
         url.queryItems = [.init(name: "code_challenge", value: challenge), .init(name: "code_challenge_method", value: "S256"), .init(name: "state", value: state)]
+        defer { authSession = nil }
         let callback: URL = try await withCheckedThrowingContinuation { continuation in
             let flow = ASWebAuthenticationSession(url: url.url!, callbackURLScheme: "screenpunk-one") { callback, error in
-                if let error { continuation.resume(throwing: error) }
+                if let error = error as? ASWebAuthenticationSessionError, error.code == .canceledLogin { continuation.resume(throwing: CancellationError()) }
+                else if let error { continuation.resume(throwing: error) }
                 else if let callback { continuation.resume(returning: callback) }
                 else { continuation.resume(throwing: DeviceError.message("Sign-in did not return a response.")) }
             }
@@ -64,9 +66,11 @@ struct AgentStatus: Decodable {
             self.authSession = flow
             if !flow.start() { continuation.resume(throwing: DeviceError.message("Could not open sign-in.")) }
         }
-        defer { authSession = nil }
         let items = URLComponents(url: callback, resolvingAgainstBaseURL: false)?.queryItems ?? []
-        guard callback.host == "auth", callback.path == "/callback", items.first(where: { $0.name == "state" })?.value == state,
+        guard callback.host == "auth", callback.path == "/callback", items.filter({ $0.name == "state" }).count == 1,
+              items.first(where: { $0.name == "state" })?.value == state else { throw DeviceError.message("Sign-in response could not be verified.") }
+        if items.first(where: { $0.name == "error" })?.value == "access_denied" { throw CancellationError() }
+        guard items.filter({ $0.name == "code" }).count == 1,
               let code = items.first(where: { $0.name == "code" })?.value else { throw DeviceError.message("Sign-in response could not be verified.") }
         let value: DeviceSession = try await call("auth/device/token", method: "POST", body: ["code": code, "codeVerifier": verifier, "installationKey": installationKey], authenticated: false)
         let registered = try await registerSession(value)
