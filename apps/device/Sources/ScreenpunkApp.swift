@@ -96,12 +96,37 @@ struct DeviceRootView: View {
         }
     }
     private func introduction<Content: View>(title: String, detail: String, @ViewBuilder actions: () -> Content) -> some View {
-        VStack(spacing: 24) { Text("SCREENPUNK").font(.caption.weight(.bold)).tracking(4).foregroundStyle(.orange); Text(title).font(.largeTitle.bold()); Text(detail).font(.title3).foregroundStyle(.secondary); actions() }.multilineTextAlignment(.center).padding(32).frame(maxWidth: 660)
+        CenteredOnboardingPage(maximumWidth: 660) {
+            VStack(spacing: 24) { Text("SCREENPUNK").font(.caption.weight(.bold)).tracking(4).foregroundStyle(.orange); Text(title).font(.largeTitle.bold()); Text(detail).font(.title3).foregroundStyle(.secondary); actions() }
+                .multilineTextAlignment(.center).padding(32)
+        }
     }
     private func beginSpeech() {
         guard !model.settingsOpen else { return }
         guard model.hasProfile, !model.busy else { model.message = model.busy ? "Your agent is still working." : "Connect your agent before speaking."; return }
         speech.begin { text in Task { await model.send(text) } }
+    }
+}
+
+/// Center short onboarding pages within the safe area while letting larger text
+/// and compact screens scroll without clipping their actions.
+private struct CenteredOnboardingPage<Content: View>: View {
+    let maximumWidth: CGFloat
+    private let content: Content
+
+    init(maximumWidth: CGFloat = 680, @ViewBuilder content: () -> Content) {
+        self.maximumWidth = maximumWidth
+        self.content = content()
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            ScrollView {
+                content
+                    .frame(maxWidth: maximumWidth)
+                    .frame(maxWidth: .infinity, minHeight: geometry.size.height)
+            }
+        }
     }
 }
 
@@ -125,7 +150,7 @@ struct CloudListenerSetupView: View {
         return "Use @\(pluginName). \(account) Subscribe to screenpunk.request.created, keep listening, and handle my device requests. Confirm when the subscription is active. If subscriptions aren’t available, tell me to use Work + Cloud or a dot."
     }
     var body: some View {
-        ScrollView {
+        CenteredOnboardingPage {
             VStack(alignment: .leading, spacing: 24) {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("SCREENPUNK").font(.caption.weight(.bold)).tracking(4).foregroundStyle(.orange)
@@ -149,7 +174,7 @@ struct CloudListenerSetupView: View {
                 Text("Invited preview · Screenpunk and plugin access required.")
                     .font(.caption).foregroundStyle(.secondary)
             }
-            .padding(28).frame(maxWidth: 680).frame(maxWidth: .infinity)
+            .padding(28)
         }
         .background(Color.black).foregroundStyle(.white)
         .onChange(of: email) { _ in copied = false }
@@ -184,9 +209,15 @@ struct CloudListenerSetupView_Previews: PreviewProvider {
     static var previews: some View {
         Group {
             CloudListenerSetupView(scope: CloudOriginScope(origin: "https://api.screenpunk.xyz")!, email: "preview@example.com")
+                .previewLayout(.fixed(width: 1024, height: 768))
                 .previewDisplayName("Production · signed in")
             CloudListenerSetupView(scope: CloudOriginScope(origin: "https://staging.screenpunk.xyz")!, email: nil)
+                .previewLayout(.fixed(width: 834, height: 1112))
                 .previewDisplayName("Staging · before sign-in")
+            CloudListenerSetupView(scope: CloudOriginScope(origin: "https://api.screenpunk.xyz")!, email: nil)
+                .previewLayout(.fixed(width: 393, height: 852))
+                .environment(\.sizeCategory, .accessibilityExtraExtraExtraLarge)
+                .previewDisplayName("iPhone · large text")
         }
     }
 }
@@ -194,7 +225,7 @@ struct CloudListenerSetupView_Previews: PreviewProvider {
 
 enum DeviceSettingsPage: String, Hashable {
     case overview = "Overview", guidedAccess = "Guided Access", display = "Display", account = "Account", screens = "Screens"
-    case preferences = "Preferences", agents = "Agents"
+    case agents = "Agents"
     case home = "Home Assistant", television = "Google TV", calendar = "Google Calendar", publicData = "Public Data"
     var symbol: String {
         switch self {
@@ -203,7 +234,6 @@ enum DeviceSettingsPage: String, Hashable {
         case .display: return "sun.max"
         case .account: return "person.crop.circle"
         case .screens: return "rectangle.stack"
-        case .preferences: return "slider.horizontal.3"
         case .agents: return "sparkles"
         case .home: return "house"
         case .television: return "tv"
@@ -218,8 +248,6 @@ struct DeviceSettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var selection: DeviceSettingsPage? = .overview
     @State private var screenToRemove: ScreenLibrary.Saved?
-    @State private var preferenceToEdit: PreferenceRecordV1?
-    @State private var preferenceToDelete: PreferenceRecordV1?
     @State private var columns: NavigationSplitViewVisibility = .all
     @Environment(\.horizontalSizeClass) private var sizeClass
     private var providers: [DeviceSettingsPage] {
@@ -234,13 +262,14 @@ struct DeviceSettingsView: View {
         NavigationSplitView(columnVisibility: $columns) {
             List(selection: $selection) {
                 Section {
-                    row(.overview)
-                    row(.guidedAccess)
+                    row(.account)
+                    row(.agents)
                 }
-                Section("Device") { row(.display); row(.account); row(.screens); row(.preferences); row(.agents) }
+                Section("Device") { row(.display); row(.screens) }
                 if !providers.isEmpty {
                     Section("Connections") { ForEach(providers, id: \.self) { row($0) } }
                 }
+                Section("Help") { row(.overview); row(.guidedAccess) }
             }
             .listStyle(.sidebar)
             .navigationTitle("Settings")
@@ -257,18 +286,6 @@ struct DeviceSettingsView: View {
         .navigationSplitViewStyle(.balanced)
         .onAppear { selection = model.settingsPage }
         .onChange(of: selection) { if let page = $0 { model.settingsPage = page } }
-        .sheet(isPresented: Binding(get: { preferenceToEdit != nil }, set: { if !$0 { preferenceToEdit = nil } })) {
-            if let preference = preferenceToEdit { DevicePreferenceEditor(model: model, preference: preference) }
-        }
-        .alert("Delete preference?", isPresented: Binding(get: { preferenceToDelete != nil }, set: { if !$0 { preferenceToDelete = nil } })) {
-            Button("Cancel", role: .cancel) { preferenceToDelete = nil }
-            Button("Delete", role: .destructive) {
-                if let preference = preferenceToDelete { model.deletePreference(preference) }
-                preferenceToDelete = nil
-            }
-        } message: {
-            Text("Delete this \(preferenceToDelete?.scope ?? "") preference for \(preferenceToDelete?.targetID ?? "")? The deletion is saved on this device and syncs with Cloud when connected.")
-        }
         .alert("Remove screen?", isPresented: Binding(get: { screenToRemove != nil }, set: { if !$0 { screenToRemove = nil } })) {
             Button("Cancel", role: .cancel) { screenToRemove = nil }
             Button("Remove", role: .destructive) {
@@ -319,59 +336,6 @@ struct DeviceSettingsView: View {
             }
         case .display:
             DeviceDisplaySettings(preferences: display)
-        case .preferences:
-            Form {
-                Section {
-                    Text("Preferences are saved only when you explicitly ask your agent to remember something or edit a saved preference here. Profile preferences apply to your profile; device and screen preferences apply to their named target.")
-                    if let status = model.preferenceSyncStatus { Label(status, systemImage: "arrow.triangle.2.circlepath").foregroundStyle(.secondary) }
-                }
-                if !model.preferenceConflicts.isEmpty {
-                    Section("Resolve changes") {
-                        ForEach(model.preferenceConflicts, id: \.id) { conflict in
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text(conflict.local.category).font(.headline)
-                                Text("\(conflict.local.scope) · \(conflict.local.targetID)").font(.caption).textSelection(.enabled)
-                                Text("On this device: \(conflict.local.deleted ? "Deleted" : model.preferenceValueText(conflict.local))")
-                                Text("Cloud: \(conflict.remote.map { $0.deleted ? "Deleted" : model.preferenceValueText($0) } ?? "Deleted")")
-                                HStack {
-                                    Button("Keep this device’s change") { model.resolvePreference(conflict.id, keepLocal: true) }
-                                    Button("Use Cloud change") { model.resolvePreference(conflict.id, keepLocal: false) }
-                                }.buttonStyle(.bordered)
-                            }.padding(.vertical, 4)
-                        }
-                    }
-                }
-                ForEach(["profile", "device", "screen"], id: \.self) { scope in
-                    Section(scope.capitalized) {
-                        let records = model.preferenceRecords.filter { $0.scope == scope }
-                        if records.isEmpty { Text("No saved preferences").foregroundStyle(.secondary) }
-                        ForEach(records, id: \.id) { record in
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text(record.category).font(.headline)
-                                Text(model.preferenceValueText(record)).textSelection(.enabled)
-                                Text("Target: \(record.targetID) · Revision \(record.revision)").font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
-                                HStack {
-                                    Button("Edit") { preferenceToEdit = record }
-                                    Button("Delete", role: .destructive) { preferenceToDelete = record }
-                                }.buttonStyle(.borderless)
-                            }.padding(.vertical, 4)
-                        }
-                    }
-                }
-                if !model.inactiveDevicePreferences.isEmpty {
-                    Section("Previous device connections") {
-                        Text("These preferences are retained on this device and do not apply to your current connection.").foregroundStyle(.secondary)
-                        ForEach(model.inactiveDevicePreferences, id: \.id) { record in
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(record.category).font(.headline)
-                                Text(model.preferenceValueText(record))
-                                Text("Device: \(record.targetID)").font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
-                            }
-                        }
-                    }
-                }
-                if let message = model.message { Section { Text(message).foregroundStyle(.secondary) } }
-            }
         case .agents:
             if let localSettings = model.localSettings { DeviceAgentsSettings(device: model, model: localSettings) }
             else { Text("Local agent storage could not be opened.") }
@@ -452,73 +416,6 @@ struct DeviceSettingsView: View {
         }
     }
 }
-
-private struct DevicePreferenceEditor: View {
-    @ObservedObject var model: DeviceModel
-    let preference: PreferenceRecordV1
-    @Environment(\.dismiss) private var dismiss
-    @State private var valueType = "text"
-    @State private var text = ""
-    @State private var yes = false
-    @State private var error: String?
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section("Applies to") {
-                    LabeledContent("Scope", value: preference.scope.capitalized)
-                    LabeledContent("Target", value: preference.targetID)
-                    LabeledContent("Category", value: preference.category)
-                    Text("Saving explicitly changes this saved preference in the scope shown above.").font(.caption)
-                }
-                Section("Value") {
-                    Picker("Value type", selection: $valueType) {
-                        Text("Text").tag("text")
-                        Text("Number").tag("number")
-                        Text("Yes or no").tag("boolean")
-                        Text("No value").tag("null")
-                    }
-                    if valueType == "text" {
-                        TextField("Preference", text: $text, axis: .vertical)
-                    } else if valueType == "number" {
-                        TextField("Number", text: $text).keyboardType(.numbersAndPunctuation)
-                    } else if valueType == "boolean" {
-                        Toggle("Yes", isOn: $yes)
-                    }
-                }
-                if let error { Section { Text(error).foregroundStyle(.red) } }
-            }
-            .navigationTitle("Edit preference")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Save for \(preference.scope)") {
-                        do {
-                            let value: AuthoringJSONValue
-                            switch valueType {
-                            case "number":
-                                guard let number = Double(text), number.isFinite else { throw DeviceError.message("Enter a valid number.") }
-                                value = .number(number)
-                            case "boolean": value = .bool(yes)
-                            case "null": value = .null
-                            default: value = .string(text)
-                            }
-                            try model.editPreference(preference, value: value); dismiss()
-                        } catch { self.error = error.localizedDescription }
-                    }
-                }
-            }
-            .onAppear {
-                switch preference.value {
-                case .string(let value): valueType = "text"; text = value
-                case .number(let value): valueType = "number"; text = String(value)
-                case .bool(let value): valueType = "boolean"; yes = value
-                default: valueType = "null"
-                }
-            }
-        }
-    }
-}
-
 
 private struct RequestStatusPill: View {
     @ObservedObject var model: DeviceModel
