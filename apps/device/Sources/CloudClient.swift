@@ -187,17 +187,7 @@ struct PreferenceSyncResponse: Decodable {
     }
     func reconcile(requestID: String) async throws -> AuthoringDeliveryState {
         let response: AgentRequest = try await cloud.call("api/device/requests/\(requestID)")
-        if let unsupported = response.canonicalUnsupported { return .ended(status: unsupported.code, message: unsupported.message) }
-        if response.status == "completed" {
-            guard let result = response.authoringResult else {
-                throw DeviceError.message("This result has no verified authoring envelope. Your screen is unchanged.")
-            }
-            return .completed(result)
-        }
-        if ["failed", "cancelled", "timed_out"].contains(response.status) {
-            return .ended(status: response.status, message: response.failure)
-        }
-        return .pending(Self.progress(response))
+        return try response.deliveryState(requestID: requestID)
     }
     func cancel(requestID: String) async throws {
         do { let _: AgentRequest = try await cloud.call("api/device/requests/\(requestID)/cancel", method: "POST") }
@@ -241,17 +231,7 @@ struct PreferenceSyncResponse: Decodable {
     }
     func reconcile(requestID: String) async throws -> AuthoringDeliveryStateV2 {
         let response: AgentRequestV2 = try await cloud.call("api/device/requests/\(requestID)", authoringVersion: 2)
-        if let unsupported = response.canonicalUnsupported { return .ended(status: unsupported.code, message: unsupported.message) }
-        if response.status == "completed" {
-            guard let result = response.authoringResult else {
-                throw DeviceError.message("This result has no verified asset mutation envelope. Your screen is unchanged.")
-            }
-            return .completed(result)
-        }
-        if ["failed", "cancelled", "timed_out"].contains(response.status) {
-            return .ended(status: response.status, message: response.failure)
-        }
-        return .pending(Self.progress(response))
+        return try response.deliveryState(requestID: requestID)
     }
     func cancel(requestID: String) async throws {
         do { let _: AgentRequestV2 = try await cloud.call("api/device/requests/\(requestID)/cancel", method: "POST", authoringVersion: 2) }

@@ -167,7 +167,7 @@ import ScreenpunkLocalTransport
     func reconcileTemporary() {
         let settled = settleAcknowledgedPending()
         takingLonger = requestPending && Date().timeIntervalSince(max(lastProgressAt, warningDismissedAt)) >= 60
-        if !settled, requestPending, let id = pendingID, let library {
+        if !settled, requestPending, currentRequestRoute == .local, let id = pendingID, let library {
             if let snapshot = library.authoringRequestV2(id: id) {
                 if recoveryAction(snapshot, library: library) == .cancelExpired { cancelKnownRequest(id, timedOut: true) }
             } else if let deadline = library.state.requestDeadline, Date().timeIntervalSince1970 * 1000 >= deadline {
@@ -222,16 +222,25 @@ import ScreenpunkLocalTransport
             agentReady = routePreference == .automatic ? (localAgent != nil || cloudAgentReady) : cloudAgentReady
             if let command = status.command { await applyCommand(command) }
             guard cloud.session?.accessToken == token, foreground, generation == connectionGeneration, !Task.isCancelled else { return true }
-            if pendingID == nil, let latest = status.latestRequest, latest.id != consumedID, latest.id != library?.state.lastRequest {
-                pendingID = latest.id
-                try persistPending()
-                // Canonical requests retain their original screen ID and immutable base revision.
+            var discoveredRequest: AgentRequest?
+            if pendingID == nil, let latest = status.latestRequest {
+                discoveredRequest = try await CloudRequestRecovery.discoverPending(id: latest.id, status: latest.status,
+                    consumedID: consumedID, lastAppliedRequestID: library?.state.lastRequest) { id in
+                    try await self.cloud.call("api/device/requests/\(id)", authoringVersion: 2)
+                }
+                guard cloud.session?.accessToken == token, foreground, generation == connectionGeneration, !Task.isCancelled else { return true }
+                if let discoveredRequest {
+                    pendingID = discoveredRequest.id
+                    try persistPending()
+                }
             }
             if let id = pendingID {
                 if library?.authoringRequestV2(id: id) != nil { return await pollAuthoringV2(generation: generation) }
                 guard let authoring else { throw DeviceError.message("Local authoring storage is unavailable.") }
                 if library?.authoringRequest(id: id) == nil {
-                    let restored: AgentRequest = try await cloud.call("api/device/requests/\(id)", authoringVersion: 2)
+                    let restored: AgentRequest
+                    if let discoveredRequest { restored = discoveredRequest }
+                    else { restored = try await cloud.call("api/device/requests/\(id)", authoringVersion: 2) }
                     guard cloud.session?.accessToken == token, foreground, generation == connectionGeneration, !Task.isCancelled else { return true }
                     if let snapshot = restored.snapshotV2 {
                         guard snapshot.delivery.route == "cloud", snapshot.context.profileID == cloud.session?.profileID, snapshot.context.deviceID == cloud.session?.deviceId else { throw DeviceError.message("This request belongs to a different connection.") }
@@ -480,7 +489,7 @@ import ScreenpunkLocalTransport
                 consumedID = id; pendingID = nil; busy = false; requestPending = false; canCancelRequest = false; canRetry = false; takingLonger = false
                 try persistPending(); refreshScreen(); refreshPreferences(); return true
             }
-            if recoveryAction(snapshot, library: library) == .cancelExpired { cancelKnownRequest(id, timedOut: true); return true }
+            if snapshot.delivery.route == "local", recoveryAction(snapshot, library: library) == .cancelExpired { cancelKnownRequest(id, timedOut: true); return true }
             let delivery = try await coordinator.reconcile(requestID: id)
             guard self.library === library, generation == connectionGeneration, !Task.isCancelled else { return true }
             if cancelledLocally.contains(id) { return true }
@@ -497,7 +506,11 @@ import ScreenpunkLocalTransport
                 try persistPending()
             case .ended(let status, let failure): try finishRequest(id, status: status, failure: failure)
             case .pending(let progress):
-                if let deadline = progress.deadlineAt { try library.submissionAccepted(deadline: deadline) }
+                if let deadline = progress.deadlineAt {
+                    try library.submissionAccepted(deadline: deadline)
+                    // This response is authoritative pending work, not an expired local snapshot.
+                    if Date().timeIntervalSince1970 * 1000 >= deadline { cancelKnownRequest(id, timedOut: true); return true }
+                }
                 busy = true; requestPending = true; canCancelRequest = true; canRetry = false
                 progressCaption = progress.caption ?? "\(resolvedAgentName ?? "Your agent") is working…"
                 if let updated = progress.updatedAt { lastProgressAt = Date(timeIntervalSince1970: updated / 1000) }
@@ -605,8 +618,9 @@ import ScreenpunkLocalTransport
     func keepWaiting() { warningDismissedAt = Date(); takingLonger = false }
     private func finishRequest(_ id: String, status: String, failure: String?) throws {
         try library?.retireAuthoringRequest(id: id)
-        message = status == "timed_out" ? "This request timed out. Your screen is unchanged." : (failure ?? "Request ended. Your screen is unchanged.")
-        canRetry = status != "cancelled" && status != "legacy_payload_unsupported"
+        let alreadyApplied = status == CloudRequestRecovery.alreadyAppliedStatus
+        message = alreadyApplied ? nil : (status == "timed_out" ? "This request timed out. Your screen is unchanged." : (failure ?? "Request ended. Your screen is unchanged."))
+        canRetry = !alreadyApplied && status != "cancelled" && status != "legacy_payload_unsupported"
         consumedID = id; pendingID = nil; busy = false; requestPending = false; canCancelRequest = false; takingLonger = false
         try persistPending()
     }

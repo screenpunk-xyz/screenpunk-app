@@ -112,3 +112,77 @@ struct AgentRequestV2: Decodable {
     let canonicalUnsupported: AgentRequest.Unsupported?
 }
 
+
+/// A fresh library is not evidence that the account's latest request is new work.
+/// Only adopt work that is still pending after an authoritative read. Existing
+/// locally journaled requests continue through normal reconciliation instead.
+enum CloudRequestRecovery {
+    static let alreadyAppliedStatus = "already_applied"
+
+    @MainActor static func discoverPending(id: String, status: String, consumedID: String?, lastAppliedRequestID: String?, now: Double = Date().timeIntervalSince1970 * 1000,
+        load: (String) async throws -> AgentRequest) async throws -> AgentRequest? {
+        guard status == "pending", id != consumedID, id != lastAppliedRequestID else { return nil }
+        let response = try await load(id)
+        guard response.id == id else { throw DeviceError.message("Cloud returned a different request.") }
+        guard response.status == "pending", response.applicationReceipt == nil,
+              let deadline = response.deadlineAt, deadline > now else { return nil }
+        return response
+    }
+
+    static func receiptOutcome(_ receipt: ApplicationReceiptV1?, requestID: String, snapshotDigest: String?, operationID: String?) throws -> (status: String, message: String?)? {
+        guard let receipt else { return nil }
+        guard receipt.schemaVersion == 1, ["applied", "conflict", "rejected"].contains(receipt.status),
+              receipt.requestID == requestID, receipt.inputDigest == snapshotDigest,
+              operationID == nil || receipt.operationID == operationID else {
+            throw DeviceError.message("Cloud returned a mismatched application receipt.")
+        }
+        if receipt.status == "applied" { return (alreadyAppliedStatus, nil) }
+        return (receipt.status, receipt.message ?? "This result was already acknowledged as \(receipt.status). Your screen is unchanged.")
+    }
+}
+
+extension AgentRequest {
+    func deliveryState(requestID: String, now: Double = Date().timeIntervalSince1970 * 1000) throws -> AuthoringDeliveryState {
+        guard id == requestID else { throw DeviceError.message("Cloud returned a different request.") }
+        if applicationReceipt != nil {
+            guard snapshot?.requestID == requestID, snapshot?.delivery.route == "cloud" else {
+                throw DeviceError.message("Cloud returned an application receipt without its matching snapshot.")
+            }
+        }
+        if let receipt = try CloudRequestRecovery.receiptOutcome(applicationReceipt, requestID: requestID,
+            snapshotDigest: snapshot?.delivery.snapshotDigest, operationID: authoringResult?.operationID) {
+            return .ended(status: receipt.status, message: receipt.message)
+        }
+        if let unsupported = canonicalUnsupported { return .ended(status: unsupported.code, message: unsupported.message) }
+        if status == "completed" {
+            guard let authoringResult else { throw DeviceError.message("This result has no verified authoring envelope. Your screen is unchanged.") }
+            return .completed(authoringResult)
+        }
+        if ["failed", "cancelled", "timed_out"].contains(status) { return .ended(status: status, message: failure) }
+        if status == "pending", let deadlineAt, now >= deadlineAt { return .ended(status: "timed_out", message: nil) }
+        return .pending(.init(status: status, caption: progress?.caption, updatedAt: progress?.updatedAt ?? createdAt, deadlineAt: deadlineAt))
+    }
+}
+
+extension AgentRequestV2 {
+    func deliveryState(requestID: String, now: Double = Date().timeIntervalSince1970 * 1000) throws -> AuthoringDeliveryStateV2 {
+        guard id == requestID else { throw DeviceError.message("Cloud returned a different request.") }
+        if applicationReceipt != nil {
+            guard snapshot?.requestID == requestID, snapshot?.delivery.route == "cloud" else {
+                throw DeviceError.message("Cloud returned an application receipt without its matching snapshot.")
+            }
+        }
+        if let receipt = try CloudRequestRecovery.receiptOutcome(applicationReceipt, requestID: requestID,
+            snapshotDigest: snapshot?.delivery.snapshotDigest, operationID: authoringResult?.operationID) {
+            return .ended(status: receipt.status, message: receipt.message)
+        }
+        if let unsupported = canonicalUnsupported { return .ended(status: unsupported.code, message: unsupported.message) }
+        if status == "completed" {
+            guard let authoringResult else { throw DeviceError.message("This result has no verified asset mutation envelope. Your screen is unchanged.") }
+            return .completed(authoringResult)
+        }
+        if ["failed", "cancelled", "timed_out"].contains(status) { return .ended(status: status, message: failure) }
+        if status == "pending", let deadlineAt, now >= deadlineAt { return .ended(status: "timed_out", message: nil) }
+        return .pending(.init(status: status, caption: progress?.caption, updatedAt: progress?.updatedAt ?? createdAt, deadlineAt: deadlineAt))
+    }
+}
