@@ -14,6 +14,38 @@ enum DeviceError: LocalizedError {
     }
 }
 
+/// A read-only listener observation belongs to one signed-in account/device, never
+/// the Local agent or selected request route. Old/offline observations cannot say connected.
+struct CloudListenerObservation {
+    enum Status: Equatable {
+        case notSignedIn, unchecked, connected, waiting, unavailable
+        var label: String {
+            switch self {
+            case .notSignedIn: return "Not signed in"
+            case .unchecked: return "Listener status not checked"
+            case .connected: return "Listener connected"
+            case .waiting: return "Waiting for listener"
+            case .unavailable: return "Listener status unavailable"
+            }
+        }
+    }
+    let accountID: String
+    let deviceID: String
+    let profileID: String?
+    let ready: Bool?
+    let checkedAt: Date
+    static func status(_ observation: Self?, accountID: String?, deviceID: String?, profileID: String?, now: Date = Date()) -> Status {
+        guard let accountID, let deviceID else { return .notSignedIn }
+        guard let observation, observation.accountID == accountID, observation.deviceID == deviceID,
+              now.timeIntervalSince(observation.checkedAt) >= 0,
+              now.timeIntervalSince(observation.checkedAt) < 30 else { return .unchecked }
+        guard let observedProfile = observation.profileID, !observedProfile.isEmpty,
+              profileID == nil || profileID == observedProfile,
+              let ready = observation.ready else { return .unavailable }
+        return ready ? .connected : .waiting
+    }
+}
+
 /// Validate canonical nested payloads before Codable can discard unknown wire fields.
 enum DeviceAuthoringWire {
     static func validateResponse(_ data: Data) throws {

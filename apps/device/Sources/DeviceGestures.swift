@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import ScreenpunkCore
 
 /// Recognizers live on the parent hosting view so one-finger web content stays interactive.
 struct DeviceGestures: UIViewRepresentable {
@@ -30,7 +31,7 @@ struct DeviceGestures: UIViewRepresentable {
             let talk = UILongPressGestureRecognizer(target: self, action: #selector(talk(_:)))
             talk.numberOfTouchesRequired = 3; talk.minimumPressDuration = 0.3; talk.allowableMovement = 80
             let menu = UILongPressGestureRecognizer(target: self, action: #selector(menu(_:)))
-            menu.numberOfTouchesRequired = 2; menu.minimumPressDuration = 5
+            menu.numberOfTouchesRequired = UnlinkGestureSpec.fingers; menu.minimumPressDuration = TimeInterval(UnlinkGestureSpec.holdSeconds)
             // Keep tracking both fingers even while the underlying page pans.
             menu.allowableMovement = .greatestFiniteMagnitude
             menu.cancelsTouchesInView = false

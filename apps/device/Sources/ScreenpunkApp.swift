@@ -77,8 +77,8 @@ struct DeviceRootView: View {
                 .id(screen.revision + model.publicReadSessionKey)
                 .ignoresSafeArea()
         } else if (model.routePreference == .local || (model.routePreference == .automatic && model.email == nil)) && !model.agentReady {
-            introduction(title: "Connect your local agent", detail: "Add Codex on your Mac in Settings → Agents, then test the connection.") {
-                Button("Set up local agent") { model.settingsPage = .agents; model.settingsOpen = true }.buttonStyle(.borderedProminent)
+            introduction(title: "Connect your local agent", detail: "Add Codex on your Mac in Settings → Account, then test the connection.") {
+                Button("Set up local agent") { model.settingsPage = .account; model.settingsOpen = true }.buttonStyle(.borderedProminent)
                 Button("Sign in to Screenpunk Cloud") { Task { await model.signIn() } }.disabled(model.accountOperationInProgress || model.routeChangeBlocked)
             }
         } else if model.email == nil && model.routePreference == .cloud {
@@ -225,7 +225,6 @@ struct CloudListenerSetupView_Previews: PreviewProvider {
 
 enum DeviceSettingsPage: String, Hashable {
     case overview = "Overview", guidedAccess = "Guided Access", display = "Display", account = "Account", screens = "Screens"
-    case agents = "Agents"
     case home = "Home Assistant", television = "Google TV", calendar = "Google Calendar", publicData = "Public Data"
     var symbol: String {
         switch self {
@@ -234,7 +233,6 @@ enum DeviceSettingsPage: String, Hashable {
         case .display: return "sun.max"
         case .account: return "person.crop.circle"
         case .screens: return "rectangle.stack"
-        case .agents: return "sparkles"
         case .home: return "house"
         case .television: return "tv"
         case .calendar: return "calendar"
@@ -248,6 +246,11 @@ struct DeviceSettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var selection: DeviceSettingsPage? = .overview
     @State private var screenToRemove: ScreenLibrary.Saved?
+    @State private var sheet: SettingsSheet?
+    private enum SettingsSheet: String, Identifiable {
+        case cloudListener
+        var id: String { rawValue }
+    }
     @State private var columns: NavigationSplitViewVisibility = .all
     @Environment(\.horizontalSizeClass) private var sizeClass
     private var providers: [DeviceSettingsPage] {
@@ -263,7 +266,6 @@ struct DeviceSettingsView: View {
             List(selection: $selection) {
                 Section {
                     row(.account)
-                    row(.agents)
                 }
                 Section("Device") { row(.display); row(.screens) }
                 if !providers.isEmpty {
@@ -284,6 +286,13 @@ struct DeviceSettingsView: View {
             }
         }
         .navigationSplitViewStyle(.balanced)
+        // Present from Settings itself, not a Form Section/row whose hosting
+        // controller can resolve the presentation against the outer cover.
+        .sheet(item: $sheet) { destination in
+            switch destination {
+            case .cloudListener: CloudListenerSetupSheet(scope: CloudClient.originScope, email: model.email)
+            }
+        }
         .onAppear { selection = model.settingsPage }
         .onChange(of: selection) { if let page = $0 { model.settingsPage = page } }
         .alert("Remove screen?", isPresented: Binding(get: { screenToRemove != nil }, set: { if !$0 { screenToRemove = nil } })) {
@@ -315,7 +324,7 @@ struct DeviceSettingsView: View {
                     Text("Move between the screens saved on this device.")
                 }
                 Section("Open Settings") {
-                    Label("Hold two fingers for five seconds", systemImage: "gearshape")
+                    Label("Hold two fingers for three seconds", systemImage: "gearshape")
                     Text("Settings opens directly. Your current screen stays saved while you adjust this device.")
                 }
             }
@@ -336,31 +345,14 @@ struct DeviceSettingsView: View {
             }
         case .display:
             DeviceDisplaySettings(preferences: display)
-        case .agents:
-            if let localSettings = model.localSettings { DeviceAgentsSettings(device: model, model: localSettings) }
-            else { Text("Local agent storage could not be opened.") }
         case .account:
-            Form {
-                Section("Screenpunk") {
-                    Text(model.email ?? "Not signed in")
-                    Label(model.agentReady ? "Agent ready" : "Waiting for agent", systemImage: model.agentReady ? "checkmark.circle" : "clock")
-                    Button("Sign in again") { Task { await model.signIn() } }.disabled(model.accountOperationInProgress || model.routeChangeBlocked)
-                    Button("Sign out", role: .destructive) { Task { await model.signOut() } }.disabled(model.accountOperationInProgress || model.routeChangeBlocked)
-                }
-                if model.availableProfiles.count > 1 {
-                    Section("Saved libraries") {
-                        ForEach(model.availableProfiles) { profile in
-                            Button { model.selectProfile(profile.id) } label: {
-                                HStack {
-                                    Text(model.profileLabel(profile))
-                                    Spacer()
-                                    if profile.id == model.activeProfile?.id { Image(systemName: "checkmark") }
-                                }
-                            }.disabled(model.accountOperationInProgress || model.routeChangeBlocked)
-                        }
-                        Text("Signing in opens that Cloud account’s library. Earlier libraries stay on this device. Selecting a previous Cloud library uses your local agent; its screens and permissions stay separate from the current Cloud account.")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
+            if let localSettings = model.localSettings {
+                DeviceAccountSettings(device: model, model: localSettings, showCloudSetup: { sheet = .cloudListener })
+            } else {
+                Form {
+                    DeviceCloudAccountSection(device: model, showListenerSetup: { sheet = .cloudListener })
+                    Section("Local agent") { Text("Local agent storage could not be opened.") }
+                    DeviceSavedLibrariesSection(device: model)
                 }
             }
         case .screens:

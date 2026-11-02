@@ -3,22 +3,16 @@ import UniformTypeIdentifiers
 import ScreenpunkApple
 import ScreenpunkCore
 
-struct DeviceAgentsSettings: View {
+struct DeviceAccountSettings: View {
     @ObservedObject var device: DeviceModel
     @ObservedObject var model: LocalAgentSettingsModel
+    let showCloudSetup: () -> Void
     @State private var setup: SetupSheet?
     @State private var forgetting = false
-    private enum SetupSheet: String, Identifiable { case pairing, address, cloud; var id: String { rawValue } }
+    private enum SetupSheet: String, Identifiable { case pairing, address; var id: String { rawValue } }
     var body: some View {
         Form {
-            Section("Cloud agent") {
-                Label(device.email ?? "Sign in to connect", systemImage: "cloud")
-                Text(device.cloudAgentReady ? "Ready" : (device.email == nil ? "Not connected" : "Connection saved; checked before sending")).foregroundStyle(.secondary)
-                if device.email == nil {
-                    Button("Sign in to Screenpunk Cloud") { Task { await device.signIn() } }.disabled(device.routeChangeBlocked || device.accountOperationInProgress)
-                }
-                Button("Set up Cloud listener") { setup = .cloud }
-            }
+            DeviceCloudAccountSection(device: device, showListenerSetup: showCloudSetup)
             Section("Local agent") {
                 if let config = model.configuration {
                     Label(config.name, systemImage: "desktopcomputer")
@@ -59,12 +53,12 @@ struct DeviceAgentsSettings: View {
                 }.disabled(device.routeChangeBlocked || model.testing)
                 Text(device.routeChangeBlocked ? "Finish or cancel the current request before changing agents." : "Automatic checks the paired computer first. If it is unavailable, a new request may go to your configured Cloud agent. A request keeps its chosen agent after delivery is prepared.").font(.caption).foregroundStyle(.secondary)
             }
+            DeviceSavedLibrariesSection(device: device)
         }
         .sheet(item: $setup) { sheet in
             switch sheet {
             case .pairing: LocalAgentSetupView(model: model, device: device)
             case .address: LocalAgentAddressRecoveryView(model: model)
-            case .cloud: CloudListenerSetupSheet(scope: CloudClient.originScope, email: device.email)
             }
         }
         .alert("Forget local agent?", isPresented: $forgetting) {
@@ -72,6 +66,84 @@ struct DeviceAgentsSettings: View {
             Button("Forget", role: .destructive) { model.forget() }
         } message: {
             Text("This removes this iPad’s saved connection and blocks outstanding local deliveries. To revoke access on the Mac, use its setup receipt to remove this iPad’s exact public key. Changing the App Server token can affect other iPads.")
+        }
+    }
+}
+
+/// Cloud identity and listener state are independent of the preferred request route.
+struct DeviceCloudAccountSection: View {
+    @ObservedObject var device: DeviceModel
+    let showListenerSetup: () -> Void
+    private var accountActionsDisabled: Bool { device.routeChangeBlocked || device.accountOperationInProgress }
+    var body: some View {
+        Section("Screenpunk Cloud") {
+            if let email = device.email {
+                ViewThatFits(in: .horizontal) {
+                    HStack {
+                        Text(email).fixedSize().textSelection(.enabled)
+                        Spacer(minLength: 16)
+                        signOut.fixedSize()
+                    }
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text(email).textSelection(.enabled)
+                        HStack { Spacer(); signOut }
+                    }
+                }
+                Label(device.cloudListenerStatus.label, systemImage: device.cloudListenerStatus == .connected ? "checkmark.circle" : "clock")
+                    .foregroundStyle(.secondary)
+            } else {
+                Button("Sign in to Screenpunk Cloud") { Task { await device.signIn() } }
+                    .disabled(accountActionsDisabled)
+            }
+            ViewThatFits(in: .horizontal) {
+                HStack {
+                    listenerSetup.fixedSize()
+                    if device.email != nil { Spacer(minLength: 16); signInAgain.fixedSize() }
+                }
+                VStack(alignment: .leading, spacing: 12) {
+                    listenerSetup
+                    if device.email != nil { HStack { Spacer(); signInAgain } }
+                }
+            }
+        }
+        .task(id: device.email) {
+            guard device.email != nil else { return }
+            while !Task.isCancelled {
+                await device.refreshCloudListenerStatus()
+                do { try await Task.sleep(nanoseconds: 15_000_000_000) } catch { return }
+            }
+        }
+    }
+    private var listenerSetup: some View {
+        Button("Set up cloud listener", action: showListenerSetup).buttonStyle(.borderless)
+    }
+    private var signInAgain: some View {
+        Button("Sign in again") { Task { await device.signIn() } }
+            .buttonStyle(.borderless).disabled(accountActionsDisabled)
+    }
+    private var signOut: some View {
+        Button("Sign out", role: .destructive) { Task { await device.signOut() } }
+            .buttonStyle(.borderless).disabled(accountActionsDisabled)
+    }
+}
+
+struct DeviceSavedLibrariesSection: View {
+    @ObservedObject var device: DeviceModel
+    var body: some View {
+        if device.availableProfiles.count > 1 {
+            Section("Saved libraries") {
+                ForEach(device.availableProfiles) { profile in
+                    Button { device.selectProfile(profile.id) } label: {
+                        HStack {
+                            Text(device.profileLabel(profile))
+                            Spacer()
+                            if profile.id == device.activeProfile?.id { Image(systemName: "checkmark") }
+                        }
+                    }.disabled(device.accountOperationInProgress || device.routeChangeBlocked)
+                }
+                Text("Signing in opens that Cloud account’s library. Earlier libraries stay on this device. Selecting a previous Cloud library uses your local agent; its screens and permissions stay separate from the current Cloud account.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         }
     }
 }
@@ -210,7 +282,7 @@ struct LocalAgentSetupView: View {
             Label("Connected to \(model.configuration?.name ?? "your computer")", systemImage: "checkmark.circle.fill")
             Text("Ready").foregroundStyle(.secondary)
             Text(LocalAgentSettingsModel.lifecycleGuidance(for: model.configuration))
-            Text("Choose when to use it in Agents → Use for new requests.")
+            Text("Choose when to use it in Account → Use for new requests.")
             if model.configuration?.serverLifecycle == .foreground {
                 Link("Enable background startup on the Mac", destination: LocalAgentMacSetup.setupURL(baseURL: CloudClient.origin))
             }

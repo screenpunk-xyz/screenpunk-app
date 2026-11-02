@@ -44,7 +44,7 @@ import ScreenpunkLocalTransport
         configuration?.serverLifecycle == .background ? "After Mac sign-in" : "In Terminal"
     }
     static func lifecycleGuidance(for configuration: LocalAgentConfiguration?) -> String {
-        guard let configuration else { return "Connect your Mac in Agents, then keep it awake and reachable." }
+        guard let configuration else { return "Connect your Mac in Account, then keep it awake and reachable." }
         switch configuration.serverLifecycle {
         case .background:
             return "The agent starts when you sign in to your Mac and restarts if it stops. You can close the setup Terminal. Keep your Mac user signed in and the Mac awake and reachable."
@@ -53,7 +53,7 @@ import ScreenpunkLocalTransport
         }
     }
     static func unavailableGuidance(for configuration: LocalAgentConfiguration?) -> String {
-        guard let configuration else { return "Connect your Mac in Agents, then keep it awake and reachable." }
+        guard let configuration else { return "Connect your Mac in Account, then keep it awake and reachable." }
         switch configuration.serverLifecycle {
         case .background: return "Keep your Mac user signed in and the Mac awake and reachable. Check background startup in Mac setup if it stays unavailable, then retry."
         case .foreground: return "Keep the Mac awake and reachable and its setup Terminal open, then retry. You can enable background startup through Mac setup."

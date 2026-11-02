@@ -2,7 +2,7 @@
 
 You need a preview invitation and access to ChatGPT Work + Cloud or a dot.
 
-1. **Connect.** Sign in on the iPad under **Settings → Account**. Choose **Cloud** under **Agents**, then **Set up Cloud listener**. Open the plugin link and connect using the same email.
+1. **Connect.** Sign in on the iPad under **Settings → Account**. Choose **Cloud** under **Use for new requests**, then **Set up cloud listener**. Open the plugin link and connect using the same email.
 2. **Start listening.** In ChatGPT, open **Work → Cloud** (or your dot), select the Screenpunk plugin, and send the copied listener request. Wait for confirmation that it’s listening with your account.
 3. **Ask for a screen.** Return to the iPad. Hold three fingers, say “Show me a large clock,” then lift to send.
 
@@ -13,7 +13,7 @@ You need a preview invitation and access to ChatGPT Work + Cloud or a dot.
 - **Plugin unavailable:** check your preview invitation.
 - **Earlier screens:** open **Settings → Account → Saved libraries**. Previous Cloud libraries use Local.
 
-The guide is always available under **Settings → Agents → Set up Cloud listener**.
+The guide is always available under **Settings → Account → Set up cloud listener**.
 
 ## Before inviting users
 

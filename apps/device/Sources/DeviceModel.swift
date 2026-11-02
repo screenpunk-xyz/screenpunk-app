@@ -36,6 +36,31 @@ import ScreenpunkLocalTransport
     @Published private(set) var selectedRoute: AuthoringRoute = .local
     @Published private(set) var routePreference: AuthoringRoutePreference = .automatic
     @Published private(set) var cloudAgentReady = false
+    @Published private var cloudListenerObservation: CloudListenerObservation?
+    var cloudListenerStatus: CloudListenerObservation.Status {
+        CloudListenerObservation.status(cloudListenerObservation, accountID: cloud.localAccountID,
+            deviceID: cloud.session?.deviceId, profileID: cloud.session?.profileID)
+    }
+    /// Account-page status only: do not enroll, consume commands, adopt requests,
+    /// change routes or run a Local preflight simply to show listener availability.
+    func refreshCloudListenerStatus() async {
+        guard foreground, let session = cloud.session, let accountID = cloud.localAccountID else { return }
+        let generation = connectionGeneration
+        do {
+            let status: AgentStatus = try await cloud.call("api/device/status")
+            guard !Task.isCancelled, foreground, connectionGeneration == generation,
+                  cloud.session?.accessToken == session.accessToken,
+                  cloud.session?.deviceId == session.deviceId, cloud.localAccountID == accountID else { return }
+            cloudListenerObservation = .init(accountID: accountID, deviceID: session.deviceId,
+                profileID: status.profileID, ready: status.agentReady, checkedAt: Date())
+        } catch {
+            guard !Task.isCancelled, foreground, connectionGeneration == generation,
+                  cloud.session?.accessToken == session.accessToken,
+                  cloud.session?.deviceId == session.deviceId, cloud.localAccountID == accountID else { return }
+            cloudListenerObservation = .init(accountID: accountID, deviceID: session.deviceId,
+                profileID: session.profileID, ready: nil, checkedAt: Date())
+        }
+    }
     @Published private(set) var resolvedAgentName: String?
     private var cloudSupportsV2 = false
     @Published private(set) var localAgent: LocalAgentConfiguration?
@@ -336,7 +361,7 @@ import ScreenpunkLocalTransport
                 guard try localLedger?.unresolvedRecord() == nil else { throw DeviceError.message("An earlier local delivery is unresolved. Finish or cancel it before sending another request.") }
                 guard let current = try configurationRepository?.load(), current.id == endpoint?.id,
                       current.hostKeySHA256 == endpoint?.hostKeySHA256,
-                      current.credentialReference == endpoint?.credentialReference else { throw DeviceError.message("The computer connection changed. Send your saved instructions again after checking Agents.") }
+                      current.credentialReference == endpoint?.credentialReference else { throw DeviceError.message("The computer connection changed. Send your saved instructions again after checking Account.") }
             }
             selectedRoute = resolved.route
             resolvedAgentName = resolved.route == .local ? (localAgent?.name ?? "Local agent") : "Cloud agent"
@@ -374,7 +399,7 @@ import ScreenpunkLocalTransport
             // An expired login or lost credential needs deliberate repair. Ordinary
             // network unavailability may choose Cloud for a new Automatic request.
             local = reason == .signInRequired || reason == .credentialsUnavailable ? .repairRequired : .unavailable
-            repairMessage = "The paired computer needs sign-in or credential repair. Open Agents to reconnect before sending this request."
+            repairMessage = "The paired computer needs sign-in or credential repair. Open Account to reconnect before sending this request."
         }
         let initial = NewRequestRoutePolicy.resolve(preference: routePreference, local: local, cloud: cloudBindingMatches ? .unchecked : .notConfigured, requiresV2: requiresV2)
         func resolved(_ decision: NewRequestRoutePolicy.Decision) throws -> ResolvedRoute {
@@ -382,7 +407,7 @@ import ScreenpunkLocalTransport
             case .use(let route, let version): return .init(route: route, version: version)
             case .needsComputer: throw DeviceError.message("Your computer is unavailable. " + LocalAgentSettingsModel.unavailableGuidance(for: localAgent))
             case .repairComputer: throw DeviceError.message(repairMessage)
-            case .connectCloud: throw DeviceError.message(routePreference == .cloud ? "Connect your Cloud agent in Agents." : "The computer is unavailable and no matching Cloud agent is configured. Reconnect the computer in Agents, or sign in to use Cloud.")
+            case .connectCloud: throw DeviceError.message(routePreference == .cloud ? "Connect your Cloud agent in Account." : "The computer is unavailable and no matching Cloud agent is configured. Reconnect the computer in Account, or sign in to use Cloud.")
             case .listenCloud: throw DeviceError.message("Ask your Cloud agent to listen for requests, then retry.")
             case .updateCloud: throw DeviceError.message("Your Cloud agent needs the asset-preserving update before it can edit this screen. Refresh its Screenpunk tools or reconnect your computer.")
             case .checkCloud: throw DeviceError.message("Cloud readiness could not be checked. Retry shortly.")
@@ -397,12 +422,12 @@ import ScreenpunkLocalTransport
     }
     private func localRepairMessage(_ reason: LocalAgentRepairReason) -> String {
         switch reason {
-        case .hostIdentityChanged: return "The computer’s SSH identity changed. Review its fingerprint in Agents → Advanced before reconnecting."
+        case .hostIdentityChanged: return "The computer’s SSH identity changed. Review its fingerprint in Account → Advanced before reconnecting."
         case .wrongBinding: return "This computer connection changed. Review the paired agent before continuing."
-        case .unsupportedVersion: return "Codex on the Mac is no longer a supported version. Review Mac setup in Agents."
-        case .invalidCredentials: return "The Mac rejected this iPad’s connection credential. Pair again in Agents."
+        case .unsupportedVersion: return "Codex on the Mac is no longer a supported version. Review Mac setup in Account."
+        case .invalidCredentials: return "The Mac rejected this iPad’s connection credential. Pair again in Account."
         case .missingConversationHistory: return "This conversation’s saved history is unavailable. Reconnect to reconcile it; Screenpunk has not resubmitted the request."
-        case .unsafeConfiguration, .unsupportedProtocol: return "The Mac’s secure connection settings need review. Open Mac setup in Agents before continuing."
+        case .unsafeConfiguration, .unsupportedProtocol: return "The Mac’s secure connection settings need review. Open Mac setup in Account before continuing."
         }
     }
     /// An acknowledgement journal can commit before its caller observes success.
@@ -925,6 +950,7 @@ import ScreenpunkLocalTransport
         })
     }
     private func stopConnection() {
+        cloudListenerObservation = nil
         connectionActive = false
         connectionGeneration = UUID()
         connection.stop()

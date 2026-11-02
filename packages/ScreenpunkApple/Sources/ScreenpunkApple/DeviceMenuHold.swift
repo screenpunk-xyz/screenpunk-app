@@ -1,6 +1,7 @@
 #if os(iOS)
 import SwiftUI
 import UIKit
+import ScreenpunkCore
 
 struct DeviceMenuHold<Content: View>: UIViewControllerRepresentable {
     let content: Content
@@ -10,8 +11,8 @@ struct DeviceMenuHold<Content: View>: UIViewControllerRepresentable {
         let host = UIHostingController(rootView: content)
         host.view.backgroundColor = .clear
         let gesture = UILongPressGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.held(_:)))
-        gesture.numberOfTouchesRequired = 2
-        gesture.minimumPressDuration = 5
+        gesture.numberOfTouchesRequired = UnlinkGestureSpec.fingers
+        gesture.minimumPressDuration = TimeInterval(UnlinkGestureSpec.holdSeconds)
         gesture.cancelsTouchesInView = false
         gesture.delegate = context.coordinator
         host.view.addGestureRecognizer(gesture)
