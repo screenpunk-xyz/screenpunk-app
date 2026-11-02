@@ -12,7 +12,7 @@ let package = Package(
     targets: [
         .target(name: "DeviceAuthoring", dependencies: ["ScreenpunkCore", "ScreenpunkApple"], path: "Sources",
                 exclude: ["CloudClient.swift", "DeviceDisplaySettings.swift", "DeviceGestures.swift", "DeviceModel.swift", "LocalAgentSettingsModel.swift", "LocalAgentSetupView.swift", "ScreenpunkApp.swift", "SpeechCapture.swift"],
-                sources: ["ScreenLibrary.swift", "DeviceAuthoringTypes.swift", "LocalAgentMacSetup.swift", "NewRequestRoutePolicy.swift", "LocalComputerDiscovery.swift"]),
+                sources: ["ScreenLibrary.swift", "DeviceAuthoringTypes.swift", "LocalAgentMacSetup.swift", "NewRequestRoutePolicy.swift", "LocalComputerDiscovery.swift", "StarterScreens.swift"], resources: [.copy("StarterScreens")]),
         .testTarget(name: "DeviceAuthoringTests", dependencies: ["DeviceAuthoring", "ScreenpunkCore", "ScreenpunkApple"], path: "Tests")
     ]
 )

@@ -18,10 +18,20 @@ struct DeviceRootView: View {
                 Color.black.opacity(0.35).ignoresSafeArea()
                 VStack(spacing: 16) {
                     Image(systemName: "link.badge.plus").font(.largeTitle)
-                    Text("Finish setting up this screen").font(.title2.bold())
-                    Text("Configure \(model.missingConnections.map(\.name).joined(separator: ", ")) in Settings to use this screen.")
-                        .multilineTextAlignment(.center)
-                    Button("Open Settings", action: model.openConnectionSettings).buttonStyle(.borderedProminent)
+                    if model.canAllowCurrentPublicData {
+                        Text("Allow public data?").font(.title2.bold())
+                        Text("This screen reads from these public sources. No account or credentials are sent.")
+                            .multilineTextAlignment(.center)
+                        Text(model.currentPublicDataOrigins.joined(separator: "\n"))
+                            .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                        Button("Allow public data", action: model.allowCurrentPublicData).buttonStyle(.borderedProminent)
+                        Button("Review sources", action: model.openConnectionSettings)
+                    } else {
+                        Text("Finish setting up this screen").font(.title2.bold())
+                        Text("Configure \(model.missingConnections.map(\.name).joined(separator: ", ")) in Settings to use this screen.")
+                            .multilineTextAlignment(.center)
+                        Button("Open Settings", action: model.openConnectionSettings).buttonStyle(.borderedProminent)
+                    }
                     Text("Swipe with two fingers to switch screens.").font(.caption).foregroundStyle(.secondary)
                 }
                 .padding(28).frame(maxWidth: 440)

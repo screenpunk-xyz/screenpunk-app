@@ -860,6 +860,16 @@ import ScreenpunkLocalTransport
             }
         }
     }
+    var canAllowCurrentPublicData: Bool {
+        !missingConnections.isEmpty && missingConnections.allSatisfy { $0.page == .publicData }
+    }
+    var currentPublicDataOrigins: [String] {
+        Array(Set(manifest?.connections.compactMap { $0.publicHTTP?.origin } ?? [])).sorted()
+    }
+    func allowCurrentPublicData() {
+        guard canAllowCurrentPublicData, let manifest else { return }
+        setPublicDataAllowed(true, for: manifest)
+    }
     func openConnectionSettings() {
         settingsPage = missingConnections.first?.page ?? .screens
         settingsOpen = true
@@ -1029,6 +1039,7 @@ import ScreenpunkLocalTransport
         if previousPending != nil, opened.state.pendingID == nil, opened.state.submissionKey == nil {
             message = "An earlier request belongs to a previous device connection. Your screens are unchanged. Send your instructions again to continue."
         }
+        try opened.installStarterScreensIfNeeded(StarterScreens.templates())
         library = opened
         func coordinator(_ transport: any AuthoringTransport) -> AuthoringCoordinator {
             let requireCurrent: () throws -> Void = { [weak self] in
