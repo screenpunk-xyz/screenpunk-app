@@ -62,7 +62,8 @@ final class PreparedRequestRecoveryPolicyTests: XCTestCase {
         }
     }
     func testExpiredOrCancelledPreparedDeliveryCannotBeRetried() {
-        XCTAssertEqual(PreparedRequestRecoveryPolicy.action(requestID: "original-id", route: .cloud, deadlineAt: 200, now: 200, hasReceipt: false, submissionKey: "original-id", cancelled: false), .cancelExpired)
+        XCTAssertEqual(PreparedRequestRecoveryPolicy.action(requestID: "original-id", route: .cloud, deadlineAt: 200, now: 200, hasReceipt: false, submissionKey: "original-id", cancelled: false), .reconcile)
+        XCTAssertEqual(PreparedRequestRecoveryPolicy.action(requestID: "original-id", route: .local, deadlineAt: 200, now: 200, hasReceipt: false, submissionKey: "original-id", cancelled: false), .cancelExpired)
         XCTAssertEqual(PreparedRequestRecoveryPolicy.action(requestID: "original-id", route: .cloud, deadlineAt: 200, now: 100, hasReceipt: false, submissionKey: "original-id", cancelled: true), .cancelled)
     }
 }

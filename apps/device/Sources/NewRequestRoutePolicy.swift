@@ -47,7 +47,8 @@ enum PreparedRequestRecoveryPolicy {
     static func action(requestID: String, route: AuthoringRoute, deadlineAt: Int64, now: Int64, hasReceipt: Bool, submissionKey: String?, cancelled: Bool) -> Action {
         if hasReceipt { return .acknowledgeReceipt }
         if cancelled { return .cancelled }
-        if now >= deadlineAt { return .cancelExpired }
+        // Cloud must reconcile authoritative completion before declaring expiry.
+        if now >= deadlineAt { return route == .cloud ? .reconcile : .cancelExpired }
         if submissionKey == requestID { return .retrySameRequest(requestID: requestID, route: route) }
         return .reconcile
     }

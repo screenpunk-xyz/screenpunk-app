@@ -93,7 +93,7 @@ public struct DashboardRuntimeView: View {
             }
         }
         .accessibilityAction(named: "Device menu", openMenu)
-        .accessibilityHint("Hold two fingers for five seconds to open the device menu.")
+        .accessibilityHint("Hold two fingers for three seconds to open the device menu.")
     }
     private func openMenu() {
         if let onMenu { onMenu() } else { showUnlink = true }

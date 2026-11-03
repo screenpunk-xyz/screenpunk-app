@@ -36,6 +36,31 @@ import ScreenpunkLocalTransport
     @Published private(set) var selectedRoute: AuthoringRoute = .local
     @Published private(set) var routePreference: AuthoringRoutePreference = .automatic
     @Published private(set) var cloudAgentReady = false
+    @Published private var cloudListenerObservation: CloudListenerObservation?
+    var cloudListenerStatus: CloudListenerObservation.Status {
+        CloudListenerObservation.status(cloudListenerObservation, accountID: cloud.localAccountID,
+            deviceID: cloud.session?.deviceId, profileID: cloud.session?.profileID)
+    }
+    /// Account-page status only: do not enroll, consume commands, adopt requests,
+    /// change routes or run a Local preflight simply to show listener availability.
+    func refreshCloudListenerStatus() async {
+        guard foreground, let session = cloud.session, let accountID = cloud.localAccountID else { return }
+        let generation = connectionGeneration
+        do {
+            let status: AgentStatus = try await cloud.call("api/device/status")
+            guard !Task.isCancelled, foreground, connectionGeneration == generation,
+                  cloud.session?.accessToken == session.accessToken,
+                  cloud.session?.deviceId == session.deviceId, cloud.localAccountID == accountID else { return }
+            cloudListenerObservation = .init(accountID: accountID, deviceID: session.deviceId,
+                profileID: status.profileID, ready: status.agentReady, checkedAt: Date())
+        } catch {
+            guard !Task.isCancelled, foreground, connectionGeneration == generation,
+                  cloud.session?.accessToken == session.accessToken,
+                  cloud.session?.deviceId == session.deviceId, cloud.localAccountID == accountID else { return }
+            cloudListenerObservation = .init(accountID: accountID, deviceID: session.deviceId,
+                profileID: session.profileID, ready: nil, checkedAt: Date())
+        }
+    }
     @Published private(set) var resolvedAgentName: String?
     private var cloudSupportsV2 = false
     @Published private(set) var localAgent: LocalAgentConfiguration?
@@ -146,6 +171,7 @@ import ScreenpunkLocalTransport
             email = authenticated.user.email; message = nil
             try openLibrary(); startConnection()
         }
+        catch is CancellationError { message = nil; startConnection() }
         catch { message = error.localizedDescription; startConnection() }
     }
     func signOut() async {
@@ -167,7 +193,7 @@ import ScreenpunkLocalTransport
     func reconcileTemporary() {
         let settled = settleAcknowledgedPending()
         takingLonger = requestPending && Date().timeIntervalSince(max(lastProgressAt, warningDismissedAt)) >= 60
-        if !settled, requestPending, let id = pendingID, let library {
+        if !settled, requestPending, currentRequestRoute == .local, let id = pendingID, let library {
             if let snapshot = library.authoringRequestV2(id: id) {
                 if recoveryAction(snapshot, library: library) == .cancelExpired { cancelKnownRequest(id, timedOut: true) }
             } else if let deadline = library.state.requestDeadline, Date().timeIntervalSince1970 * 1000 >= deadline {
@@ -222,16 +248,25 @@ import ScreenpunkLocalTransport
             agentReady = routePreference == .automatic ? (localAgent != nil || cloudAgentReady) : cloudAgentReady
             if let command = status.command { await applyCommand(command) }
             guard cloud.session?.accessToken == token, foreground, generation == connectionGeneration, !Task.isCancelled else { return true }
-            if pendingID == nil, let latest = status.latestRequest, latest.id != consumedID, latest.id != library?.state.lastRequest {
-                pendingID = latest.id
-                try persistPending()
-                // Canonical requests retain their original screen ID and immutable base revision.
+            var discoveredRequest: AgentRequest?
+            if pendingID == nil, let latest = status.latestRequest {
+                discoveredRequest = try await CloudRequestRecovery.discoverPending(id: latest.id, status: latest.status,
+                    consumedID: consumedID, lastAppliedRequestID: library?.state.lastRequest) { id in
+                    try await self.cloud.call("api/device/requests/\(id)", authoringVersion: 2)
+                }
+                guard cloud.session?.accessToken == token, foreground, generation == connectionGeneration, !Task.isCancelled else { return true }
+                if let discoveredRequest {
+                    pendingID = discoveredRequest.id
+                    try persistPending()
+                }
             }
             if let id = pendingID {
                 if library?.authoringRequestV2(id: id) != nil { return await pollAuthoringV2(generation: generation) }
                 guard let authoring else { throw DeviceError.message("Local authoring storage is unavailable.") }
                 if library?.authoringRequest(id: id) == nil {
-                    let restored: AgentRequest = try await cloud.call("api/device/requests/\(id)", authoringVersion: 2)
+                    let restored: AgentRequest
+                    if let discoveredRequest { restored = discoveredRequest }
+                    else { restored = try await cloud.call("api/device/requests/\(id)", authoringVersion: 2) }
                     guard cloud.session?.accessToken == token, foreground, generation == connectionGeneration, !Task.isCancelled else { return true }
                     if let snapshot = restored.snapshotV2 {
                         guard snapshot.delivery.route == "cloud", snapshot.context.profileID == cloud.session?.profileID, snapshot.context.deviceID == cloud.session?.deviceId else { throw DeviceError.message("This request belongs to a different connection.") }
@@ -327,7 +362,7 @@ import ScreenpunkLocalTransport
                 guard try localLedger?.unresolvedRecord() == nil else { throw DeviceError.message("An earlier local delivery is unresolved. Finish or cancel it before sending another request.") }
                 guard let current = try configurationRepository?.load(), current.id == endpoint?.id,
                       current.hostKeySHA256 == endpoint?.hostKeySHA256,
-                      current.credentialReference == endpoint?.credentialReference else { throw DeviceError.message("The computer connection changed. Send your saved instructions again after checking Agents.") }
+                      current.credentialReference == endpoint?.credentialReference else { throw DeviceError.message("The computer connection changed. Send your saved instructions again after checking Account.") }
             }
             selectedRoute = resolved.route
             resolvedAgentName = resolved.route == .local ? (localAgent?.name ?? "Local agent") : "Cloud agent"
@@ -365,7 +400,7 @@ import ScreenpunkLocalTransport
             // An expired login or lost credential needs deliberate repair. Ordinary
             // network unavailability may choose Cloud for a new Automatic request.
             local = reason == .signInRequired || reason == .credentialsUnavailable ? .repairRequired : .unavailable
-            repairMessage = "The paired computer needs sign-in or credential repair. Open Agents to reconnect before sending this request."
+            repairMessage = "The paired computer needs sign-in or credential repair. Open Account to reconnect before sending this request."
         }
         let initial = NewRequestRoutePolicy.resolve(preference: routePreference, local: local, cloud: cloudBindingMatches ? .unchecked : .notConfigured, requiresV2: requiresV2)
         func resolved(_ decision: NewRequestRoutePolicy.Decision) throws -> ResolvedRoute {
@@ -373,7 +408,7 @@ import ScreenpunkLocalTransport
             case .use(let route, let version): return .init(route: route, version: version)
             case .needsComputer: throw DeviceError.message("Your computer is unavailable. " + LocalAgentSettingsModel.unavailableGuidance(for: localAgent))
             case .repairComputer: throw DeviceError.message(repairMessage)
-            case .connectCloud: throw DeviceError.message(routePreference == .cloud ? "Connect your Cloud agent in Agents." : "The computer is unavailable and no matching Cloud agent is configured. Reconnect the computer in Agents, or sign in to use Cloud.")
+            case .connectCloud: throw DeviceError.message(routePreference == .cloud ? "Connect your Cloud agent in Account." : "The computer is unavailable and no matching Cloud agent is configured. Reconnect the computer in Account, or sign in to use Cloud.")
             case .listenCloud: throw DeviceError.message("Ask your Cloud agent to listen for requests, then retry.")
             case .updateCloud: throw DeviceError.message("Your Cloud agent needs the asset-preserving update before it can edit this screen. Refresh its Screenpunk tools or reconnect your computer.")
             case .checkCloud: throw DeviceError.message("Cloud readiness could not be checked. Retry shortly.")
@@ -388,12 +423,12 @@ import ScreenpunkLocalTransport
     }
     private func localRepairMessage(_ reason: LocalAgentRepairReason) -> String {
         switch reason {
-        case .hostIdentityChanged: return "The computer’s SSH identity changed. Review its fingerprint in Agents → Advanced before reconnecting."
+        case .hostIdentityChanged: return "The computer’s SSH identity changed. Review its fingerprint in Account → Advanced before reconnecting."
         case .wrongBinding: return "This computer connection changed. Review the paired agent before continuing."
-        case .unsupportedVersion: return "Codex on the Mac is no longer a supported version. Review Mac setup in Agents."
-        case .invalidCredentials: return "The Mac rejected this iPad’s connection credential. Pair again in Agents."
+        case .unsupportedVersion: return "Codex on the Mac is no longer a supported version. Review Mac setup in Account."
+        case .invalidCredentials: return "The Mac rejected this iPad’s connection credential. Pair again in Account."
         case .missingConversationHistory: return "This conversation’s saved history is unavailable. Reconnect to reconcile it; Screenpunk has not resubmitted the request."
-        case .unsafeConfiguration, .unsupportedProtocol: return "The Mac’s secure connection settings need review. Open Mac setup in Agents before continuing."
+        case .unsafeConfiguration, .unsupportedProtocol: return "The Mac’s secure connection settings need review. Open Mac setup in Account before continuing."
         }
     }
     /// An acknowledgement journal can commit before its caller observes success.
@@ -480,7 +515,7 @@ import ScreenpunkLocalTransport
                 consumedID = id; pendingID = nil; busy = false; requestPending = false; canCancelRequest = false; canRetry = false; takingLonger = false
                 try persistPending(); refreshScreen(); refreshPreferences(); return true
             }
-            if recoveryAction(snapshot, library: library) == .cancelExpired { cancelKnownRequest(id, timedOut: true); return true }
+            if snapshot.delivery.route == "local", recoveryAction(snapshot, library: library) == .cancelExpired { cancelKnownRequest(id, timedOut: true); return true }
             let delivery = try await coordinator.reconcile(requestID: id)
             guard self.library === library, generation == connectionGeneration, !Task.isCancelled else { return true }
             if cancelledLocally.contains(id) { return true }
@@ -497,7 +532,11 @@ import ScreenpunkLocalTransport
                 try persistPending()
             case .ended(let status, let failure): try finishRequest(id, status: status, failure: failure)
             case .pending(let progress):
-                if let deadline = progress.deadlineAt { try library.submissionAccepted(deadline: deadline) }
+                if let deadline = progress.deadlineAt {
+                    try library.submissionAccepted(deadline: deadline)
+                    // This response is authoritative pending work, not an expired local snapshot.
+                    if Date().timeIntervalSince1970 * 1000 >= deadline { cancelKnownRequest(id, timedOut: true); return true }
+                }
                 busy = true; requestPending = true; canCancelRequest = true; canRetry = false
                 progressCaption = progress.caption ?? "\(resolvedAgentName ?? "Your agent") is working…"
                 if let updated = progress.updatedAt { lastProgressAt = Date(timeIntervalSince1970: updated / 1000) }
@@ -605,8 +644,9 @@ import ScreenpunkLocalTransport
     func keepWaiting() { warningDismissedAt = Date(); takingLonger = false }
     private func finishRequest(_ id: String, status: String, failure: String?) throws {
         try library?.retireAuthoringRequest(id: id)
-        message = status == "timed_out" ? "This request timed out. Your screen is unchanged." : (failure ?? "Request ended. Your screen is unchanged.")
-        canRetry = status != "cancelled" && status != "legacy_payload_unsupported"
+        let alreadyApplied = status == CloudRequestRecovery.alreadyAppliedStatus
+        message = alreadyApplied ? nil : (status == "timed_out" ? "This request timed out. Your screen is unchanged." : (failure ?? "Request ended. Your screen is unchanged."))
+        canRetry = !alreadyApplied && status != "cancelled" && status != "legacy_payload_unsupported"
         consumedID = id; pendingID = nil; busy = false; requestPending = false; canCancelRequest = false; takingLonger = false
         try persistPending()
     }
@@ -821,6 +861,16 @@ import ScreenpunkLocalTransport
             }
         }
     }
+    var canAllowCurrentPublicData: Bool {
+        !missingConnections.isEmpty && missingConnections.allSatisfy { $0.page == .publicData }
+    }
+    var currentPublicDataOrigins: [String] {
+        Array(Set(manifest?.connections.compactMap { $0.publicHTTP?.origin } ?? [])).sorted()
+    }
+    func allowCurrentPublicData() {
+        guard canAllowCurrentPublicData, let manifest else { return }
+        setPublicDataAllowed(true, for: manifest)
+    }
     func openConnectionSettings() {
         settingsPage = missingConnections.first?.page ?? .screens
         settingsOpen = true
@@ -911,6 +961,7 @@ import ScreenpunkLocalTransport
         })
     }
     private func stopConnection() {
+        cloudListenerObservation = nil
         connectionActive = false
         connectionGeneration = UUID()
         connection.stop()
@@ -989,6 +1040,7 @@ import ScreenpunkLocalTransport
         if previousPending != nil, opened.state.pendingID == nil, opened.state.submissionKey == nil {
             message = "An earlier request belongs to a previous device connection. Your screens are unchanged. Send your instructions again to continue."
         }
+        try opened.installStarterScreensIfNeeded(StarterScreens.templates())
         library = opened
         func coordinator(_ transport: any AuthoringTransport) -> AuthoringCoordinator {
             let requireCurrent: () throws -> Void = { [weak self] in

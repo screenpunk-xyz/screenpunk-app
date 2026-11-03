@@ -5,7 +5,7 @@ import ScreenpunkCore
 /// One atomic metadata replacement commits an installation. Failed writes never replace the current screen.
 @MainActor final class ScreenLibrary {
     struct Saved: Codable, Identifiable { let id: String; let revision: String; let artifact: ScreenArtifact }
-    struct State: Codable { var screens: [Saved] = []; var selectedID: String?; var previous: Saved?; var lastRequest: String?; var pendingID: String?; var pendingScreenID: String?; var consumedID: String?; var cancelledRequests: [String]?; var cancelIntents: [String]?; var lastInstruction: String?; var submissionKey: String?; var submissionText: String?; var submissionScreen: ScreenArtifact?; var requestDeadline: Double?; var authoring: AuthoringStoreState?; var linkedProfile: LocalProfileDescriptor?; var localRequestIDs: Set<String>? }
+    struct State: Codable { var screens: [Saved] = []; var selectedID: String?; var previous: Saved?; var lastRequest: String?; var pendingID: String?; var pendingScreenID: String?; var consumedID: String?; var cancelledRequests: [String]?; var cancelIntents: [String]?; var lastInstruction: String?; var submissionKey: String?; var submissionText: String?; var submissionScreen: ScreenArtifact?; var requestDeadline: Double?; var authoring: AuthoringStoreState?; var linkedProfile: LocalProfileDescriptor?; var localRequestIDs: Set<String>?; var bundledScreenSeeds: Set<String>? }
     private(set) var state = State()
     private let root: URL
     private let libraryOwner: String
@@ -93,6 +93,53 @@ import ScreenpunkCore
             try commit(next, stagedDirectory: revision)
             pruneUnusedRevisions()
         } catch { if !committing { try? FileManager.default.removeItem(at: directory) }; throw error }
+    }
+    /// Seed once per library. A durable per-template marker survives edits/removal;
+    /// an interrupted first install resumes only its missing templates.
+    func installStarterScreensIfNeeded(_ templates: [StarterScreens.Template]) throws {
+        guard state.pendingID == nil, state.submissionKey == nil else { return }
+        if state.bundledScreenSeeds == nil {
+            var next = state
+            // Add beside existing screens, preserving their selection and revisions.
+            next.bundledScreenSeeds = []
+            try commit(next)
+        }
+        // An installation marker needs an installed copy or a removal tombstone.
+        // Repair an interrupted/older initialization without resurrecting removed screens.
+        let installedOrRemoved = Set(state.screens.map(\.id)).union(state.authoring?.knownScreenIDs ?? [])
+        let uninstalled = (state.bundledScreenSeeds ?? []).subtracting(installedOrRemoved)
+        if !uninstalled.isEmpty {
+            var next = state; next.bundledScreenSeeds?.subtract(uninstalled); try commit(next)
+        }
+        for template in templates where !(state.bundledScreenSeeds ?? []).contains(template.id) {
+            if state.screens.contains(where: { $0.id == template.id }) {
+                var next = state; next.bundledScreenSeeds?.insert(template.id); try commit(next)
+                continue // Never replace an existing, potentially edited copy.
+            }
+            try Self.validate(template.artifact)
+            let revision = UUID().uuidString
+            let directory = root.appendingPathComponent(revision, isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            var committing = false
+            do {
+                for file in template.artifact.files {
+                    let url = directory.appendingPathComponent(file.path)
+                    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try Data(file.content.utf8).write(to: url, options: .atomic)
+                }
+                _ = try PackageAssetStore.load(directory: directory)
+                var next = state
+                next.screens.append(Saved(id: template.id, revision: revision, artifact: template.artifact))
+                if next.screens.count == 1 && next.selectedID == nil { next.selectedID = template.id }
+                next.bundledScreenSeeds?.insert(template.id)
+                committing = true
+                try commit(next, stagedDirectory: revision)
+                pruneUnusedRevisions()
+            } catch {
+                if !committing { try? FileManager.default.removeItem(at: directory) }
+                throw error
+            }
+        }
     }
     func savePending(id: String?, screenID: String?, consumedID: String?) throws {
         var next = state; next.pendingID = id; next.pendingScreenID = screenID; next.consumedID = consumedID; try commit(next)
