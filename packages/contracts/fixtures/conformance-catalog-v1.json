@@ -1,0 +1,322 @@
+{
+  "package": {
+    "schemaVersion": 1,
+    "screen": {
+      "title": "Clock",
+      "entry": "index.html",
+      "requiredAssets": [],
+      "externalDependencies": []
+    },
+    "files": [
+      {
+        "path": "index.html",
+        "mediaType": "text/html",
+        "byteLength": 79,
+        "digest": "8d4e8c26490314a5c60b1826fae2b908547e75fc467fc8a60a0a1ed3d2f59936",
+        "contentBase64": "PCFkb2N0eXBlIGh0bWw+PGh0bWw+PGhlYWQ+PHRpdGxlPkNsb2NrPC90aXRsZT48L2hlYWQ+PGJvZHk+Q2xvY2s8L2JvZHk+PC9odG1sPg=="
+      }
+    ]
+  },
+  "canonicalPackage": "{\"files\":[{\"byteLength\":79,\"contentBase64\":\"PCFkb2N0eXBlIGh0bWw+PGh0bWw+PGhlYWQ+PHRpdGxlPkNsb2NrPC90aXRsZT48L2hlYWQ+PGJvZHk+Q2xvY2s8L2JvZHk+PC9odG1sPg==\",\"digest\":\"8d4e8c26490314a5c60b1826fae2b908547e75fc467fc8a60a0a1ed3d2f59936\",\"mediaType\":\"text/html\",\"path\":\"index.html\"}],\"schemaVersion\":1,\"screen\":{\"entry\":\"index.html\",\"externalDependencies\":[],\"requiredAssets\":[],\"title\":\"Clock\"}}",
+  "packageDigest": "2765000e0d6fe8f1a07aa2d974df60c494cca3355c88058ae3687329b70ba43a",
+  "begin": {
+    "schemaVersion": 1,
+    "operationID": "op-1",
+    "libraryID": "library-1",
+    "localScreenID": "screen-1",
+    "sourceRevisionID": "revision-1",
+    "parentRevisionIDs": [],
+    "predecessorRevisionID": null,
+    "commitCounter": 1,
+    "origin": "seed",
+    "sourceAppliedAt": "2026-11-05T12:00:00.000Z",
+    "screenName": "Clock",
+    "package": {
+      "byteLength": 388,
+      "digest": "2765000e0d6fe8f1a07aa2d974df60c494cca3355c88058ae3687329b70ba43a"
+    }
+  },
+  "gapBegin": {
+    "schemaVersion": 1,
+    "operationID": "op-4",
+    "libraryID": "library-1",
+    "localScreenID": "screen-1",
+    "sourceRevisionID": "revision-4",
+    "parentRevisionIDs": [
+      "revision-1"
+    ],
+    "predecessorRevisionID": "revision-1",
+    "commitCounter": 4,
+    "origin": "seed",
+    "sourceAppliedAt": "2026-11-05T12:00:00.000Z",
+    "screenName": "Clock",
+    "package": {
+      "byteLength": 388,
+      "digest": "2765000e0d6fe8f1a07aa2d974df60c494cca3355c88058ae3687329b70ba43a"
+    },
+    "gap": {
+      "checkpointCounter": 1,
+      "checkpointRevisionID": "revision-1",
+      "skippedFromCounter": 2,
+      "skippedThroughCounter": 3,
+      "reason": "user_acknowledged_backup_pause"
+    }
+  },
+  "invalidBegin": [
+    {
+      "path": [
+        "commitCounter"
+      ],
+      "value": 0
+    },
+    {
+      "path": [
+        "parentRevisionIDs"
+      ],
+      "value": [
+        "revision-1"
+      ]
+    },
+    {
+      "path": [
+        "package",
+        "digest"
+      ],
+      "value": "bad"
+    },
+    {
+      "path": [
+        "sourceAppliedAt"
+      ],
+      "value": "yesterday"
+    }
+  ],
+  "invalidPackage": [
+    {
+      "path": [
+        "files",
+        0,
+        "path"
+      ],
+      "value": "../index.html"
+    },
+    {
+      "path": [
+        "files",
+        0,
+        "byteLength"
+      ],
+      "value": 1
+    },
+    {
+      "path": [
+        "files",
+        0,
+        "digest"
+      ],
+      "value": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "path": [
+        "files",
+        0,
+        "contentBase64"
+      ],
+      "value": "bad!"
+    },
+    {
+      "path": [
+        "screen",
+        "requiredAssets"
+      ],
+      "value": [
+        "missing.js"
+      ]
+    }
+  ],
+  "invalidCompletePackages": [
+    {
+      "name": "quoted-tag-terminator",
+      "package": {
+        "schemaVersion": 1,
+        "screen": {
+          "title": "Clock",
+          "entry": "index.html",
+          "requiredAssets": [],
+          "externalDependencies": []
+        },
+        "files": [
+          {
+            "path": "index.html",
+            "mediaType": "text/html",
+            "byteLength": 33,
+            "digest": "c440b6595f67917679650fc7cae6a6e94bb0fda6ab1b6f2858b5df02e8f1f4bc",
+            "contentBase64": "PGltZyB0aXRsZT0iPiIgc3JjPSJtaXNzaW5nLnN2ZyI+"
+          }
+        ]
+      }
+    },
+    {
+      "name": "embedded-object",
+      "package": {
+        "schemaVersion": 1,
+        "screen": {
+          "title": "Clock",
+          "entry": "index.html",
+          "requiredAssets": [],
+          "externalDependencies": []
+        },
+        "files": [
+          {
+            "path": "index.html",
+            "mediaType": "text/html",
+            "byteLength": 37,
+            "digest": "a8a59aaf5f15f0d859bc996f696316c9fb164a000ee07301dccb557a1847299a",
+            "contentBase64": "PG9iamVjdCBkYXRhPSJtaXNzaW5nLmh0bWwiPjwvb2JqZWN0Pg=="
+          }
+        ]
+      }
+    },
+    {
+      "name": "css-quoted-url",
+      "package": {
+        "schemaVersion": 1,
+        "screen": {
+          "title": "Clock",
+          "entry": "index.html",
+          "requiredAssets": [],
+          "externalDependencies": []
+        },
+        "files": [
+          {
+            "path": "index.html",
+            "mediaType": "text/html",
+            "byteLength": 53,
+            "digest": "f78319d2636d8d77abf3301a91e629594382803591efa5bf720a445cb4b0e2a4",
+            "contentBase64": "PHN0eWxlPmJvZHkgeyBiYWNrZ3JvdW5kOnVybCgibWlzc2luZy5zdmciKSB9PC9zdHlsZT4="
+          }
+        ]
+      }
+    },
+    {
+      "name": "malformed-manifest",
+      "package": {
+        "schemaVersion": 1,
+        "screen": {
+          "title": "Clock",
+          "entry": "index.html",
+          "requiredAssets": [],
+          "externalDependencies": []
+        },
+        "files": [
+          {
+            "path": "index.html",
+            "mediaType": "text/html",
+            "byteLength": 79,
+            "digest": "8d4e8c26490314a5c60b1826fae2b908547e75fc467fc8a60a0a1ed3d2f59936",
+            "contentBase64": "PCFkb2N0eXBlIGh0bWw+PGh0bWw+PGhlYWQ+PHRpdGxlPkNsb2NrPC90aXRsZT48L2hlYWQ+PGJvZHk+Q2xvY2s8L2JvZHk+PC9odG1sPg=="
+          },
+          {
+            "path": "manifest.json",
+            "mediaType": "application/json",
+            "byteLength": 2,
+            "digest": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            "contentBase64": "e30="
+          }
+        ]
+      }
+    },
+    {
+      "name": "incomplete-manifest",
+      "package": {
+        "schemaVersion": 1,
+        "screen": {
+          "title": "Clock",
+          "entry": "index.html",
+          "requiredAssets": [],
+          "externalDependencies": []
+        },
+        "files": [
+          {
+            "path": "index.html",
+            "mediaType": "text/html",
+            "byteLength": 79,
+            "digest": "8d4e8c26490314a5c60b1826fae2b908547e75fc467fc8a60a0a1ed3d2f59936",
+            "contentBase64": "PCFkb2N0eXBlIGh0bWw+PGh0bWw+PGhlYWQ+PHRpdGxlPkNsb2NrPC90aXRsZT48L2hlYWQ+PGJvZHk+Q2xvY2s8L2JvZHk+PC9odG1sPg=="
+          },
+          {
+            "path": "manifest.json",
+            "mediaType": "application/json",
+            "byteLength": 261,
+            "digest": "3473c90025428e63ac0e53f9bff6f01e77cd31e57bd4c07d83c1ff1ecbce61d0",
+            "contentBase64": "eyJzY2hlbWFWZXJzaW9uIjogMSwgInNka1ZlcnNpb24iOiAiMSIsICJkYXNoYm9hcmRJZCI6ICJzY3JlZW4iLCAibmFtZSI6ICJDbG9jayIsICJyZXZpc2lvbiI6ICJyZXYiLCAiZW50cnlwb2ludCI6ICJpbmRleC5odG1sIiwgInRhcmdldCI6IHsicHJvZmlsZUlkIjogImlwYWQiLCAid2lkdGgiOiAxMDAsICJoZWlnaHQiOiAxMDAsICJzY2FsZSI6IDEsICJvcmllbnRhdGlvbiI6ICJwb3J0cmFpdCJ9LCAiY29ubmVjdGlvbnMiOiBbXSwgImZpbGVzIjogW119"
+          }
+        ]
+      }
+    }
+  ],
+  "expiredStatus": {
+    "schemaVersion": 1,
+    "operationID": "op-1",
+    "state": "failed",
+    "catalogScreenID": "catalog-1",
+    "error": {
+      "code": "retry_later",
+      "message": "Upload lease expired; begin a new operation.",
+      "restartOperation": true
+    }
+  },
+  "missingVersion": {
+    "versionID": "version-1",
+    "catalogScreenID": "catalog-1",
+    "displayVersion": 1,
+    "sourceRevisionID": "revision-1",
+    "parentRevisionIDs": [],
+    "copyID": "copy-1",
+    "commitCounter": 1,
+    "screenName": "Clock",
+    "sourceAppliedAt": "2026-11-05T12:00:00.000Z",
+    "backedUpAt": "2026-11-05T12:01:00.000Z",
+    "packageSchema": 1,
+    "packageDigest": "2765000e0d6fe8f1a07aa2d974df60c494cca3355c88058ae3687329b70ba43a",
+    "sizeBytes": 388,
+    "deviceDisplayName": "iPad",
+    "deviceLinked": true,
+    "preview": {
+      "status": "unavailable",
+      "reason": "not_provided"
+    },
+    "integrity": "missing"
+  },
+  "emptyFilePackage": {
+    "package": {
+      "schemaVersion": 1,
+      "screen": {
+        "title": "Clock",
+        "entry": "index.html",
+        "requiredAssets": [
+          "style.css"
+        ],
+        "externalDependencies": []
+      },
+      "files": [
+        {
+          "path": "index.html",
+          "mediaType": "text/html",
+          "byteLength": 99,
+          "digest": "0fea9ec4413bdd10e4db224bf30dd1c7a6726853ba2b6aa53351292867da4cb8",
+          "contentBase64": "PCFkb2N0eXBlIGh0bWw+PGh0bWw+PGhlYWQ+PGxpbmsgcmVsPSJzdHlsZXNoZWV0IiBocmVmPSJzdHlsZS5jc3MiPjwvaGVhZD48Ym9keT5DbG9jazwvYm9keT48L2h0bWw+"
+        },
+        {
+          "path": "style.css",
+          "mediaType": "text/css",
+          "byteLength": 0,
+          "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "contentBase64": ""
+        }
+      ]
+    },
+    "canonicalPackage": "{\"files\":[{\"byteLength\":99,\"contentBase64\":\"PCFkb2N0eXBlIGh0bWw+PGh0bWw+PGhlYWQ+PGxpbmsgcmVsPSJzdHlsZXNoZWV0IiBocmVmPSJzdHlsZS5jc3MiPjwvaGVhZD48Ym9keT5DbG9jazwvYm9keT48L2h0bWw+\",\"digest\":\"0fea9ec4413bdd10e4db224bf30dd1c7a6726853ba2b6aa53351292867da4cb8\",\"mediaType\":\"text/html\",\"path\":\"index.html\"},{\"byteLength\":0,\"contentBase64\":\"\",\"digest\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\",\"mediaType\":\"text/css\",\"path\":\"style.css\"}],\"schemaVersion\":1,\"screen\":{\"entry\":\"index.html\",\"externalDependencies\":[],\"requiredAssets\":[\"style.css\"],\"title\":\"Clock\"}}",
+    "digest": "1b9fb29b8ad2a3b701321e14775413593744cc99532f45a5b909e9415eeea17c"
+  }
+}

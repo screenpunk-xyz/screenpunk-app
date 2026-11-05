@@ -38,3 +38,112 @@ A result screen has `files` and `deletedPaths`. File mutations are exactly `{kin
 ## Public release boundary
 
 This package and its generated Swift resources are authoritative in `screenpunk-app`. Public software and shared contracts use Apache License 2.0; see `LICENSE`. The package version identifies the combined contracts/setup release artifact; request protocols remain independently versioned 1 and 2. The private cloud consumes a verified immutable bundle instead of importing a private editable copy. See `../../tools/public-artifacts/README.md` for packaging, commit/digest pins and the explicit local provisional bootstrap. Existing versions stay available during coordinated app/server rollout.
+
+## Catalog backup capability v1
+
+Catalog is additive and independent of authoring versions `1` and `2`. Source is
+`catalog.ts`; `definitions/catalog-v1.json` is the wire schema definition,
+`generated/catalog-definition.ts` and `definitions/catalog-*-v1.schema.json` are
+checked generated outputs. Run `npm run contracts:generate` after schema edits.
+`fixtures/conformance-catalog-v1.json` seals canonical package bytes and SHA256;
+TypeScript and Swift conformance tests consume this same fixture.
+
+Device-authenticated API routes (account/enrollment/copy come from server auth):
+
+| Method | Route | Body/result |
+| --- | --- | --- |
+| GET | `/api/catalog/capabilities` | `CatalogCapability` |
+| POST | `/api/catalog/backups/begin` | `CatalogBeginBackup` / `CatalogBackupStatus` |
+| PUT | `/api/catalog/backups/{uploadID}/package` | Exact canonical package bytes / `CatalogBackupStatus` |
+| PUT | `/api/catalog/backups/{uploadID}/preview` | Declared raster bytes / `CatalogBackupStatus` |
+| POST | `/api/catalog/backups/{uploadID}/complete` | `CatalogCompleteBackup` / `CatalogBackupStatus` |
+| GET | `/api/catalog/backups/operations/{operationID}` | `CatalogBackupStatus` |
+
+Browser-authenticated app routes: `GET /api/catalog` returns `CatalogList`
+(`cursor` optional bounded opaque pagination token; at most 20 cards per page),
+`GET /api/catalog/screens/{screenID}/versions/{versionID}/preview` serves only
+private/no-store validated raster bytes, and
+`DELETE /api/catalog/screens/{screenID}/versions/{versionID}` returns
+`CatalogDeleteResult`. Browser deletes require existing CSRF/origin checks and an
+`If-Match` header equal to the quoted decimal `catalogRevision` returned by list;
+a stale revision returns `conflict` (HTTP 409), and the browser refetches. Device
+credentials do not grant catalog listing or deletion. Errors are
+`{error: CatalogError}`; safe bounded messages never contain source or secrets.
+Suggested HTTP mapping: unauthorized=401, not_found=404, not_entitled=403,
+conflict/deleted=409, quota_exceeded=413, invalid_package=400, retry_later=429,
+offline=503. Known terminal operation retries precede entitlement rejection.
+Capability absence disables new backup transport without changing authoring.
+
+`previewMediaTypes: []` explicitly means raster capture/upload is unavailable.
+Do not accept or advertise preview support without a real bounded decoder;
+header signatures and caller dimensions are insufficient. Package publication
+still succeeds with `{status:"unavailable",reason:"not_provided"}`. No HTML/SVG
+preview execution or synthetic replacement images.
+
+Packages are canonical JSON (existing `canonicalJSON`, UTF8, no BOM/newline),
+containing a manifest and base64 **final materialized** file bytes. Hash and length
+in begin refer to the exact whole uploaded envelope, not decoded file bytes or an
+authoring delta. Each file also has its own raw digest/length. Sort files by exact
+ASCII path; reject duplicate/case-colliding paths, traversal, links before export,
+noncanonical base64 and unsupported media. Existing stricter authoring bounds
+remain: <=20 UTF8 html/css/js/json/svg/txt files and <=204800-byte canonical
+AuthoringScreen projection. The 10MiB outer transport ceiling does not add binary
+package support. Raster previews are separate. Every discovered static local
+reference must exist and appear in `requiredAssets`; discovered HTTP(S) references
+must appear in `externalDependencies`. Bounded static markup/CSS validation does
+not snapshot or exhaustively discover dynamic JavaScript dependencies. External
+live data remains external; credential markers, private keys and secret-bearing
+files are rejected, never silently stripped. Consumers retain existing stricter
+package dependency/manifest validation.
+
+Wire timestamps use exact UTC `YYYY-MM-DDTHH:mm:ss.SSSZ`; Swift uses
+`CatalogContract.timestamp`. IDs are opaque bounded ASCII identifiers. Device
+account identity, credential-bearing library owner and enrollment IDs are not
+upload fields. Persist a separate stable wire library/local-screen ID when local
+identifiers do not meet this grammar. Server maps authenticated enrollment plus
+library/local-screen ID to its catalog/copy IDs. Source revision is immutable;
+commitCounter is per copy, not a timestamp or display version. Parent IDs describe
+lineage and predecessor identifies the previous captured copy revision. Display
+versions are assigned only at publication, never reused. Idempotency uses stable
+operationID plus `catalogBeginDigest`; changed request is conflict. Exact same
+source revision dedupes; stale ancestors return superseded and never become latest.
+
+Overflow pauses capture visibly while preserving bounded queued pins and permits
+editing. Explicit Resume/current-screen acknowledgement may submit origin `seed`
+with `gap` matching the server's **exact** prior copy counter/head. Skipped counters
+start at checkpoint+1 and end immediately before the seed counter; reason is
+`user_acknowledged_backup_pause`. Checkpoint must be >=1: drain the first queued
+intent before reconciling a gap. This is not a reset-to-root escape, and server
+still checks tombstones, monotonic counters, immutable source identity and copy
+fences. No silent queue coalescing. A root seed has no gap and no predecessor.
+
+Effective entitlement is configured server-side, with no pricing or billing policy.
+Defaults: 3 versions/screen, 20 screens/account, 10MiB envelope, 512KiB preview,
+2048px maximum dimensions, 1GiB account live/reserved usage and separately bounded
+20MiB publication overlap, and 100 revisions/100MiB device queue. Count cleanup
+backlog until physical deletion. Recheck entitlement/quota at publication; failed
+uploads never evict completed backups. Downgrade pauses new captures while keeping
+list/read/delete and completed history. `sizeBytes` is actual stored package bytes,
+excluding preview/metadata. List uses real completed versions only, latest excluded
+from descending history; stable display numbers may have gaps after deletion.
+
+Release gate: merge all public source/generated fixtures and Swift parity tests in
+an immutable public commit, assign an unused public artifact version, then run
+`tools/public-artifacts/pack.mjs --source-revision FULL_SHA --output OUTSIDE_CHECKOUT`.
+Publish those immutable bundle/hash/lock bytes through the owning GitHub plugin
+release workflow. Private consumers must update their verifier allowlist support,
+lock and vendor snapshot through the established artifact tooling using that
+published SHA/hash. Provisional bundles are local integration evidence only and
+cannot qualify deployment. Do not release against a working-tree import or edit
+only the private vendored copy. Authoring contract version list stays `["1","2"]`.
+
+Known missing R2 objects may mark a visible version `integrity:"missing"`; retain
+its metadata and deletion path and display “Backup unavailable” instead of hiding
+healthy rows or claiming the package exists. Expired upload leases return state
+`failed`, error `retry_later`, and `restartOperation:true`. Only that terminal
+combination permits rotating the transport operation ID while preserving the
+source revision/counter/lineage, exact pinned package bytes and queue intent.
+Ordinary pending/backoff responses never carry this flag.
+
+Empty individual files are valid and preserved with byteLength zero, canonical empty
+base64 and SHA256 of empty bytes; the whole package envelope remains nonempty.

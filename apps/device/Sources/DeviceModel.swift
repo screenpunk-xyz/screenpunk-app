@@ -31,6 +31,10 @@ import ScreenpunkLocalTransport
     @Published var inactiveDevicePreferences: [PreferenceRecordV1] = []
     @Published var preferenceConflicts: [AuthoringPreferenceConflict] = []
     @Published var preferenceSyncStatus: String?
+    @Published private(set) var catalogBackupStatus: String?
+    @Published private(set) var catalogCanResume = false
+    private var catalogTask: Task<Void, Never>?
+    private var catalogTaskID = UUID()
     @Published private(set) var activeProfile: LocalProfileDescriptor?
     @Published private(set) var availableProfiles: [LocalProfileDescriptor] = []
     @Published private(set) var selectedRoute: AuthoringRoute = .local
@@ -169,7 +173,11 @@ import ScreenpunkLocalTransport
             detachAccountLibrary()
             _ = try profileRepository?.activateAccountProfile(accountID: CloudClient.originScope.localAccountID(serverUserID: authenticated.user.id), deviceID: authenticated.deviceId)
             email = authenticated.user.email; message = nil
-            try openLibrary(); startConnection()
+            try openLibrary()
+            if let profile = activeProfile, let account = cloud.localAccountID {
+                try library?.resumeCatalogAuthentication(binding: .init(origin: CloudClient.origin.absoluteString, accountID: account, userID: authenticated.user.id, deviceID: authenticated.deviceId, libraryID: profile.libraryOwner))
+            }
+            startConnection()
         }
         catch is CancellationError { message = nil; startConnection() }
         catch { message = error.localizedDescription; startConnection() }
@@ -945,6 +953,7 @@ import ScreenpunkLocalTransport
         // preference changes, which do not currently emit socket invalidations.
         connectionActive = true
         requestPreferenceSync()
+        requestCatalogSync()
         if currentRequestRoute == .local, pendingID != nil || routePreference == .local || !cloudAccountMatches {
             connectionActive = true; agentReady = localAgent != nil
             requestRefresh(); return
@@ -975,12 +984,14 @@ import ScreenpunkLocalTransport
         refreshTask?.cancel(); refreshTask = nil; refreshNeeded = false
         preferenceSyncPump.cancel()
         preferenceSyncFlight.cancel()
+        catalogTask?.cancel(); catalogTask = nil; catalogTaskID = UUID()
     }
     /// One in-flight reconciliation plus one trailing refresh, regardless of notice volume.
     /// Transient HTTP failures retry with bounded backoff even when the socket stays open.
     private func requestRefresh() {
         guard foreground, connectionActive else { return }
         requestPreferenceSync()
+        requestCatalogSync()
         refreshNeeded = true
         guard refreshTask == nil else { return }
         let generation = connectionGeneration
@@ -1247,6 +1258,7 @@ import ScreenpunkLocalTransport
         cancelledLocally = []; inventorySignature = nil
         installedManifests = []; installedScreens = []; manifestIssues = [:]
         preferenceRecords = []; inactiveDevicePreferences = []; preferenceConflicts = []; preferenceSyncStatus = nil
+        catalogBackupStatus = nil; catalogCanResume = false
         agentReady = false; requestPending = false; canCancelRequest = false; canRetry = false; takingLonger = false
     }
     private func persistPending() throws { try library?.savePending(id: pendingID, screenID: pendingScreenID, consumedID: consumedID) }
@@ -1285,5 +1297,165 @@ import ScreenpunkLocalTransport
                 homeAssistant = HomeAssistantDeviceRuntime(vault: HomeAssistantDeviceVault(), scope: { scope })
             }
         } catch { assets = nil; message = "Could not load this screen. Use Settings to restore its previous version." }
+    }
+}
+
+
+extension DeviceModel {
+    private struct CatalogFlight: Equatable {
+        var generation: UUID
+        var library: ObjectIdentifier
+        var binding: ScreenLibrary.CatalogBinding
+        var token: String // Memory only; never persisted or logged.
+    }
+    private var catalogFlight: CatalogFlight? {
+        guard foreground, connectionActive, cloudBindingMatches, let library, let profile = activeProfile,
+              let session = cloud.session, let account = cloud.localAccountID else { return nil }
+        return CatalogFlight(generation: connectionGeneration, library: ObjectIdentifier(library),
+            binding: .init(origin: CloudClient.origin.absoluteString, accountID: account, userID: session.user.id,
+                deviceID: session.deviceId, libraryID: profile.libraryOwner), token: session.accessToken)
+    }
+    private func requestCatalogSync() {
+        guard catalogTask == nil, catalogFlight != nil else { return }
+        let taskID = UUID(); catalogTaskID = taskID
+        catalogTask = Task { [weak self] in
+            defer { if self?.catalogTaskID == taskID { self?.catalogTask = nil } }
+            while !Task.isCancelled {
+                guard let self, let flight = self.catalogFlight else { return }
+                let wait = await self.syncCatalog(flight: flight)
+                guard self.catalogFlight == flight, !Task.isCancelled else { return }
+                do { try await Task.sleep(nanoseconds: UInt64(max(1, min(60, wait))) * 1_000_000_000) } catch { return }
+            }
+        }
+    }
+    func resumeCatalogBackups() {
+        guard let flight = catalogFlight, let library else { return }
+        do {
+            try library.resumeCatalog(binding: flight.binding)
+            catalogBackupStatus = library.catalogQueue?.status
+            catalogCanResume = false
+        } catch { catalogBackupStatus = error.localizedDescription }
+    }
+    private func syncCatalog(flight: CatalogFlight) async -> Int {
+        guard catalogFlight == flight, let library else { return 60 }
+        func current() throws {
+            guard self.catalogFlight == flight, !Task.isCancelled else { throw CancellationError() }
+        }
+        func refreshStatus() {
+            guard self.catalogFlight == flight else { return }
+            let queue = library.catalogQueue
+            self.catalogCanResume = queue?.captureAllowed == true && queue?.paused == true && queue?.entries.isEmpty == true
+            self.catalogBackupStatus = queue?.status ?? queue.map { $0.entries.isEmpty ? "Backup queue is up to date. Catalog shows completed backups; previews may be unavailable." : "\($0.entries.count) screen backups queued. Current screens are saved on this device." }
+        }
+        var activeIntent: ScreenLibrary.CatalogIntent?
+        if library.catalogQueue?.binding == flight.binding, library.catalogQueue?.authPaused == true {
+            catalogBackupStatus = "Backups paused. Sign in again to the original account to continue."
+            catalogCanResume = false
+            return 60
+        }
+        do {
+            try await cloud.enrollInstallation()
+            try current()
+            guard let capability = try await cloud.catalogCapability(token: flight.token) else {
+                try current(); catalogBackupStatus = "Cloud backups are unavailable on this server."; return 60
+            }
+            try current()
+            if capability.entitlement.backupEnabled { try library.activateCatalog(binding: flight.binding) }
+            guard library.catalogQueue?.binding == flight.binding else {
+                catalogBackupStatus = capability.entitlement.backupEnabled ? "Backups for this library need their original account and device connection." : "Cloud backups are not enabled for this account."
+                return 60
+            }
+            try library.setCatalogEntitlement(capability.entitlement.backupEnabled, binding: flight.binding)
+            refreshStatus()
+            guard var intent = library.catalogQueue?.entries.first else {
+                if !capability.entitlement.backupEnabled { catalogBackupStatus = "Cloud backups are not enabled for this account. Existing completed backups are retained." }
+                return 5
+            }
+            activeIntent = intent
+            if intent.retryAt > Date().timeIntervalSince1970 { return max(1, min(60, Int(ceil(intent.retryAt - Date().timeIntervalSince1970)))) }
+            // Recover a terminal acknowledgement even after entitlement is disabled.
+            if intent.packageDigest != nil {
+                do {
+                    let known: CatalogBackupStatus = try await cloud.catalogRequest(CatalogContract.operationsPath + intent.operationID, token: flight.token)
+                    try current()
+                    if try handleCatalogStatus(known, intent: intent, binding: flight.binding, library: library) { refreshStatus(); return 1 }
+                } catch let error as CloudClient.CatalogHTTPError where error.status == 404 { }
+            }
+            guard capability.entitlement.backupEnabled else {
+                catalogBackupStatus = "Cloud backups are paused for this account. Existing queued screens stay saved on this device."; return 60
+            }
+            if let reason = intent.blockedReason { catalogBackupStatus = reason; return 60 }
+            let exported: CatalogPackageExporter.Export
+            do { exported = try library.exportCatalogIntent(intent, binding: flight.binding) }
+            catch {
+                intent.blockedReason = "Backups paused: this committed package is missing, unsafe, or contains credential markers. Keep the screen on this device and contact support to reconcile its backup; later revisions cannot bypass it."
+                try library.updateCatalogIntent(intent, binding: flight.binding)
+                catalogBackupStatus = intent.blockedReason; return 60
+            }
+            guard exported.bytes.count <= capability.entitlement.packageBytes else {
+                intent.blockedReason = "Backups paused: this complete screen package exceeds the account limit. Its installed screen is unchanged."
+                try library.updateCatalogIntent(intent, binding: flight.binding); catalogBackupStatus = intent.blockedReason; return 60
+            }
+            let begin = try library.catalogBegin(intent, declaration: exported.declaration, binding: flight.binding)
+            let beginBytes = try CatalogContract.canonical(begin)
+            let beginDigest = CatalogContract.digest(beginBytes)
+            guard intent.beginDigest == nil || intent.beginDigest == beginDigest else { throw DeviceError.message("The saved backup request changed. Review this screen’s backup connection.") }
+            intent.packageDigest = exported.declaration.digest; intent.beginDigest = beginDigest
+            try library.updateCatalogIntent(intent, binding: flight.binding); activeIntent = intent
+            let started: CatalogBackupStatus = try await cloud.catalogRequest(CatalogContract.beginPath, method: "POST", bytes: beginBytes, token: flight.token)
+            try current()
+            if try handleCatalogStatus(started, intent: intent, binding: flight.binding, library: library) { refreshStatus(); return 1 }
+            guard started.operationID == intent.operationID, let upload = started.uploadID,
+                  upload.range(of: "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$", options: .regularExpression) != nil else { throw DeviceError.message("Cloud did not confirm this backup operation.") }
+            intent.uploadID = upload; try library.updateCatalogIntent(intent, binding: flight.binding); activeIntent = intent
+            let _: EmptyResponse = try await cloud.catalogRequest(CatalogContract.uploadsPath + upload + "/package", method: "PUT", bytes: exported.bytes, token: flight.token, package: true)
+            try current()
+            let completed: CatalogBackupStatus = try await cloud.catalogRequest(CatalogContract.uploadsPath + upload + "/complete", method: "POST", bytes: CatalogContract.canonical(CatalogCompleteBackup(operationID: intent.operationID)), token: flight.token)
+            try current()
+            guard try handleCatalogStatus(completed, intent: intent, binding: flight.binding, library: library) else { throw DeviceError.message("The backup has not completed yet.") }
+            refreshStatus(); return 1
+        } catch is CancellationError { return 60 }
+        catch DeviceError.http(let status, _) where status == 401 {
+            guard catalogFlight == flight, !Task.isCancelled else { return 60 }
+            try? library.pauseCatalogAuthentication(binding: flight.binding)
+            catalogBackupStatus = "Backups paused. Sign in again to the original account to continue."
+            catalogCanResume = false
+            return 60
+        }
+        catch {
+            guard catalogFlight == flight, !Task.isCancelled else { return 60 }
+            if let detail = error as? CloudClient.CatalogHTTPError, detail.status == 401 || detail.code == "unauthorized" {
+                try? library.pauseCatalogAuthentication(binding: flight.binding)
+                catalogBackupStatus = "Backups paused. Sign in again to the original account to continue."
+                catalogCanResume = false
+                return 60
+            }
+            if var intent = activeIntent, library.catalogQueue?.entries.first?.id == intent.id {
+                intent.attempts = min(16, intent.attempts + 1)
+                let detail = error as? CloudClient.CatalogHTTPError
+                let delay = max(detail?.retryAfterSeconds ?? 0, Int(min(3600, pow(2, Double(min(12, intent.attempts)))) * Double.random(in: 0.75...1.25)))
+                intent.retryAt = Date().timeIntervalSince1970 + Double(max(2, delay))
+                if ["invalid_package", "conflict"].contains(detail?.code ?? "") {
+                    intent.blockedReason = "Backups paused: Cloud rejected this saved package or its history. Keep the installed screen and contact support to reconcile the pending backup."
+                }
+                try? library.updateCatalogIntent(intent, binding: flight.binding)
+                catalogBackupStatus = intent.blockedReason ?? (detail?.status == 401 || detail?.status == 403 ? "Backups paused. Sign in to the original account to continue." : "Screen backups will retry when Cloud is available. Queued revisions stay on this device.")
+            } else { catalogBackupStatus = "Cloud backups will retry. Your installed screens are saved on this device." }
+            return 5
+        }
+    }
+    private func handleCatalogStatus(_ status: CatalogBackupStatus, intent: ScreenLibrary.CatalogIntent, binding: ScreenLibrary.CatalogBinding, library: ScreenLibrary) throws -> Bool {
+        guard status.schemaVersion == 1, status.operationID == intent.operationID else { throw DeviceError.message("Cloud returned a different backup operation.") }
+        try CatalogContract.validateStatus(status)
+        if status.state == "failed", status.error?.code == "retry_later", status.error?.restartOperation == true {
+            try library.restartExpiredCatalogOperation(intentID: intent.id, operationID: intent.operationID, binding: binding)
+            return true
+        }
+        if status.state == "failed", let error = status.error {
+            throw CloudClient.CatalogHTTPError(status: error.code == "unauthorized" ? 401 : error.code == "not_entitled" ? 403 : 400, code: error.code, retryAfterSeconds: error.retryAfterSeconds)
+        }
+        guard ["completed", "duplicate", "superseded", "deleted"].contains(status.state) else { return false }
+        try library.acknowledgeCatalogIntent(id: intent.id, binding: binding)
+        return true
     }
 }
