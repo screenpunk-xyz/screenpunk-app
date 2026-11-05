@@ -73,6 +73,7 @@ struct DeviceAccountSettings: View {
 /// Cloud identity and listener state are independent of the preferred request route.
 struct DeviceCloudAccountSection: View {
     @ObservedObject var device: DeviceModel
+    @State private var confirmCatalogResume = false
     let showListenerSetup: () -> Void
     private var accountActionsDisabled: Bool { device.routeChangeBlocked || device.accountOperationInProgress }
     var body: some View {
@@ -88,6 +89,16 @@ struct DeviceCloudAccountSection: View {
                         Text(email).textSelection(.enabled)
                         HStack { Spacer(); signOut }
                     }
+                }
+                if let backupStatus = device.catalogBackupStatus {
+                    Label(backupStatus, systemImage: "icloud")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    Text("When enabled, backups start with current screens; earlier edits are unavailable. Live data and connection settings are not included.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                if device.catalogCanResume {
+                    Button("Resume backups with current screens") { confirmCatalogResume = true }
+                        .disabled(accountActionsDisabled)
                 }
                 Label(device.cloudListenerStatus.label, systemImage: device.cloudListenerStatus == .connected ? "checkmark.circle" : "clock")
                     .foregroundStyle(.secondary)
@@ -105,6 +116,12 @@ struct DeviceCloudAccountSection: View {
                     if device.email != nil { HStack { Spacer(); signInAgain } }
                 }
             }
+        }
+        .alert("Resume current-screen backups?", isPresented: $confirmCatalogResume) {
+            Button("Cancel", role: .cancel) { }
+            Button("Resume backups") { device.resumeCatalogBackups() }
+        } message: {
+            Text("Edits made while backups were paused are not saved as history. Resume queues each current screen after the verified backup checkpoint.")
         }
         .task(id: device.email) {
             guard device.email != nil else { return }

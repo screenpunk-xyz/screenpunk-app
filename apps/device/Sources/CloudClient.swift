@@ -131,6 +131,46 @@ struct AgentStatus: Decodable {
         }
         return try JSONDecoder().decode(T.self, from: data.isEmpty ? Data("{}".utf8) : data)
     }
+
+    struct CatalogHTTPError: LocalizedError {
+        var status: Int
+        var code: String
+        var retryAfterSeconds: Int?
+        var errorDescription: String? { "Cloud backups are paused (\(code))." }
+    }
+    private struct CatalogErrorEnvelope: Decodable { var error: CatalogError }
+    func catalogRequest<T: Decodable>(_ path: String, method: String = "GET", bytes: Data? = nil, token: String, package: Bool = false) async throws -> T {
+        guard path.hasPrefix("/api/catalog"), bytes?.count ?? 0 <= (package ? CatalogContract.packageBytes : 64 * 1024) else { throw DeviceError.message("Backup request exceeded its limit.") }
+        var request = URLRequest(url: Self.origin.appendingPathComponent(String(path.dropFirst())))
+        request.httpMethod = method; request.timeoutInterval = 60
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue(CatalogContract.version, forHTTPHeaderField: "X-Screenpunk-Catalog-Version")
+        if let bytes { request.httpBody = bytes; request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
+        let transport = URLSession(configuration: .ephemeral, delegate: NoRedirects(), delegateQueue: nil)
+        defer { transport.finishTasksAndInvalidate() }
+        let (stream, response) = try await transport.bytes(for: request)
+        guard let http = response as? HTTPURLResponse else { throw DeviceError.message("Cloud backups did not respond.") }
+        guard response.expectedContentLength <= 64 * 1024 else { throw DeviceError.message("Backup response exceeded its limit.") }
+        var data = Data()
+        for try await byte in stream {
+            guard data.count < 64 * 1024 else { throw DeviceError.message("Backup response exceeded its limit.") }
+            data.append(byte)
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            let detail = (try? JSONDecoder().decode(CatalogError.self, from: data)) ?? (try? JSONDecoder().decode(CatalogErrorEnvelope.self, from: data).error)
+            let retry = http.value(forHTTPHeaderField: "Retry-After").flatMap(Int.init) ?? detail?.retryAfterSeconds
+            throw CatalogHTTPError(status: http.statusCode, code: detail?.code ?? (http.statusCode == 401 ? "unauthorized" : "retry_later"), retryAfterSeconds: retry)
+        }
+        return try JSONDecoder().decode(T.self, from: data.isEmpty ? Data("{}".utf8) : data)
+    }
+    func catalogCapability(token: String) async throws -> CatalogCapability? {
+        do {
+            let capability: CatalogCapability = try await catalogRequest(CatalogContract.capabilitiesPath, token: token)
+            guard capability.version == CatalogContract.version, capability.feature == CatalogContract.feature else { return nil }
+            return capability
+        } catch let error as CatalogHTTPError where error.status == 404 || error.status == 405 { return nil }
+    }
     func signOut() async throws {
         defer { session = nil; enrolledToken = nil }
         var revocationError: Error?

@@ -12,7 +12,7 @@ const output = option('--output');
 if (!output) throw Error('Usage: node tools/public-artifacts/pack.mjs --output /path/bundle.json (--source-revision FULL_COMMIT | --provisional)');
 const provisional = args.includes('--provisional'), revision = option('--source-revision');
 if (provisional === !!revision) throw Error('Choose an exact committed source revision or explicit --provisional');
-const paths = ['LICENSE','packages/contracts/LICENSE','packages/contracts/package.json','packages/contracts/README.md','packages/contracts/authoring.ts','packages/contracts/authoring-v2.ts','tools/local-agent-setup/generated/local-agent-setup.ts'];
+const paths = ['LICENSE','packages/contracts/LICENSE','packages/contracts/package.json','packages/contracts/README.md','packages/contracts/authoring.ts','packages/contracts/authoring-v2.ts','packages/contracts/catalog.ts','tools/local-agent-setup/generated/local-agent-setup.ts'];
 for (const directory of ['definitions','fixtures','generated']) for (const file of readdirSync(resolve(root,'packages/contracts',directory))) paths.push(`packages/contracts/${directory}/${file}`);
 paths.sort();
 const files = paths.map(path => {

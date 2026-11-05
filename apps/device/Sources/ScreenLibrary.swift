@@ -5,7 +5,7 @@ import ScreenpunkCore
 /// One atomic metadata replacement commits an installation. Failed writes never replace the current screen.
 @MainActor final class ScreenLibrary {
     struct Saved: Codable, Identifiable { let id: String; let revision: String; let artifact: ScreenArtifact }
-    struct State: Codable { var screens: [Saved] = []; var selectedID: String?; var previous: Saved?; var lastRequest: String?; var pendingID: String?; var pendingScreenID: String?; var consumedID: String?; var cancelledRequests: [String]?; var cancelIntents: [String]?; var lastInstruction: String?; var submissionKey: String?; var submissionText: String?; var submissionScreen: ScreenArtifact?; var requestDeadline: Double?; var authoring: AuthoringStoreState?; var linkedProfile: LocalProfileDescriptor?; var localRequestIDs: Set<String>?; var bundledScreenSeeds: Set<String>? }
+    struct State: Codable { var screens: [Saved] = []; var selectedID: String?; var previous: Saved?; var lastRequest: String?; var pendingID: String?; var pendingScreenID: String?; var consumedID: String?; var cancelledRequests: [String]?; var cancelIntents: [String]?; var lastInstruction: String?; var submissionKey: String?; var submissionText: String?; var submissionScreen: ScreenArtifact?; var requestDeadline: Double?; var authoring: AuthoringStoreState?; var linkedProfile: LocalProfileDescriptor?; var localRequestIDs: Set<String>?; var bundledScreenSeeds: Set<String>?; var catalog: CatalogQueue? }
     private(set) var state = State()
     private let root: URL
     private let libraryOwner: String
@@ -133,7 +133,7 @@ import ScreenpunkCore
                 if next.screens.count == 1 && next.selectedID == nil { next.selectedID = template.id }
                 next.bundledScreenSeeds?.insert(template.id)
                 committing = true
-                try commit(next, stagedDirectory: revision)
+                try commit(next, stagedDirectory: revision, captureCatalog: false)
                 pruneUnusedRevisions()
             } catch {
                 if !committing { try? FileManager.default.removeItem(at: directory) }
@@ -257,7 +257,11 @@ import ScreenpunkCore
             next.pendingID = nil; next.pendingScreenID = nil; next.requestDeadline = nil
         }
     }
-    private func commit(_ next: State, stagedDirectory: String? = nil) throws {
+    private func commit(_ proposed: State, stagedDirectory: String? = nil, captureCatalog: Bool = true) throws {
+        var next = proposed
+        if captureCatalog, let revision = stagedDirectory, let saved = next.screens.first(where: { $0.revision == revision }) {
+            captureCatalogRevision(saved, origin: "apply", in: &next)
+        }
         do {
             try journal.commit(JSONEncoder().encode(next), stagedDirectory: stagedDirectory)
             state = next
@@ -268,7 +272,7 @@ import ScreenpunkCore
         }
     }
     private func pruneUnusedRevisions() {
-        let retained = Set(state.screens.map(\.revision) + [state.previous?.revision].compactMap { $0 } + (state.authoring?.revisionPins?.values.map(\.revision) ?? []))
+        let retained = Set(state.screens.map(\.revision) + [state.previous?.revision].compactMap { $0 } + (state.authoring?.revisionPins?.values.map(\.revision) ?? []) + (state.catalog?.entries.map(\.revision) ?? []))
         for url in (try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? [] {
             if UUID(uuidString: url.lastPathComponent) != nil && !retained.contains(url.lastPathComponent) { try? FileManager.default.removeItem(at: url) }
         }
@@ -575,5 +579,239 @@ import ScreenpunkCore
         }
         guard paths.contains("index.html") else { throw DeviceError.message("The screen is missing index.html.") }
         try AuthoringPackageDependencies.validate(files: artifact.files.map { .init(path: $0.path, content: $0.content) })
+    }
+}
+
+
+extension ScreenLibrary {
+    /// Credentials never enter this durable binding. A changed account/enrollment must
+    /// open its own library; an old queue remains quarantined until its owner returns.
+    struct CatalogBinding: Codable, Equatable {
+        var origin: String
+        var accountID: String
+        var userID: String
+        var deviceID: String
+        var libraryID: String
+    }
+    struct CatalogCopy: Codable {
+        var id: String = UUID().uuidString
+        var localScreenID: String = UUID().uuidString
+        var counter: Int = 0
+        var head: String?
+        var lastQueuedCounter: Int = 0
+        var acknowledgedCounter: Int = 0
+        var acknowledgedRevision: String?
+        var gapFrom: Int?
+        var gapThrough: Int?
+    }
+    struct CatalogIntent: Codable, Identifiable {
+        var id: String = UUID().uuidString
+        var operationID: String = UUID().uuidString
+        var screenID: String
+        var revision: String
+        var copyID: String
+        var counter: Int
+        var parentIDs: [String]
+        var title: String
+        var entry: String
+        var paths: [String]
+        var appliedAt: Int64
+        var origin: String
+        var packageBytes: Int
+        var attempts: Int = 0
+        var retryAt: Double = 0
+        var uploadID: String?
+        var packageDigest: String?
+        var beginDigest: String?
+        var blockedReason: String?
+        var gap: CatalogGapDeclaration?
+    }
+    struct CatalogQueue: Codable {
+        var binding: CatalogBinding
+        var libraryID: String = UUID().uuidString
+        var copies: [String: CatalogCopy] = [:]
+        var entries: [CatalogIntent] = []
+        var paused: Bool = false
+        var captureAllowed: Bool = true
+        var authPaused: Bool = false
+        var status: String?
+        var seedAnnounced: Bool = false
+        var acknowledgedCount: Int = 0
+        var maxRevisions: Int = 100
+        var maxBytes: Int = 100 * 1024 * 1024
+    }
+    var catalogQueue: CatalogQueue? { state.catalog }
+
+    /// Only call after an authenticated capability response for this exact library.
+    /// Existing content is an honestly labelled current-screen seed, never history.
+    func activateCatalog(binding: CatalogBinding, maxRevisions: Int = 100, maxBytes: Int = 100 * 1024 * 1024) throws {
+        guard binding.libraryID == libraryOwner, !binding.origin.isEmpty, !binding.accountID.isEmpty,
+              !binding.userID.isEmpty, !binding.deviceID.isEmpty else { throw DeviceError.message("The backup account binding is incomplete.") }
+        if let queue = state.catalog {
+            guard queue.binding == binding else {
+                if queue.captureAllowed {
+                    var next = state; next.catalog?.captureAllowed = false
+                    next.catalog?.status = "Backups paused: queued revisions belong to an earlier device connection. Sign in to that connection or contact support to reconcile this library."
+                    try commit(next)
+                }
+                throw DeviceError.message("Saved backups belong to an earlier account or device connection.")
+            }
+            return
+        }
+        var next = state
+        next.catalog = CatalogQueue(binding: binding, maxRevisions: max(1, min(100, maxRevisions)), maxBytes: max(1, min(100 * 1024 * 1024, maxBytes)))
+        next.catalog?.seedAnnounced = true
+        next.catalog?.status = "Cloud backups are enabled. Current screens are queued once; earlier edits are not available."
+        for saved in next.screens { captureCatalogRevision(saved, origin: "seed", in: &next) }
+        try commit(next)
+    }
+
+    private func captureCatalogRevision(_ saved: Saved, origin: String, in next: inout State) {
+        guard var queue = next.catalog else { return }
+        var copy = queue.copies[saved.id] ?? CatalogCopy()
+        // Journal recovery/replay must not assign a new operation or counter.
+        guard copy.head != saved.revision else { return }
+        let parents = copy.head.map { [$0] } ?? []
+        copy.counter += 1
+        copy.head = saved.revision
+        let directory = root.appendingPathComponent(saved.revision)
+        // This is admission accounting only. Export validates paths and exact bytes
+        // independently before transport; failed export never changes application.
+        var bytes = 0
+        var admissionError: String?
+        var packageDigest: String?
+        for path in saved.artifact.files.map(\.path) {
+            do {
+                let values = try directory.appendingPathComponent(path).resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey, .isSymbolicLinkKey])
+                guard values.isRegularFile == true, values.isSymbolicLink != true, let size = values.fileSize, size >= 0, size <= 204_800 else { throw DeviceError.message("A backup asset is missing or unsafe.") }
+                bytes += size
+            } catch { admissionError = "A backup asset is missing or unsafe. Review this screen before resuming backups." }
+        }
+        // Base64 plus manifest overhead; budget conservatively before export.
+        bytes = ((bytes + 2) / 3) * 4 + saved.artifact.files.count * 512 + 8192
+        do {
+            let exported = try CatalogPackageExporter.export(directory: directory, title: saved.artifact.title, entry: saved.artifact.entry, paths: saved.artifact.files.map(\.path))
+            bytes = exported.bytes.count
+            packageDigest = exported.declaration.digest
+        } catch {
+            admissionError = "Backups paused: this committed package is unsafe, incomplete, or contains credential markers. Keep the installed screen and contact support to reconcile its pending backup."
+        }
+        if queue.paused || !queue.captureAllowed || queue.entries.count >= queue.maxRevisions || bytes > queue.maxBytes - queue.entries.reduce(0, { $0 + $1.packageBytes }) {
+            queue.paused = true
+            copy.gapFrom = copy.gapFrom ?? copy.counter
+            copy.gapThrough = copy.counter
+            queue.status = "Backups paused: capture is unavailable or the saved queue is full. Further edits stay on this device and are not queued. After queued backups finish, choose Resume backups to save each current screen."
+        } else {
+            queue.entries.append(CatalogIntent(screenID: saved.id, revision: saved.revision, copyID: copy.id, counter: copy.counter,
+                parentIDs: parents, title: saved.artifact.title, entry: saved.artifact.entry, paths: saved.artifact.files.map(\.path),
+                appliedAt: Int64(Date().timeIntervalSince1970 * 1000), origin: origin, packageBytes: bytes, packageDigest: packageDigest, blockedReason: admissionError))
+            copy.lastQueuedCounter = copy.counter
+        }
+        queue.copies[saved.id] = copy
+        next.catalog = queue
+    }
+
+    func updateCatalogIntent(_ intent: CatalogIntent, binding: CatalogBinding) throws {
+        guard state.catalog?.binding == binding, let index = state.catalog?.entries.firstIndex(where: { $0.id == intent.id }) else { throw DeviceError.message("The backup connection changed.") }
+        var next = state; next.catalog?.entries[index] = intent; try commit(next)
+    }
+    func acknowledgeCatalogIntent(id: String, binding: CatalogBinding) throws {
+        guard state.catalog?.binding == binding, state.catalog?.entries.first?.id == id else { throw DeviceError.message("The backup connection changed.") }
+        var next = state
+        let intent = next.catalog!.entries.removeFirst()
+        if intent.counter > (next.catalog?.copies[intent.screenID]?.acknowledgedCounter ?? 0) {
+            next.catalog?.copies[intent.screenID]?.acknowledgedCounter = intent.counter
+            next.catalog?.copies[intent.screenID]?.acknowledgedRevision = intent.revision
+        }
+        next.catalog?.acknowledgedCount += 1
+        if next.catalog?.entries.isEmpty == true, next.catalog?.paused != true { next.catalog?.status = nil }
+        try commit(next)
+        pruneUnusedRevisions()
+    }
+    func setCatalogStatus(_ status: String?, binding: CatalogBinding) throws {
+        guard state.catalog?.binding == binding else { return }
+        var next = state; next.catalog?.status = status; try commit(next)
+    }
+}
+
+
+extension ScreenLibrary {
+    func exportCatalogIntent(_ intent: CatalogIntent, binding: CatalogBinding) throws -> CatalogPackageExporter.Export {
+        guard state.catalog?.binding == binding, state.catalog?.entries.contains(where: { $0.id == intent.id && $0.revision == intent.revision }) == true else { throw DeviceError.message("The backup connection changed.") }
+        let exported = try CatalogPackageExporter.export(directory: root.appendingPathComponent(intent.revision), title: intent.title, entry: intent.entry, paths: intent.paths)
+        guard intent.packageDigest == nil || intent.packageDigest == exported.declaration.digest else { throw DeviceError.message("The immutable backup package changed. Backups are paused for review.") }
+        return exported
+    }
+    func catalogBegin(_ intent: CatalogIntent, declaration: CatalogObjectDeclaration, binding: CatalogBinding) throws -> CatalogBeginBackup {
+        guard let queue = state.catalog, queue.binding == binding, let copy = queue.copies[intent.screenID], copy.id == intent.copyID else { throw DeviceError.message("The backup connection changed.") }
+        let begin = CatalogBeginBackup(operationID: intent.operationID, libraryID: queue.libraryID, localScreenID: copy.localScreenID,
+            sourceRevisionID: intent.revision, parentRevisionIDs: intent.parentIDs, predecessorRevisionID: intent.parentIDs.first,
+            commitCounter: intent.counter, origin: intent.origin == "apply" ? "applied" : "seed",
+            sourceAppliedAt: CatalogContract.timestamp(Date(timeIntervalSince1970: Double(intent.appliedAt) / 1000)), screenName: intent.title, gap: intent.gap, package: declaration)
+        try CatalogContract.validateBegin(begin)
+        return begin
+    }
+    /// Explicit user acknowledgement excludes the recorded intermediate edits.
+    /// Existing pins must drain first; a copy without a server checkpoint cannot reset.
+    func resumeCatalog(binding: CatalogBinding) throws {
+        guard let queue = state.catalog, queue.binding == binding, queue.captureAllowed, queue.paused, queue.entries.isEmpty else { throw DeviceError.message("Wait for queued backups to finish before resuming.") }
+        var next = state
+        for saved in state.screens {
+            guard var copy = next.catalog?.copies[saved.id], let from = copy.gapFrom, let through = copy.gapThrough else { continue }
+            guard copy.acknowledgedCounter >= 1, let checkpoint = copy.acknowledgedRevision,
+                  from == copy.acknowledgedCounter + 1 else { throw DeviceError.message("This screen has no verified backup checkpoint. Backups remain paused; contact support to reconcile this screen without losing its history.") }
+            guard saved.revision != checkpoint else { throw DeviceError.message("The current screen is an earlier backed-up revision. Make a new screen edit before resuming; saved revisions cannot be renumbered.") }
+            let gap = CatalogGapDeclaration(checkpointCounter: copy.acknowledgedCounter, checkpointRevisionID: checkpoint, skippedFromCounter: from, skippedThroughCounter: through)
+            copy.head = checkpoint; copy.counter = through
+            copy.gapFrom = nil; copy.gapThrough = nil
+            next.catalog?.copies[saved.id] = copy
+            next.catalog?.paused = false
+            captureCatalogRevision(saved, origin: "seed", in: &next)
+            guard let index = next.catalog?.entries.lastIndex(where: { $0.screenID == saved.id }) else { throw DeviceError.message("The current screen exceeds the backup queue limit.") }
+            next.catalog?.entries[index].gap = gap
+        }
+        next.catalog?.paused = false
+        next.catalog?.status = "Backups resumed. Current screens are queued; edits made while paused are not a backup history."
+        try commit(next)
+    }
+}
+
+
+extension ScreenLibrary {
+    func setCatalogEntitlement(_ enabled: Bool, binding: CatalogBinding) throws {
+        guard state.catalog?.binding == binding, state.catalog?.captureAllowed != enabled else { return }
+        var next = state; next.catalog?.captureAllowed = enabled; try commit(next)
+    }
+}
+
+
+extension ScreenLibrary {
+    func restartExpiredCatalogOperation(intentID: String, operationID: String, binding: CatalogBinding) throws {
+        guard state.catalog?.binding == binding,
+              let index = state.catalog?.entries.firstIndex(where: { $0.id == intentID && $0.operationID == operationID }) else { throw DeviceError.message("The backup connection changed.") }
+        var next = state
+        next.catalog?.entries[index].operationID = UUID().uuidString
+        next.catalog?.entries[index].beginDigest = nil
+        next.catalog?.entries[index].uploadID = nil
+        next.catalog?.entries[index].attempts = 0
+        next.catalog?.entries[index].retryAt = 0
+        // Source identity, counter, package digest and revision pin remain unchanged.
+        try commit(next)
+    }
+}
+
+
+extension ScreenLibrary {
+    func pauseCatalogAuthentication(binding: CatalogBinding) throws {
+        guard state.catalog?.binding == binding, state.catalog?.authPaused != true else { return }
+        var next = state; next.catalog?.authPaused = true; try commit(next)
+    }
+    /// Only explicit successful sign-in of the identical account/enrollment clears
+    /// this durable pause. Restart or selecting a different library does not.
+    func resumeCatalogAuthentication(binding: CatalogBinding) throws {
+        guard state.catalog?.binding == binding, state.catalog?.authPaused == true else { return }
+        var next = state; next.catalog?.authPaused = false
+        for index in next.catalog!.entries.indices { next.catalog?.entries[index].retryAt = 0 }
+        try commit(next)
     }
 }

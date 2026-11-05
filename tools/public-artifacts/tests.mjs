@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { sha256, lockFor, verifyBundle, validateLock } from './format.mjs';
+import { sha256, lockFor, verifyBundle, validateLock, safePath, sourceSnapshot } from './format.mjs';
 import * as setup from '../local-agent-setup/generated/local-agent-setup.ts';
 const root=fileURLToPath(new URL('../../',import.meta.url));
 const scratch=resolve(process.env.SCREENPUNK_ARTIFACT_TEST_ROOT ?? join(tmpdir(),'screenpunk-public-artifact-tests-public'));
@@ -19,7 +19,7 @@ assert.equal(result.status,0,result.stderr);
 const bytes=readFileSync(output),bundle=JSON.parse(bytes),lock=JSON.parse(readFileSync(output+'.lock.json'));
 test('portable artifact includes the contract validators, schemas, fixtures, license and setup',()=>{
   const verified=verifyBundle(bytes,lock);
-  for(const path of ['packages/contracts/authoring.ts','packages/contracts/authoring-v2.ts','packages/contracts/definitions/request-v1.schema.json','packages/contracts/definitions/request-v2.schema.json','packages/contracts/fixtures/conformance-v1.json','packages/contracts/fixtures/conformance-v2.json','LICENSE','tools/local-agent-setup/generated/local-agent-setup.ts']) assert.ok(verified.files.has(path),path);
+  for(const path of ['packages/contracts/authoring.ts','packages/contracts/authoring-v2.ts','packages/contracts/catalog.ts','packages/contracts/generated/catalog-definition.ts','packages/contracts/fixtures/conformance-catalog-v1.json','packages/contracts/definitions/request-v1.schema.json','packages/contracts/definitions/request-v2.schema.json','packages/contracts/fixtures/conformance-v1.json','packages/contracts/fixtures/conformance-v2.json','LICENSE','tools/local-agent-setup/generated/local-agent-setup.ts']) assert.ok(verified.files.has(path),path);
   assert.equal(lock.sourceRevision,null);assert.equal(lock.provenance,'local-provisional');
   assert.throws(()=>validateLock(lock,{requirePublished:true}),/cannot deploy/);
 });
@@ -66,4 +66,17 @@ test('packing is deterministic, immutable and never invents a public revision',(
 test.after(()=>{
   rmSync(directory,{recursive:true});
   writeFileSync(join(scratch,'ownership.json'),JSON.stringify({owner:'Screenpunk migration contracts_artifacts',project:'screenpunk-app',purpose:'Synthetic public artifact packaging checks',lifecycle:'completed',budgetMiB:50,keep:['ownership.json'],removed:directory,activeFixtures:[]})+'\n');
+});
+
+test('catalog source is narrowly allowlisted alongside generated schema fixtures', () => {
+  for (const path of ['packages/contracts/catalog.ts','packages/contracts/definitions/catalog-v1.json','packages/contracts/fixtures/conformance-catalog-v1.json','packages/contracts/generated/catalog-definition.ts']) assert.equal(safePath(path),path);
+  for (const path of ['packages/contracts/catalog.test.ts','packages/contracts/catalog.js','packages/contracts/scripts/sync-catalog.mjs','packages/contracts/definitions/nested/catalog.json','packages/contracts/../catalog.ts']) assert.throws(()=>safePath(path));
+});
+
+test('catalog export requires complete source/schema/fixture artifacts',()=>{
+  for(const path of ['packages/contracts/catalog.ts','packages/contracts/definitions/catalog-v1.json','packages/contracts/generated/catalog-definition.ts','packages/contracts/fixtures/conformance-catalog-v1.json']) {
+    const changed=structuredClone(bundle); changed.files=changed.files.filter(f=>f.path!==path); changed.sourceSnapshotSHA256=sourceSnapshot(changed.files);
+    const encoded=Buffer.from(JSON.stringify(changed)+'\n');
+    assert.throws(()=>verifyBundle(encoded,lockFor(changed,encoded)),/Required catalog artifact file missing/);
+  }
 });

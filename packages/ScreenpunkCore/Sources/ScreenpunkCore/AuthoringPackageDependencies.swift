@@ -13,8 +13,21 @@ public enum AuthoringPackageDependencies {
 
     /// Internal limits let small, ordinary fixtures exercise the same fail-closed guards.
     static func validate(files: [AuthoringScreenFile], workLimit: Int, byteLimit: Int = packageByteLimit) throws {
-        try admit(files: files, byteLimit: byteLimit)
         var budget = Budget(remaining: workLimit)
+        try scan(files: files, byteLimit: byteLimit, budget: &budget)
+    }
+
+    /// Uses the exact bounded, quote-aware installation parser to collect catalog
+    /// declarations. Catalog admission is stricter; ordinary validation is unchanged.
+    public static func catalogDependencies(files: [AuthoringScreenFile]) throws -> (local: [String], external: [String]) {
+        var budget = Budget(remaining: workLimit, catalog: true)
+        try scan(files: files, byteLimit: packageByteLimit, budget: &budget)
+        guard budget.local.count <= 20, budget.external.count <= 20 else { throw invalid("Too many catalog dependencies.") }
+        return (budget.local.sorted(), budget.external.sorted())
+    }
+
+    private static func scan(files: [AuthoringScreenFile], byteLimit: Int, budget: inout Budget) throws {
+        try admit(files: files, byteLimit: byteLimit)
         try budget.spend(0)
         let paths = Set(files.map(\.path))
         for file in files {
@@ -76,6 +89,9 @@ public enum AuthoringPackageDependencies {
 
     private struct Budget {
         var remaining: Int
+        var catalog = false
+        var local = Set<String>()
+        var external = Set<String>()
         mutating func spend(_ count: Int = 1) throws {
             guard count >= 0, remaining >= count else { throw invalid("Package dependency parsing exceeded its work limit.") }
             remaining -= count
@@ -292,6 +308,7 @@ public enum AuthoringPackageDependencies {
         }
     }
     private static func srcset(_ bytes: [UInt8], context: Context, budget: inout Budget) throws {
+        if budget.catalog, has(bytes, 0, bytes.count, "data:") { throw invalid("Unsupported catalog data srcset.") }
         var i = 0
         while i < bytes.count {
             while i < bytes.count, space(bytes[i]) || bytes[i] == 44 { try budget.spend(); i += 1 }
@@ -335,6 +352,7 @@ public enum AuthoringPackageDependencies {
     }
     /// Supported amp/numeric entities are decoded once, while advancing the input.
     private static func entities(_ bytes: [UInt8], _ range: Range<Int>, budget: inout Budget) throws -> [UInt8] {
+        if budget.catalog, bytes[range].contains(38) { throw invalid("Unsupported catalog dependency entity.") }
         var output: [UInt8] = []; output.reserveCapacity(range.count)
         var i = range.lowerBound
         while i < range.upperBound {
@@ -362,6 +380,16 @@ public enum AuthoringPackageDependencies {
         let raw = String(decoding: bytes, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
         let value = Array(raw.utf8)
         if value.isEmpty || value[0] == 35 { return }
+        if budget.catalog {
+            if raw.hasPrefix("data:") { return }
+            guard raw.utf16.count <= 160, raw.range(of: #"[\\&\x00-\x20]"#, options: .regularExpression) == nil else { throw invalid("Unsupported catalog dependency encoding.") }
+            if raw.range(of: #"^https?://"#, options: [.regularExpression, .caseInsensitive]) != nil {
+                guard let url = URLComponents(string: raw), url.host != nil, url.user == nil, url.password == nil else { throw invalid("Credential-bearing catalog dependency URL.") }
+                budget.external.insert(raw); return
+            }
+            guard raw.range(of: #"^[a-z][a-z0-9+.-]*:|^//"#, options: [.regularExpression, .caseInsensitive]) == nil,
+                  !raw.hasPrefix("/"), !raw.prefix(while: { $0 != "?" && $0 != "#" }).contains("%") else { throw invalid("Unsupported catalog dependency path or scheme.") }
+        }
         let package = has(value, 0, value.count, "screenpunk://package/", insensitive: true)
         var start = 0
         if package { start = 21 }
@@ -401,5 +429,6 @@ public enum AuthoringPackageDependencies {
         for part in components { try budget.spend(part.utf8.count + 1) }
         let resolved = components.joined(separator: "/")
         guard context.paths.contains(resolved) else { throw invalid("The screen references a missing package file: \(resolved).") }
+        if budget.catalog { budget.local.insert(resolved) }
     }
 }
