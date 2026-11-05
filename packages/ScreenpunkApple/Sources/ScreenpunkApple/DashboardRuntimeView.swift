@@ -11,6 +11,7 @@ public struct DashboardRuntimeView: View {
     public var publicReads: PublicReadSession?
     public var homeAssistant: HomeAssistantDeviceRuntime?
     public var revision: String
+    public var catalogContext: CatalogPreviewContext?
     public var connections: ConnectionRuntime?
     public var settings: DeviceSettings
     public var onSettingsApplied: (Bool) -> Void
@@ -26,6 +27,7 @@ public struct DashboardRuntimeView: View {
         homeAssistant: HomeAssistantDeviceRuntime? = nil,
         publicReads: PublicReadSession? = nil,
         revision: String = "",
+        catalogContext: CatalogPreviewContext? = nil,
         connections: ConnectionRuntime? = nil,
         settings: DeviceSettings = .init(),
         onSettingsApplied: @escaping (Bool) -> Void = { _ in },
@@ -39,7 +41,7 @@ public struct DashboardRuntimeView: View {
         self.screenName = screenName
         self.homeAssistant = homeAssistant
         self.publicReads = publicReads
-        self.revision = revision
+        self.revision = revision; self.catalogContext = catalogContext
         self.connections = connections; self.settings = settings; self.onSettingsApplied = onSettingsApplied
         self.store = store
         self.connectionCount = connectionCount
@@ -62,7 +64,7 @@ public struct DashboardRuntimeView: View {
     public var body: some View {
         ZStack {
 #if canImport(WebKit)
-            DashboardWebView(store: store, homeAssistant: homeAssistant, publicReads: publicReads?.runtime, rasterResources: publicReads?.resources, revision: revision,
+            DashboardWebView(store: store, homeAssistant: homeAssistant, publicReads: publicReads?.runtime, rasterResources: publicReads?.resources, revision: revision, catalogContext: catalogContext,
                              connections: connections, settings: settings, active: scenePhase == .active, onSettingsApplied: onSettingsApplied,
                              onConnectionHealth: { connectionUnhealthy = !$0 },
                              onReady: { loaded = true }, onUnlinkHold: openMenu)

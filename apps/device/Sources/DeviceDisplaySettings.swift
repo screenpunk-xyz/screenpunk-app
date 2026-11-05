@@ -65,11 +65,28 @@ final class DeviceDisplayPreferences: ObservableObject {
 
 struct DeviceDisplaySettings: View {
     @ObservedObject var preferences: DeviceDisplayPreferences
+    @ObservedObject var device: DeviceModel
+    @State private var deviceName = ""
+    @State private var nameSaved = false
     @State private var draft = DeviceBrightnessSettings()
     @State private var saved = false
 
     var body: some View {
         Form {
+            Section {
+                TextField("Device name", text: $deviceName)
+                    .textInputAutocapitalization(.words)
+                    .submitLabel(.done)
+                    .onSubmit(saveDeviceName)
+                    .accessibilityIdentifier("deviceName")
+                Button("Save device name", action: saveDeviceName)
+                    .disabled(!canSaveDeviceName)
+                if nameSaved { Text("Saved").foregroundStyle(.secondary) }
+            } header: {
+                Text("Device Name")
+            } footer: {
+                Text("Choose a name for this device in Screenpunk.")
+            }
             Section("Brightness") {
                 Picker("Control", selection: $draft.mode) {
                     Text("System").tag(DeviceBrightnessMode.system)
@@ -116,9 +133,24 @@ struct DeviceDisplaySettings: View {
                 }
             }
         }
-        .navigationTitle("Display")
-        .onAppear { draft = preferences.settings }
+        .navigationTitle("General")
+        .onAppear { draft = preferences.settings; deviceName = device.displayName }
+        .onChange(of: deviceName) { _ in nameSaved = false }
+        .onChange(of: device.displayName) { deviceName = $0 }
         .onChange(of: draft) { _ in saved = false }
+    }
+
+    private var canSaveDeviceName: Bool {
+        guard let normalized = try? DeviceNameStore.normalized(deviceName) else { return false }
+        return normalized != device.displayName
+    }
+
+    private func saveDeviceName() {
+        guard canSaveDeviceName else { return }
+        let requested = try? DeviceNameStore.normalized(deviceName)
+        device.updateDeviceName(deviceName)
+        deviceName = device.displayName
+        nameSaved = requested == device.displayName
     }
 
     private func levelSlider(_ value: Binding<Double>) -> some View {

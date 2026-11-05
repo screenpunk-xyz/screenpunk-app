@@ -20,6 +20,22 @@ final class CatalogContractTests: XCTestCase {
         XCTAssertEqual(try CatalogContract.canonical(begin), try AuthoringContract.canonicalJSON(data(f["begin"]!)))
         XCTAssertThrowsError(try CatalogContract.verifyPackage(bytes + Data([10]), declaration: begin.package))
     }
+    func testPreviewImmutableBindingAndCanonicalParity() throws {
+        let f = try XCTUnwrap(try fixture()["previewAttachment"] as? [String: Any])
+        var begin = try JSONDecoder().decode(CatalogPreviewBegin.self, from: data(f["begin"]!))
+        try CatalogContract.validatePreviewBegin(begin)
+        XCTAssertEqual(String(decoding: try CatalogContract.canonical(begin), as: UTF8.self), f["canonicalBegin"] as? String)
+        XCTAssertEqual(try CatalogContract.previewBeginDigest(begin), f["beginDigest"] as? String)
+        let preview = try JSONDecoder().decode(CatalogPreview.self, from: data(f["available"]!))
+        XCTAssertEqual(preview.source, "exact_package")
+        XCTAssertEqual(preview.capturedAt, begin.capturedAt)
+        let status = try JSONDecoder().decode(CatalogPreviewStatus.self, from: data(f["status"]!))
+        try CatalogContract.validateStatus(status)
+        let candidates = try JSONDecoder().decode(CatalogPreviewCandidates.self, from: data(f["candidates"]!))
+        XCTAssertEqual(candidates.candidates.first?.sourceRevisionID, begin.sourceRevisionID)
+        begin.preview.mediaType = "image/jpeg"
+        XCTAssertThrowsError(try CatalogContract.validatePreviewBegin(begin))
+    }
     func testEmptyCSSPackagePreservesExactBytes() throws {
         let f = try XCTUnwrap(try fixture()["emptyFilePackage"] as? [String: Any])
         let package = try JSONDecoder().decode(CatalogPackage.self, from: data(f["package"]!))

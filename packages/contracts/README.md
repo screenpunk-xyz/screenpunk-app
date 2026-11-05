@@ -55,7 +55,7 @@ Device-authenticated API routes (account/enrollment/copy come from server auth):
 | GET | `/api/catalog/capabilities` | `CatalogCapability` |
 | POST | `/api/catalog/backups/begin` | `CatalogBeginBackup` / `CatalogBackupStatus` |
 | PUT | `/api/catalog/backups/{uploadID}/package` | Exact canonical package bytes / `CatalogBackupStatus` |
-| PUT | `/api/catalog/backups/{uploadID}/preview` | Declared raster bytes / `CatalogBackupStatus` |
+| PUT | `/api/catalog/backups/{uploadID}/preview` | Legacy route rejected; use the exact-version attachment protocol below |
 | POST | `/api/catalog/backups/{uploadID}/complete` | `CatalogCompleteBackup` / `CatalogBackupStatus` |
 | GET | `/api/catalog/backups/operations/{operationID}` | `CatalogBackupStatus` |
 
@@ -147,3 +147,71 @@ Ordinary pending/backoff responses never carry this flag.
 
 Empty individual files are valid and preserved with byteLength zero, canonical empty
 base64 and SHA256 of empty bytes; the whole package envelope remains nonempty.
+
+### Exact-version PNG attachments (additive preview protocol v1)
+
+Artifact beta.4 adds `previewBackfillVersion:"1"` on `CatalogCapability`.
+Clients use this protocol only when that field is present **and**
+`previewMediaTypes` includes `image/png`. PNG support applies to the following
+post-publication flow. The legacy `/api/catalog/backups/{backupUploadID}/preview`
+route remains rejected; advertising PNG does not authorize that route. Existing
+package backup success and source-pin acknowledgement remain independent of
+preview capture/upload failures. JPEG is not accepted by this attachment protocol.
+
+| Method | Device-authenticated route | Typed body/result |
+| --- | --- | --- |
+| GET | `/api/catalog/preview-candidates?cursor=...` | `CatalogPreviewCandidates` (<=20 records/page) |
+| GET | `/api/catalog/screens/{screenID}/versions/{versionID}/package?sourceRevisionID=...&packageDigest=...` | Exact immutable canonical package bytes |
+| POST | `/api/catalog/previews/begin` | `CatalogPreviewBegin` / `CatalogPreviewStatus` |
+| PUT | `/api/catalog/previews/{uploadID}/image` | Exact declared PNG bytes / `CatalogPreviewStatus` |
+| POST | `/api/catalog/previews/{uploadID}/complete` | `CatalogCompleteBackup` / `CatalogPreviewStatus` |
+| GET | `/api/catalog/previews/operations/{operationID}` | `CatalogPreviewStatus` |
+
+Candidates and package retrieval are limited to the authenticated **original
+producing enrollment and copy**, not an account-wide device catalog/list grant.
+Server compares the selected version's mapped library/local-screen IDs,
+sourceRevisionID, packageDigest, account ownership and current tombstone/integrity
+state. The package query includes exact immutable source binding; it is not a
+selector for arbitrary device/source data. Source downloads are private/no-store,
+served as attachment/octet-stream without execution in the browser account origin.
+Native recovery verifies the whole-envelope digest and existing package validators
+before capture. Missing or unrecoverable source produces unavailable preview;
+never capture the current screen for a different saved version.
+
+`CatalogPreviewBegin` requires operationID, catalogScreenID, versionID, libraryID,
+localScreenID, sourceRevisionID, packageDigest, source:`"exact_package"`, exact UTC
+`capturedAt`, and PNG digest/actual byte length/dimensions. `catalogPreviewBeginDigest`
+seals the canonical immutable intent. Same operation and request dedupe; changed
+request conflicts. Intent/upload IDs are server-scoped, leased and bounded. Begin
+and publication recheck version ownership, original copy/enrollment, revocation,
+quota, entitlement and tombstones. An available preview is immutable: only the same
+bytes can dedupe; a different image cannot silently replace it. Logical deletion
+wins an in-flight attachment race and enqueues exact private-object cleanup.
+
+A device may capture the active view only after checking its exact immutable
+revision/package asset digests and generation before and after capture. Persist
+those bounded PNG bytes and declaration before HTTP; attach only after the matching
+package version is acknowledged. If the active view no longer matches, render the
+exact recovered package in an isolated native view with network/device bridges,
+runtime preferences and credentials disabled. Do not execute saved HTML in the
+Cloud/browser account origin. Dynamic source that cannot produce an honest image
+under those restrictions remains explicitly unavailable. This is a device capture
+claim bound to authenticated provenance, not server-side proof of pixel semantics.
+
+The server verifies PNG signature, complete chunk structure/CRC, supported raster
+format, bounded decompression/scanlines and actual dimensions before publication;
+filename, headers, or caller-supplied dimensions alone are insufficient. Enforce
+<=512KiB and <=2048 pixels per dimension (plus stricter effective entitlement).
+Do not advertise support until this validator and private storage are ready.
+Capture/upload/validation failure never turns a completed package into a failed
+screen application or fabricates an image.
+
+Available `CatalogPreview` may include source:`"exact_package"` and `capturedAt`;
+new attachments supply both, optional fields preserve compatibility with existing
+wire readers. The browser's existing authorized per-version `/preview` GET serves
+only active version metadata and safe PNG bytes with private/no-store headers.
+Show the matching latest or earlier version's capture time. A backfilled image is
+a **current rendering of that exact saved source**, not a historical snapshot of
+external runtime data at sourceAppliedAt or backedUpAt. Never label missing or
+failed captures as a screenshot. The synthetic one-pixel conformance raster is
+protocol test evidence only and must never be served as a production preview.

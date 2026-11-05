@@ -18,17 +18,18 @@ public struct DashboardWebView: UIViewRepresentable {
     public var publicReads: PublicReadRuntime?
     public var rasterResources: PublicRasterResources?
     public var revision: String
+    public var catalogContext: CatalogPreviewContext?
     public var connections: ConnectionRuntime?
     public var settings: DeviceSettings
     public var active: Bool
     public var onSettingsApplied: (Bool) -> Void
     public var onConnectionHealth: (Bool) -> Void
 
-    public init(store: PackageAssetStore, homeAssistant: HomeAssistantDeviceRuntime? = nil, publicReads: PublicReadRuntime? = nil, rasterResources: PublicRasterResources? = nil, revision: String = "", connections: ConnectionRuntime? = nil, settings: DeviceSettings = .init(), active: Bool = true, onSettingsApplied: @escaping (Bool) -> Void = { _ in }, onConnectionHealth: @escaping (Bool) -> Void = { _ in }, onReady: @escaping () -> Void = {}, onUnlinkHold: @escaping () -> Void) {
+    public init(store: PackageAssetStore, homeAssistant: HomeAssistantDeviceRuntime? = nil, publicReads: PublicReadRuntime? = nil, rasterResources: PublicRasterResources? = nil, revision: String = "", catalogContext: CatalogPreviewContext? = nil, connections: ConnectionRuntime? = nil, settings: DeviceSettings = .init(), active: Bool = true, onSettingsApplied: @escaping (Bool) -> Void = { _ in }, onConnectionHealth: @escaping (Bool) -> Void = { _ in }, onReady: @escaping () -> Void = {}, onUnlinkHold: @escaping () -> Void) {
         self.store = store
         self.homeAssistant = homeAssistant
         self.publicReads = publicReads; self.rasterResources = rasterResources
-        self.revision = revision
+        self.revision = revision; self.catalogContext = catalogContext
         self.connections = connections; self.settings = settings; self.active = active; self.onSettingsApplied = onSettingsApplied
         self.onConnectionHealth = onConnectionHealth
         self.onReady = onReady
@@ -36,7 +37,7 @@ public struct DashboardWebView: UIViewRepresentable {
     }
 
     public func makeCoordinator() -> DashboardWebCoordinator {
-        DashboardWebCoordinator(store: store, homeAssistant: homeAssistant, publicReads: publicReads, rasterResources: rasterResources, revision: revision, connections: connections, settings: settings, active: active, onSettingsApplied: onSettingsApplied, onConnectionHealth: onConnectionHealth, onReady: onReady, onUnlinkHold: onUnlinkHold)
+        DashboardWebCoordinator(store: store, homeAssistant: homeAssistant, publicReads: publicReads, rasterResources: rasterResources, revision: revision, catalogContext: catalogContext, connections: connections, settings: settings, active: active, onSettingsApplied: onSettingsApplied, onConnectionHealth: onConnectionHealth, onReady: onReady, onUnlinkHold: onUnlinkHold)
     }
 
     public func makeUIView(context: Context) -> WKWebView {
@@ -60,17 +61,18 @@ public struct DashboardWebView: NSViewRepresentable {
     public var publicReads: PublicReadRuntime?
     public var rasterResources: PublicRasterResources?
     public var revision: String
+    public var catalogContext: CatalogPreviewContext?
     public var connections: ConnectionRuntime?
     public var settings: DeviceSettings
     public var active: Bool
     public var onSettingsApplied: (Bool) -> Void
     public var onConnectionHealth: (Bool) -> Void
 
-    public init(store: PackageAssetStore, homeAssistant: HomeAssistantDeviceRuntime? = nil, publicReads: PublicReadRuntime? = nil, rasterResources: PublicRasterResources? = nil, revision: String = "", connections: ConnectionRuntime? = nil, settings: DeviceSettings = .init(), active: Bool = true, onSettingsApplied: @escaping (Bool) -> Void = { _ in }, onConnectionHealth: @escaping (Bool) -> Void = { _ in }, onReady: @escaping () -> Void = {}, onUnlinkHold: @escaping () -> Void) {
+    public init(store: PackageAssetStore, homeAssistant: HomeAssistantDeviceRuntime? = nil, publicReads: PublicReadRuntime? = nil, rasterResources: PublicRasterResources? = nil, revision: String = "", catalogContext: CatalogPreviewContext? = nil, connections: ConnectionRuntime? = nil, settings: DeviceSettings = .init(), active: Bool = true, onSettingsApplied: @escaping (Bool) -> Void = { _ in }, onConnectionHealth: @escaping (Bool) -> Void = { _ in }, onReady: @escaping () -> Void = {}, onUnlinkHold: @escaping () -> Void) {
         self.store = store
         self.homeAssistant = homeAssistant
         self.publicReads = publicReads; self.rasterResources = rasterResources
-        self.revision = revision
+        self.revision = revision; self.catalogContext = catalogContext
         self.connections = connections; self.settings = settings; self.active = active; self.onSettingsApplied = onSettingsApplied
         self.onConnectionHealth = onConnectionHealth
         self.onReady = onReady
@@ -78,7 +80,7 @@ public struct DashboardWebView: NSViewRepresentable {
     }
 
     public func makeCoordinator() -> DashboardWebCoordinator {
-        DashboardWebCoordinator(store: store, homeAssistant: homeAssistant, publicReads: publicReads, rasterResources: rasterResources, revision: revision, connections: connections, settings: settings, active: active, onSettingsApplied: onSettingsApplied, onConnectionHealth: onConnectionHealth, onReady: onReady, onUnlinkHold: onUnlinkHold)
+        DashboardWebCoordinator(store: store, homeAssistant: homeAssistant, publicReads: publicReads, rasterResources: rasterResources, revision: revision, catalogContext: catalogContext, connections: connections, settings: settings, active: active, onSettingsApplied: onSettingsApplied, onConnectionHealth: onConnectionHealth, onReady: onReady, onUnlinkHold: onUnlinkHold)
     }
 
     public func makeNSView(context: Context) -> WKWebView {
@@ -109,9 +111,14 @@ public final class DashboardWebCoordinator: NSObject, WKNavigationDelegate, WKUI
     private var onSettingsApplied: (Bool) -> Void
     private var settingsValid = true
     private var allowsAudioAutoplay = false
+    private let catalogContext: CatalogPreviewContext?
+    private let catalogRevision: String
+    private let catalogAssets: PackageAssetStore
 
-    init(store: PackageAssetStore, homeAssistant: HomeAssistantDeviceRuntime? = nil, publicReads: PublicReadRuntime? = nil, rasterResources: PublicRasterResources? = nil, revision: String = "", connections: ConnectionRuntime? = nil, settings: DeviceSettings = .init(), active: Bool = true, onSettingsApplied: @escaping (Bool) -> Void = { _ in }, onConnectionHealth: @escaping (Bool) -> Void = { _ in }, onReady: @escaping () -> Void = {}, onUnlinkHold: @escaping () -> Void) {
+    init(store: PackageAssetStore, homeAssistant: HomeAssistantDeviceRuntime? = nil, publicReads: PublicReadRuntime? = nil, rasterResources: PublicRasterResources? = nil, revision: String = "", catalogContext: CatalogPreviewContext? = nil, connections: ConnectionRuntime? = nil, settings: DeviceSettings = .init(), active: Bool = true, onSettingsApplied: @escaping (Bool) -> Void = { _ in }, onConnectionHealth: @escaping (Bool) -> Void = { _ in }, onReady: @escaping () -> Void = {}, onUnlinkHold: @escaping () -> Void) {
         let rasterResources = rasterResources ?? PublicRasterResources()
+        self.catalogContext = catalogContext
+        catalogRevision = revision; catalogAssets = store
         self.handler = PackageSchemeHandler(store: store, rasterResources: rasterResources)
         self.onReady = onReady
         self.onUnlinkHold = onUnlinkHold
@@ -139,6 +146,9 @@ public final class DashboardWebCoordinator: NSObject, WKNavigationDelegate, WKUI
         events?.update(settings: settings)
         if let events { settingsValid = events.settingsApplied }
         self.active = active
+        #if os(iOS)
+        if let view = webView { CatalogPreviewCaptureRegistry.shared.setActive(view: view, active: active) }
+        #endif
         bridge?.setActive(active)
         if active { events?.start() } else { events?.stop(); bridge?.cancel(); webView?.pauseAllMediaPlayback(completionHandler: nil) }
         // Defer callback to avoid publishing SwiftUI state during view update.
@@ -146,11 +156,18 @@ public final class DashboardWebCoordinator: NSObject, WKNavigationDelegate, WKUI
         DispatchQueue.main.async { onSettingsApplied(valid) }
     }
 
-    func stop() { bridge?.setActive(false); events?.stop(); bridge?.cancel(); webView?.pauseAllMediaPlayback(completionHandler: nil) }
+    func stop() {
+        #if os(iOS)
+        if let view = webView { CatalogPreviewCaptureRegistry.shared.unregister(view: view) }
+        #endif
+        bridge?.setActive(false); events?.stop(); bridge?.cancel(); webView?.pauseAllMediaPlayback(completionHandler: nil) }
 
     private func load(path: String) {
         guard let url = URL(string: "\(IsolationPolicy.customScheme)://\(IsolationPolicy.packageHost)/\(path)") else { return }
         bridge?.cancel(); programmaticURL = url.absoluteString
+        #if os(iOS)
+        if let view = webView { CatalogPreviewCaptureRegistry.shared.navigationStarted(view: view) }
+        #endif
         webView?.load(URLRequest(url: url))
     }
 
@@ -173,6 +190,9 @@ public final class DashboardWebCoordinator: NSObject, WKNavigationDelegate, WKUI
         }
         let webView = WKWebView(frame: .zero, configuration: config)
         self.webView = webView
+        #if os(iOS)
+        CatalogPreviewCaptureRegistry.shared.register(view: webView, revision: catalogRevision, assets: catalogAssets, context: catalogContext, active: active)
+        #endif
         bridge?.attach(to: webView)
         bridge?.setActive(active)
         webView.navigationDelegate = self
@@ -258,7 +278,12 @@ public final class DashboardWebCoordinator: NSObject, WKNavigationDelegate, WKUI
         nil
     }
 
-    public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { onReady() }
+    public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        #if os(iOS)
+        CatalogPreviewCaptureRegistry.shared.navigationFinished(view: webView)
+        #endif
+        onReady()
+    }
 
     public func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         bridge?.cancel()

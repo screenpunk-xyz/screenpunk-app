@@ -1,0 +1,1265 @@
+{
+  "type": "object",
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "operationID": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+    },
+    "catalogScreenID": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+    },
+    "versionID": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+    },
+    "libraryID": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+    },
+    "localScreenID": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+    },
+    "sourceRevisionID": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+    },
+    "packageDigest": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "capturedAt": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 24,
+      "pattern": "^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d\\.\\d{3}Z$"
+    },
+    "source": {
+      "const": "exact_package"
+    },
+    "preview": {
+      "$ref": "#/$defs/PNGPreviewDeclaration"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "operationID",
+    "catalogScreenID",
+    "versionID",
+    "libraryID",
+    "localScreenID",
+    "sourceRevisionID",
+    "packageDigest",
+    "capturedAt",
+    "source",
+    "preview"
+  ],
+  "additionalProperties": false,
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://screenpunk.xyz/contracts/catalog-v1/PreviewBegin",
+  "$defs": {
+    "Object": {
+      "type": "object",
+      "properties": {
+        "byteLength": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10485760
+        },
+        "digest": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      },
+      "required": [
+        "byteLength",
+        "digest"
+      ],
+      "additionalProperties": false
+    },
+    "PreviewDeclaration": {
+      "type": "object",
+      "properties": {
+        "byteLength": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 524288
+        },
+        "digest": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "mediaType": {
+          "enum": [
+            "image/png",
+            "image/jpeg"
+          ]
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2048
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2048
+        }
+      },
+      "required": [
+        "byteLength",
+        "digest",
+        "mediaType",
+        "width",
+        "height"
+      ],
+      "additionalProperties": false
+    },
+    "Gap": {
+      "type": "object",
+      "properties": {
+        "checkpointCounter": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "checkpointRevisionID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "skippedFromCounter": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "skippedThroughCounter": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "reason": {
+          "const": "user_acknowledged_backup_pause"
+        }
+      },
+      "required": [
+        "checkpointCounter",
+        "checkpointRevisionID",
+        "skippedFromCounter",
+        "skippedThroughCounter",
+        "reason"
+      ],
+      "additionalProperties": false
+    },
+    "BeginBackup": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "operationID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "libraryID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "localScreenID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "sourceRevisionID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "parentRevisionIDs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+          },
+          "minItems": 0,
+          "maxItems": 8,
+          "uniqueItems": true
+        },
+        "predecessorRevisionID": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "commitCounter": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "origin": {
+          "enum": [
+            "applied",
+            "seed"
+          ]
+        },
+        "sourceAppliedAt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 24,
+          "pattern": "^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d\\.\\d{3}Z$"
+        },
+        "screenName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "versionName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "note": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "gap": {
+          "$ref": "#/$defs/Gap"
+        },
+        "package": {
+          "$ref": "#/$defs/Object"
+        },
+        "preview": {
+          "$ref": "#/$defs/PreviewDeclaration"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "operationID",
+        "libraryID",
+        "localScreenID",
+        "sourceRevisionID",
+        "parentRevisionIDs",
+        "predecessorRevisionID",
+        "commitCounter",
+        "origin",
+        "sourceAppliedAt",
+        "screenName",
+        "package"
+      ],
+      "additionalProperties": false
+    },
+    "PackageFile": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$"
+        },
+        "mediaType": {
+          "enum": [
+            "text/html",
+            "text/css",
+            "text/javascript",
+            "application/json",
+            "image/svg+xml",
+            "text/plain"
+          ]
+        },
+        "byteLength": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 204800
+        },
+        "digest": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "contentBase64": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 273068
+        }
+      },
+      "required": [
+        "path",
+        "mediaType",
+        "byteLength",
+        "digest",
+        "contentBase64"
+      ],
+      "additionalProperties": false
+    },
+    "Package": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "screen": {
+          "type": "object",
+          "properties": {
+            "title": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100
+            },
+            "entry": {
+              "const": "index.html"
+            },
+            "requiredAssets": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$"
+              },
+              "minItems": 0,
+              "maxItems": 20,
+              "uniqueItems": true
+            },
+            "externalDependencies": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160
+              },
+              "minItems": 0,
+              "maxItems": 20,
+              "uniqueItems": true
+            }
+          },
+          "required": [
+            "title",
+            "entry",
+            "requiredAssets",
+            "externalDependencies"
+          ],
+          "additionalProperties": false
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PackageFile"
+          },
+          "minItems": 1,
+          "maxItems": 20,
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "screen",
+        "files"
+      ],
+      "additionalProperties": false
+    },
+    "Error": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "enum": [
+            "not_entitled",
+            "offline",
+            "quota_exceeded",
+            "invalid_package",
+            "conflict",
+            "deleted",
+            "retry_later",
+            "unauthorized",
+            "not_found"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        },
+        "retryAfterSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400
+        },
+        "restartOperation": {
+          "const": true
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "restartOperation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "code": {
+                "const": "retry_later"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "Entitlement": {
+      "type": "object",
+      "properties": {
+        "backupEnabled": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "versionsPerScreen": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "screensPerAccount": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "packageBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10485760
+        },
+        "previewBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 524288
+        },
+        "previewDimension": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2048
+        },
+        "accountBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "publicationOverlapBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 20971520
+        }
+      },
+      "required": [
+        "backupEnabled",
+        "reason",
+        "versionsPerScreen",
+        "screensPerAccount",
+        "packageBytes",
+        "previewBytes",
+        "previewDimension",
+        "accountBytes",
+        "publicationOverlapBytes"
+      ],
+      "additionalProperties": false
+    },
+    "Capability": {
+      "type": "object",
+      "properties": {
+        "version": {
+          "const": "1"
+        },
+        "feature": {
+          "const": "catalog-backup-v1"
+        },
+        "entitlement": {
+          "$ref": "#/$defs/Entitlement"
+        },
+        "previewMediaTypes": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "image/png",
+              "image/jpeg"
+            ]
+          },
+          "minItems": 0,
+          "maxItems": 2,
+          "uniqueItems": true
+        },
+        "previewBackfillVersion": {
+          "const": "1"
+        }
+      },
+      "required": [
+        "version",
+        "feature",
+        "entitlement",
+        "previewMediaTypes"
+      ],
+      "additionalProperties": false
+    },
+    "BackupStatus": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "operationID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "state": {
+          "enum": [
+            "pending",
+            "uploaded",
+            "completed",
+            "duplicate",
+            "superseded",
+            "deleted",
+            "failed"
+          ]
+        },
+        "catalogScreenID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "uploadID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "versionID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "displayVersion": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "expiresAt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 24,
+          "pattern": "^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d\\.\\d{3}Z$"
+        },
+        "error": {
+          "$ref": "#/$defs/Error"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "operationID",
+        "state",
+        "catalogScreenID"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "error"
+            ],
+            "properties": {
+              "error": {
+                "required": [
+                  "restartOperation"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "state": {
+                "const": "failed"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "CompleteBackup": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "operationID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "operationID"
+      ],
+      "additionalProperties": false
+    },
+    "Preview": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "const": "available"
+            },
+            "mediaType": {
+              "enum": [
+                "image/png",
+                "image/jpeg"
+              ]
+            },
+            "byteLength": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 524288
+            },
+            "digest": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64,
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "width": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2048
+            },
+            "height": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2048
+            },
+            "source": {
+              "const": "exact_package"
+            },
+            "capturedAt": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 24,
+              "pattern": "^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d\\.\\d{3}Z$"
+            }
+          },
+          "required": [
+            "status",
+            "mediaType",
+            "byteLength",
+            "digest",
+            "width",
+            "height"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "const": "unavailable"
+            },
+            "reason": {
+              "enum": [
+                "not_provided",
+                "invalid",
+                "capture_failed"
+              ]
+            }
+          },
+          "required": [
+            "status",
+            "reason"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Version": {
+      "type": "object",
+      "properties": {
+        "versionID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "catalogScreenID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "displayVersion": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "sourceRevisionID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "parentRevisionIDs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+          },
+          "minItems": 0,
+          "maxItems": 8,
+          "uniqueItems": true
+        },
+        "copyID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "commitCounter": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "screenName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "versionName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "note": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "sourceAppliedAt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 24,
+          "pattern": "^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d\\.\\d{3}Z$"
+        },
+        "backedUpAt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 24,
+          "pattern": "^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d\\.\\d{3}Z$"
+        },
+        "packageSchema": {
+          "const": 1
+        },
+        "packageDigest": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "sizeBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10485760
+        },
+        "deviceDisplayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "deviceLinked": {
+          "type": "boolean"
+        },
+        "preview": {
+          "$ref": "#/$defs/Preview"
+        },
+        "integrity": {
+          "const": "missing"
+        }
+      },
+      "required": [
+        "versionID",
+        "catalogScreenID",
+        "displayVersion",
+        "sourceRevisionID",
+        "parentRevisionIDs",
+        "copyID",
+        "commitCounter",
+        "screenName",
+        "sourceAppliedAt",
+        "backedUpAt",
+        "packageSchema",
+        "packageDigest",
+        "sizeBytes",
+        "deviceDisplayName",
+        "deviceLinked",
+        "preview"
+      ],
+      "additionalProperties": false
+    },
+    "Screen": {
+      "type": "object",
+      "properties": {
+        "catalogScreenID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "latest": {
+          "$ref": "#/$defs/Version"
+        },
+        "history": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Version"
+          },
+          "minItems": 0,
+          "maxItems": 99,
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "catalogScreenID",
+        "latest",
+        "history"
+      ],
+      "additionalProperties": false
+    },
+    "List": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "catalogRevision": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "entitlement": {
+          "$ref": "#/$defs/Entitlement"
+        },
+        "usage": {
+          "type": "object",
+          "properties": {
+            "storedBytes": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "reservedBytes": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "cleanupBytes": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            }
+          },
+          "required": [
+            "storedBytes",
+            "reservedBytes",
+            "cleanupBytes"
+          ],
+          "additionalProperties": false
+        },
+        "screens": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Screen"
+          },
+          "minItems": 0,
+          "maxItems": 20,
+          "uniqueItems": true
+        },
+        "nextCursor": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "catalogRevision",
+        "entitlement",
+        "usage",
+        "screens"
+      ],
+      "additionalProperties": false
+    },
+    "DeleteResult": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "catalogScreenID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "versionID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "deleted": {
+          "const": true
+        },
+        "catalogRevision": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "catalogScreenID",
+        "versionID",
+        "deleted",
+        "catalogRevision"
+      ],
+      "additionalProperties": false
+    },
+    "PreviewCandidate": {
+      "type": "object",
+      "properties": {
+        "catalogScreenID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "versionID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "libraryID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "localScreenID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "sourceRevisionID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "packageDigest": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "packageBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10485760
+        }
+      },
+      "required": [
+        "catalogScreenID",
+        "versionID",
+        "libraryID",
+        "localScreenID",
+        "sourceRevisionID",
+        "packageDigest",
+        "packageBytes"
+      ],
+      "additionalProperties": false
+    },
+    "PreviewCandidates": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "candidates": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PreviewCandidate"
+          },
+          "minItems": 0,
+          "maxItems": 20,
+          "uniqueItems": true
+        },
+        "nextCursor": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "candidates"
+      ],
+      "additionalProperties": false
+    },
+    "PNGPreviewDeclaration": {
+      "type": "object",
+      "properties": {
+        "byteLength": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 524288
+        },
+        "digest": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "mediaType": {
+          "const": "image/png"
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2048
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2048
+        }
+      },
+      "required": [
+        "byteLength",
+        "digest",
+        "mediaType",
+        "width",
+        "height"
+      ],
+      "additionalProperties": false
+    },
+    "PreviewBegin": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "operationID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "catalogScreenID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "versionID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "libraryID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "localScreenID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "sourceRevisionID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "packageDigest": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "capturedAt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 24,
+          "pattern": "^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d\\.\\d{3}Z$"
+        },
+        "source": {
+          "const": "exact_package"
+        },
+        "preview": {
+          "$ref": "#/$defs/PNGPreviewDeclaration"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "operationID",
+        "catalogScreenID",
+        "versionID",
+        "libraryID",
+        "localScreenID",
+        "sourceRevisionID",
+        "packageDigest",
+        "capturedAt",
+        "source",
+        "preview"
+      ],
+      "additionalProperties": false
+    },
+    "PreviewStatus": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "operationID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "catalogScreenID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "versionID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "state": {
+          "enum": [
+            "pending",
+            "uploaded",
+            "completed",
+            "duplicate",
+            "deleted",
+            "failed"
+          ]
+        },
+        "uploadID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "expiresAt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 24,
+          "pattern": "^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d\\.\\d{3}Z$"
+        },
+        "error": {
+          "$ref": "#/$defs/Error"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "operationID",
+        "catalogScreenID",
+        "versionID",
+        "state"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "error"
+            ],
+            "properties": {
+              "error": {
+                "required": [
+                  "restartOperation"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "state": {
+                "const": "failed"
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

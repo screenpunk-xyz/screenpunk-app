@@ -35,6 +35,7 @@ struct AgentStatus: Decodable {
     static var origin: URL { originScope.url }
     private var authSession: ASWebAuthenticationSession?
     private var enrolledToken: String?
+    private let deviceNameWrites = DeviceNameWriteQueue()
     var session: DeviceSession? = SessionKeychain.load()
     /// Used only for local libraries, ownership, permissions and preference eligibility.
     var localAccountID: String? { session.map { Self.originScope.localAccountID(serverUserID: $0.user.id) } }
@@ -87,16 +88,40 @@ struct AgentStatus: Decodable {
         guard session?.accessToken == value.accessToken else { throw CancellationError() }
         try SessionKeychain.save(registered); session = registered; enrolledToken = value.accessToken
     }
+    static var installationDeviceNameKey: String? { (try? LocalProfileRepository().snapshot().installationID).map { "installation|" + $0 } }
+    static func deviceNameKey(accountID: String, deviceID: String) -> String { originScope.canonicalOrigin + "|" + accountID + "|" + deviceID }
+    private static let nameAcknowledgementsKey = "screenpunk.device.name-acknowledgements.v1"
     private func registerSession(_ value: DeviceSession) async throws -> DeviceSession {
+        try await deviceNameWrites.perform { [self] in try await performRegisterSession(value) }
+    }
+    private func performRegisterSession(_ value: DeviceSession) async throws -> DeviceSession {
         let key = try InstallationIdentity.loadOrCreate()
+        let nameKey = Self.deviceNameKey(accountID: Self.originScope.localAccountID(serverUserID: value.user.id), deviceID: value.deviceId)
+        let fallback = (try? DeviceNameStore.normalized(UIDevice.current.name)) ?? "Screenpunk"
+        let desiredName = DeviceNameStore().name(for: Self.installationDeviceNameKey ?? "unavailable", fallback: fallback)
         let registration: DeviceRegistration
-        do { registration = try await call("api/device/register", method: "POST", body: ["name": UIDevice.current.name, "installationKey": key], authorizationToken: value.accessToken) }
+        do { registration = try await call("api/device/register", method: "POST", body: ["name": desiredName, "installationKey": key], authorizationToken: value.accessToken) }
         catch DeviceError.http(let status, _) where status == 409 {
             throw DeviceError.http(409, "This device has an earlier saved connection. Sign in again from Settings to restore it.")
         }
         guard registration.id == value.deviceId else { throw DeviceError.message("Your device connection changed. Sign in again to continue.") }
+        guard registration.name == nil || registration.name == desiredName else { throw DeviceError.message("Cloud did not confirm the device name. It will retry.") }
+        var names = UserDefaults.standard.dictionary(forKey: Self.nameAcknowledgementsKey) as? [String: String] ?? [:]
+        names[nameKey] = desiredName; UserDefaults.standard.set(names, forKey: Self.nameAcknowledgementsKey)
         var next = value; next.profileID = registration.profileID
         return next
+    }
+    /// Local name persistence is independent of transport; registration retries
+    /// only the exact captured account/enrollment and never reassigns a device.
+    func syncDeviceName() async throws {
+        guard let captured = session else { return }
+        let key = Self.deviceNameKey(accountID: Self.originScope.localAccountID(serverUserID: captured.user.id), deviceID: captured.deviceId)
+        let name = DeviceNameStore().name(for: Self.installationDeviceNameKey ?? "unavailable", fallback: (try? DeviceNameStore.normalized(UIDevice.current.name)) ?? "Screenpunk")
+        let acknowledged = UserDefaults.standard.dictionary(forKey: Self.nameAcknowledgementsKey) as? [String: String] ?? [:]
+        guard acknowledged[key] != name else { return }
+        _ = try await registerSession(captured)
+        guard session?.accessToken == captured.accessToken, session?.deviceId == captured.deviceId, session?.user.id == captured.user.id,
+              DeviceNameStore().name(for: Self.installationDeviceNameKey ?? "unavailable", fallback: (try? DeviceNameStore.normalized(UIDevice.current.name)) ?? "Screenpunk") == name else { throw CancellationError() }
     }
     func rememberProfile(_ profileID: String) throws {
         guard var value = session, value.profileID != profileID else { return }
@@ -139,30 +164,38 @@ struct AgentStatus: Decodable {
         var errorDescription: String? { "Cloud backups are paused (\(code))." }
     }
     private struct CatalogErrorEnvelope: Decodable { var error: CatalogError }
-    func catalogRequest<T: Decodable>(_ path: String, method: String = "GET", bytes: Data? = nil, token: String, package: Bool = false) async throws -> T {
-        guard path.hasPrefix("/api/catalog"), bytes?.count ?? 0 <= (package ? CatalogContract.packageBytes : 64 * 1024) else { throw DeviceError.message("Backup request exceeded its limit.") }
-        var request = URLRequest(url: Self.origin.appendingPathComponent(String(path.dropFirst())))
-        request.httpMethod = method; request.timeoutInterval = 60
-        request.cachePolicy = .reloadIgnoringLocalCacheData
+    func catalogRequest<T: Decodable>(_ path: String, method: String = "GET", bytes: Data? = nil, token: String, package: Bool = false, image: Bool = false) async throws -> T {
+        let data = try await catalogBytes(path, method: method, bytes: bytes, token: token, requestLimit: image ? CatalogContract.previewBytes : package ? CatalogContract.packageBytes : 64 * 1024, responseLimit: 64 * 1024, contentType: image ? "image/png" : "application/json")
+        return try JSONDecoder().decode(T.self, from: data.isEmpty ? Data("{}".utf8) : data)
+    }
+    func catalogPackage(_ path: String, token: String, declaration: CatalogObjectDeclaration) async throws -> CatalogPackage {
+        let bytes = try await catalogBytes(path, method: "GET", bytes: nil, token: token, requestLimit: 0, responseLimit: CatalogContract.packageBytes, contentType: "application/json")
+        return try CatalogContract.verifyPackage(bytes, declaration: declaration)
+    }
+    private func catalogBytes(_ path: String, method: String, bytes: Data?, token: String, requestLimit: Int, responseLimit: Int, contentType: String) async throws -> Data {
+        guard path.hasPrefix("/api/catalog"), let relative = URLComponents(string: path), relative.scheme == nil, relative.host == nil, relative.fragment == nil,
+              bytes?.count ?? 0 <= requestLimit, var target = URLComponents(url: Self.origin, resolvingAgainstBaseURL: false) else { throw DeviceError.message("Backup request exceeded its limit.") }
+        target.path = relative.path; target.queryItems = relative.queryItems
+        guard let url = target.url else { throw DeviceError.message("Invalid backup route.") }
+        var request = URLRequest(url: url)
+        request.httpMethod = method; request.timeoutInterval = 60; request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue(CatalogContract.version, forHTTPHeaderField: "X-Screenpunk-Catalog-Version")
-        if let bytes { request.httpBody = bytes; request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
+        if let bytes { request.httpBody = bytes; request.setValue(contentType, forHTTPHeaderField: "Content-Type") }
         let transport = URLSession(configuration: .ephemeral, delegate: NoRedirects(), delegateQueue: nil)
-        defer { transport.finishTasksAndInvalidate() }
+        defer { transport.invalidateAndCancel() }
         let (stream, response) = try await transport.bytes(for: request)
         guard let http = response as? HTTPURLResponse else { throw DeviceError.message("Cloud backups did not respond.") }
-        guard response.expectedContentLength <= 64 * 1024 else { throw DeviceError.message("Backup response exceeded its limit.") }
+        let limit = (200..<300).contains(http.statusCode) ? responseLimit : 64 * 1024
+        guard response.expectedContentLength <= limit else { throw DeviceError.message("Backup response exceeded its limit.") }
         var data = Data()
-        for try await byte in stream {
-            guard data.count < 64 * 1024 else { throw DeviceError.message("Backup response exceeded its limit.") }
-            data.append(byte)
-        }
+        for try await byte in stream { guard data.count < limit else { throw DeviceError.message("Backup response exceeded its limit.") }; data.append(byte) }
         guard (200..<300).contains(http.statusCode) else {
             let detail = (try? JSONDecoder().decode(CatalogError.self, from: data)) ?? (try? JSONDecoder().decode(CatalogErrorEnvelope.self, from: data).error)
             let retry = http.value(forHTTPHeaderField: "Retry-After").flatMap(Int.init) ?? detail?.retryAfterSeconds
             throw CatalogHTTPError(status: http.statusCode, code: detail?.code ?? (http.statusCode == 401 ? "unauthorized" : "retry_later"), retryAfterSeconds: retry)
         }
-        return try JSONDecoder().decode(T.self, from: data.isEmpty ? Data("{}".utf8) : data)
+        return data
     }
     func catalogCapability(token: String) async throws -> CatalogCapability? {
         do {
@@ -187,7 +220,7 @@ struct AgentStatus: Decodable {
     }
 }
 struct EmptyResponse: Decodable {}
-private struct DeviceRegistration: Decodable { let id: String; let profileID: String }
+private struct DeviceRegistration: Decodable { let id: String; let profileID: String; let name: String? }
 
 struct PreferenceSyncResponse: Decodable {
     struct Accepted: Decodable { let id: String; let revision: Int }

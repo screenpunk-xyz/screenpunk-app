@@ -83,7 +83,7 @@ struct DeviceRootView: View {
         if let screen = model.screen, let assets = model.assets {
             // The isolated WebView coordinator owns an immutable package and bridge scope.
             // A new local revision must create a new renderer, including on rollback/swipe.
-            DashboardRuntimeView(store: assets, homeAssistant: model.homeAssistant, publicReads: model.publicReads, revision: screen.revision, connectionCount: 1, screenName: screen.artifact.title, onMenu: { model.settingsOpen = true })
+            DashboardRuntimeView(store: assets, homeAssistant: model.homeAssistant, publicReads: model.publicReads, revision: screen.revision, catalogContext: model.catalogPreviewContext, connectionCount: 1, screenName: screen.artifact.title, onMenu: { model.settingsOpen = true })
                 .id(screen.revision + model.publicReadSessionKey)
                 .ignoresSafeArea()
         } else if (model.routePreference == .local || (model.routePreference == .automatic && model.email == nil)) && !model.agentReady {
@@ -234,13 +234,13 @@ struct CloudListenerSetupView_Previews: PreviewProvider {
 #endif
 
 enum DeviceSettingsPage: String, Hashable {
-    case overview = "Overview", guidedAccess = "Guided Access", display = "Display", account = "Account", screens = "Screens"
+    case overview = "Overview", guidedAccess = "Guided Access", display = "General", account = "Account", screens = "Screens"
     case home = "Home Assistant", television = "Google TV", calendar = "Google Calendar", publicData = "Public Data"
     var symbol: String {
         switch self {
         case .overview: return "hand.draw"
         case .guidedAccess: return "lock.rectangle"
-        case .display: return "sun.max"
+        case .display: return "gearshape"
         case .account: return "person.crop.circle"
         case .screens: return "rectangle.stack"
         case .home: return "house"
@@ -354,7 +354,7 @@ struct DeviceSettingsView: View {
                 }
             }
         case .display:
-            DeviceDisplaySettings(preferences: display)
+            DeviceDisplaySettings(preferences: display, device: model)
         case .account:
             if let localSettings = model.localSettings {
                 DeviceAccountSettings(device: model, model: localSettings, showCloudSetup: { sheet = .cloudListener })

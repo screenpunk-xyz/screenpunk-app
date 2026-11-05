@@ -164,12 +164,14 @@ public struct CatalogCapability: Codable, Sendable, Equatable {
     public var version: String
     public var feature: String
     public var entitlement: CatalogEntitlement
+    public var previewBackfillVersion: String?
     public var previewMediaTypes: [String]
-    public init(version: String = "1", feature: String = "catalog-backup-v1", entitlement: CatalogEntitlement, previewMediaTypes: [String]) {
+    public init(version: String = "1", feature: String = "catalog-backup-v1", entitlement: CatalogEntitlement, previewMediaTypes: [String], previewBackfillVersion: String? = nil) {
         self.version = version
         self.feature = feature
         self.entitlement = entitlement
         self.previewMediaTypes = previewMediaTypes
+        self.previewBackfillVersion = previewBackfillVersion
     }
 }
 
@@ -317,6 +319,8 @@ public struct CatalogPackageScreen: Codable, Sendable, Equatable {
 
 /// Preview bytes require a real bounded raster decoder at the server before available status.
 public struct CatalogPreview: Codable, Sendable, Equatable {
+    public var source: String?
+    public var capturedAt: String?
     public var status: String
     public var reason: String?
     public var mediaType: String?
@@ -324,8 +328,8 @@ public struct CatalogPreview: Codable, Sendable, Equatable {
     public var digest: String?
     public var width: Int?
     public var height: Int?
-    public init(status: String = "unavailable", reason: String? = "not_provided", mediaType: String? = nil, byteLength: Int? = nil, digest: String? = nil, width: Int? = nil, height: Int? = nil) {
-        self.status=status; self.reason=reason; self.mediaType=mediaType; self.byteLength=byteLength; self.digest=digest; self.width=width; self.height=height
+    public init(status: String = "unavailable", reason: String? = "not_provided", mediaType: String? = nil, byteLength: Int? = nil, digest: String? = nil, width: Int? = nil, height: Int? = nil, source: String? = nil, capturedAt: String? = nil) {
+        self.source=source; self.capturedAt=capturedAt; self.status=status; self.reason=reason; self.mediaType=mediaType; self.byteLength=byteLength; self.digest=digest; self.width=width; self.height=height
     }
 }
 public enum CatalogContract {
@@ -397,6 +401,117 @@ extension CatalogContract {
     public static func validateStatus(_ value: CatalogBackupStatus) throws {
         if let restart = value.error?.restartOperation {
             guard restart, value.state == "failed", value.error?.code == "retry_later" else { throw ValidationError.invalid("restart requires failed expired operation") }
+        }
+    }
+}
+
+public struct CatalogPreviewCandidate: Codable, Sendable, Equatable {
+    public var catalogScreenID: String
+    public var versionID: String
+    public var libraryID: String
+    public var localScreenID: String
+    public var sourceRevisionID: String
+    public var packageDigest: String
+    public var packageBytes: Int
+    public init(catalogScreenID: String, versionID: String, libraryID: String, localScreenID: String, sourceRevisionID: String, packageDigest: String, packageBytes: Int) {
+        self.catalogScreenID = catalogScreenID
+        self.versionID = versionID
+        self.libraryID = libraryID
+        self.localScreenID = localScreenID
+        self.sourceRevisionID = sourceRevisionID
+        self.packageDigest = packageDigest
+        self.packageBytes = packageBytes
+    }
+}
+
+public struct CatalogPreviewCandidates: Codable, Sendable, Equatable {
+    public var schemaVersion: Int
+    public var candidates: [CatalogPreviewCandidate]
+    public var nextCursor: String?
+    public init(schemaVersion: Int = 1, candidates: [CatalogPreviewCandidate], nextCursor: String? = nil) {
+        self.schemaVersion = schemaVersion
+        self.candidates = candidates
+        self.nextCursor = nextCursor
+    }
+}
+
+public struct CatalogPNGPreviewDeclaration: Codable, Sendable, Equatable {
+    public var byteLength: Int
+    public var digest: String
+    public var mediaType: String
+    public var width: Int
+    public var height: Int
+    public init(byteLength: Int, digest: String, mediaType: String = "image/png", width: Int, height: Int) {
+        self.byteLength = byteLength
+        self.digest = digest
+        self.mediaType = mediaType
+        self.width = width
+        self.height = height
+    }
+}
+
+public struct CatalogPreviewBegin: Codable, Sendable, Equatable {
+    public var schemaVersion: Int
+    public var operationID: String
+    public var catalogScreenID: String
+    public var versionID: String
+    public var libraryID: String
+    public var localScreenID: String
+    public var sourceRevisionID: String
+    public var packageDigest: String
+    public var capturedAt: String
+    public var source: String
+    public var preview: CatalogPNGPreviewDeclaration
+    public init(schemaVersion: Int = 1, operationID: String, catalogScreenID: String, versionID: String, libraryID: String, localScreenID: String, sourceRevisionID: String, packageDigest: String, capturedAt: String, source: String = "exact_package", preview: CatalogPNGPreviewDeclaration) {
+        self.schemaVersion = schemaVersion
+        self.operationID = operationID
+        self.catalogScreenID = catalogScreenID
+        self.versionID = versionID
+        self.libraryID = libraryID
+        self.localScreenID = localScreenID
+        self.sourceRevisionID = sourceRevisionID
+        self.packageDigest = packageDigest
+        self.capturedAt = capturedAt
+        self.source = source
+        self.preview = preview
+    }
+}
+
+public struct CatalogPreviewStatus: Codable, Sendable, Equatable {
+    public var schemaVersion: Int
+    public var operationID: String
+    public var catalogScreenID: String
+    public var versionID: String
+    public var state: String
+    public var uploadID: String?
+    public var expiresAt: String?
+    public var error: CatalogError?
+    public init(schemaVersion: Int = 1, operationID: String, catalogScreenID: String, versionID: String, state: String, uploadID: String? = nil, expiresAt: String? = nil, error: CatalogError? = nil) {
+        self.schemaVersion = schemaVersion
+        self.operationID = operationID
+        self.catalogScreenID = catalogScreenID
+        self.versionID = versionID
+        self.state = state
+        self.uploadID = uploadID
+        self.expiresAt = expiresAt
+        self.error = error
+    }
+}
+
+extension CatalogContract {
+    public static let previewCandidatesPath = "/api/catalog/preview-candidates"
+    public static let previewBeginPath = "/api/catalog/previews/begin"
+    public static let previewUploadsPath = "/api/catalog/previews/"
+    public static let previewOperationsPath = "/api/catalog/previews/operations/"
+    public static func validatePreviewBegin(_ value: CatalogPreviewBegin) throws {
+        let ids = [value.operationID,value.catalogScreenID,value.versionID,value.libraryID,value.localScreenID,value.sourceRevisionID]
+        let date = ISO8601DateFormatter(); date.formatOptions = [.withInternetDateTime,.withFractionalSeconds]
+        guard value.schemaVersion == 1, value.source == "exact_package", ids.allSatisfy({ $0.range(of: "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$", options: .regularExpression) != nil }), value.packageDigest.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil, let captured = date.date(from: value.capturedAt), timestamp(captured) == value.capturedAt, value.preview.mediaType == "image/png", value.preview.byteLength > 0, value.preview.byteLength <= previewBytes, value.preview.width > 0, value.preview.height > 0, value.preview.width <= previewDimension, value.preview.height <= previewDimension, value.preview.digest.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil else { throw ValidationError.invalid("preview binding/declaration") }
+    }
+    public static func previewBeginDigest(_ value: CatalogPreviewBegin) throws -> String { try validatePreviewBegin(value); return digest(try canonical(value)) }
+    public static func validateStatus(_ value: CatalogPreviewStatus) throws {
+        if let restart = value.error?.restartOperation {
+            guard restart, value.state == "failed", value.error?.code == "retry_later" else { throw ValidationError.invalid("restart requires failed expired preview") }
         }
     }
 }
