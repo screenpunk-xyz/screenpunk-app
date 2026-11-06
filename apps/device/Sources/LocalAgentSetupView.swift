@@ -96,6 +96,9 @@ struct DeviceCloudAccountSection: View {
                     Text("When enabled, backups start with current screens; earlier edits are unavailable. Live data and connection settings are not included.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
+                if let previewStatus = device.catalogPreviewStatus {
+                    Text(previewStatus).font(.footnote).foregroundStyle(.secondary)
+                }
                 if device.catalogCanResume {
                     Button("Resume backups with current screens") { confirmCatalogResume = true }
                         .disabled(accountActionsDisabled)

@@ -6,11 +6,11 @@ import { authoringContentDigestV2, authoringMediaTypeV2 } from './authoring-v2';
 export const CATALOG_CAPABILITY = 'catalog-backup-v1';
 export const CATALOG_VERSION = '1';
 export const CATALOG_LIMITS = Object.freeze({ versionsPerScreen:3, screensPerAccount:20, packageBytes:10*1024*1024, previewBytes:512*1024, previewDimension:2048, accountBytes:1024*1024*1024, publicationOverlapBytes:20*1024*1024, queueRevisions:100, queueBytes:100*1024*1024, files:20, fileBytes:204800 });
-export const CATALOG_ROUTES = Object.freeze({ capabilities:'/api/catalog/capabilities', begin:'/api/catalog/backups/begin', uploads:'/api/catalog/backups/', operations:'/api/catalog/backups/operations/', list:'/api/catalog', screens:'/api/catalog/screens/' });
+export const CATALOG_ROUTES = Object.freeze({ capabilities:'/api/catalog/capabilities', begin:'/api/catalog/backups/begin', uploads:'/api/catalog/backups/', operations:'/api/catalog/backups/operations/', list:'/api/catalog', screens:'/api/catalog/screens/', previewCandidates:'/api/catalog/preview-candidates', previewBegin:'/api/catalog/previews/begin', previewUploads:'/api/catalog/previews/', previewOperations:'/api/catalog/previews/operations/' });
 export type CatalogErrorCode = 'not_entitled'|'offline'|'quota_exceeded'|'invalid_package'|'conflict'|'deleted'|'retry_later'|'unauthorized'|'not_found';
 export interface CatalogError { code:CatalogErrorCode; message:string; retryAfterSeconds?:number; restartOperation?:true }
 export interface CatalogEntitlement { backupEnabled:boolean; reason:string; versionsPerScreen:number; screensPerAccount:number; packageBytes:number; previewBytes:number; previewDimension:number; accountBytes:number; publicationOverlapBytes:number }
-export interface CatalogCapability { version:'1'; feature:'catalog-backup-v1'; previewMediaTypes:('image/png'|'image/jpeg')[]; entitlement:CatalogEntitlement }
+export interface CatalogCapability { version:'1'; feature:'catalog-backup-v1'; previewMediaTypes:('image/png'|'image/jpeg')[]; previewBackfillVersion?:'1'; entitlement:CatalogEntitlement }
 export interface CatalogPackageFile { path:string; mediaType:string; byteLength:number; digest:string; contentBase64:string }
 export interface CatalogPackage { schemaVersion:1; screen:{ title:string; entry:'index.html'; requiredAssets:string[]; externalDependencies:string[] }; files:CatalogPackageFile[] }
 export interface CatalogObjectDeclaration { byteLength:number; digest:string }
@@ -24,7 +24,7 @@ export interface CatalogBeginBackup {
 export type CatalogBackupState = 'pending'|'uploaded'|'completed'|'duplicate'|'superseded'|'deleted'|'failed';
 export interface CatalogBackupStatus { schemaVersion:1; operationID:string; state:CatalogBackupState; catalogScreenID:string; uploadID?:string; versionID?:string; displayVersion?:number; expiresAt?:string; error?:CatalogError }
 export interface CatalogCompleteBackup { schemaVersion:1; operationID:string }
-export type CatalogPreview = { status:'available'; mediaType:'image/png'|'image/jpeg'; byteLength:number; digest:string; width:number; height:number } | { status:'unavailable'; reason:'not_provided'|'invalid'|'capture_failed' };
+export type CatalogPreview = { status:'available'; source?:'exact_package'; capturedAt?:string; mediaType:'image/png'|'image/jpeg'; byteLength:number; digest:string; width:number; height:number } | { status:'unavailable'; reason:'not_provided'|'invalid'|'capture_failed' };
 export interface CatalogVersion { versionID:string; catalogScreenID:string; displayVersion:number; sourceRevisionID:string; parentRevisionIDs:string[]; copyID:string; commitCounter:number; screenName:string; versionName?:string; note?:string; sourceAppliedAt:string; backedUpAt:string; packageSchema:1; packageDigest:string; sizeBytes:number; deviceDisplayName:string; deviceLinked:boolean; integrity?:'missing'; preview:CatalogPreview }
 export interface CatalogScreen { catalogScreenID:string; latest:CatalogVersion; history:CatalogVersion[] }
 export interface CatalogList { schemaVersion:1; catalogRevision:number; entitlement:CatalogEntitlement; usage:{storedBytes:number;reservedBytes:number;cleanupBytes:number}; screens:CatalogScreen[]; nextCursor?:string }
@@ -43,8 +43,15 @@ export function validateCatalogWire(name:keyof typeof CATALOG_SCHEMAS,value:unkn
   if(schema.type==='integer'&&(!Number.isSafeInteger(v)||v<schema.minimum||v>schema.maximum))throw Error('Catalog integer');
   if(schema.type==='boolean'&&typeof v!=='boolean'||schema.type==='null'&&v!==null)throw Error('Catalog type');
  };check(CATALOG_SCHEMAS[name],value);
- const v=value as any;if(name==='Error'&&v.restartOperation&&v.code!=='retry_later'||name==='BackupStatus'&&v.error?.restartOperation&&(v.state!=='failed'||v.error.code!=='retry_later'))throw Error('Catalog restart requires expired failed operation');
+ const v=value as any;if(name==='Error'&&v.restartOperation&&v.code!=='retry_later'||(name==='BackupStatus'||name==='PreviewStatus')&&v.error?.restartOperation&&(v.state!=='failed'||v.error.code!=='retry_later'))throw Error('Catalog restart requires expired failed operation');
 }
+export interface CatalogPNGPreviewDeclaration extends Omit<CatalogPreviewDeclaration,'mediaType'> { mediaType:'image/png' }
+export interface CatalogPreviewCandidate { catalogScreenID:string; versionID:string; libraryID:string; localScreenID:string; sourceRevisionID:string; packageDigest:string; packageBytes:number }
+export interface CatalogPreviewCandidates { schemaVersion:1; candidates:CatalogPreviewCandidate[]; nextCursor?:string }
+export interface CatalogPreviewBegin { schemaVersion:1; operationID:string; catalogScreenID:string; versionID:string; libraryID:string; localScreenID:string; sourceRevisionID:string; packageDigest:string; capturedAt:string; source:'exact_package'; preview:CatalogPNGPreviewDeclaration }
+export interface CatalogPreviewStatus { schemaVersion:1; operationID:string; catalogScreenID:string; versionID:string; state:'pending'|'uploaded'|'completed'|'duplicate'|'deleted'|'failed'; uploadID?:string; expiresAt?:string; error?:CatalogError }
+export function validateCatalogPreviewBegin(value:unknown):CatalogPreviewBegin { validateCatalogWire('PreviewBegin',value); const v=value as CatalogPreviewBegin;if(!timestamp(v.capturedAt))throw Error('Catalog invalid capture timestamp');return v; }
+export async function catalogPreviewBeginDigest(value:unknown):Promise<string> { return authoringContentDigestV2(canonicalJSON(validateCatalogPreviewBegin(value))); }
 const fail = (message:string):never => { throw new Error(`Catalog: ${message}`); };
 const plain = (v:unknown):v is Record<string,any> => !!v && typeof v==='object' && !Array.isArray(v);
 const keys = (v:unknown,required:string[],optional:string[]=[]) => { if(!plain(v)||required.some(k=>!Object.hasOwn(v,k))||Object.keys(v).some(k=>![...required,...optional].includes(k)))fail('invalid fields'); };

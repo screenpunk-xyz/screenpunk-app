@@ -318,5 +318,63 @@
     },
     "canonicalPackage": "{\"files\":[{\"byteLength\":99,\"contentBase64\":\"PCFkb2N0eXBlIGh0bWw+PGh0bWw+PGhlYWQ+PGxpbmsgcmVsPSJzdHlsZXNoZWV0IiBocmVmPSJzdHlsZS5jc3MiPjwvaGVhZD48Ym9keT5DbG9jazwvYm9keT48L2h0bWw+\",\"digest\":\"0fea9ec4413bdd10e4db224bf30dd1c7a6726853ba2b6aa53351292867da4cb8\",\"mediaType\":\"text/html\",\"path\":\"index.html\"},{\"byteLength\":0,\"contentBase64\":\"\",\"digest\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\",\"mediaType\":\"text/css\",\"path\":\"style.css\"}],\"schemaVersion\":1,\"screen\":{\"entry\":\"index.html\",\"externalDependencies\":[],\"requiredAssets\":[\"style.css\"],\"title\":\"Clock\"}}",
     "digest": "1b9fb29b8ad2a3b701321e14775413593744cc99532f45a5b909e9415eeea17c"
+  },
+  "previewAttachment": {
+    "description": "Synthetic one-pixel PNG for protocol conformance only, never a production screenshot",
+    "pngBase64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNQMnb5DwACrQGZOt75egAAAABJRU5ErkJggg==",
+    "begin": {
+      "schemaVersion": 1,
+      "operationID": "preview-operation-1",
+      "catalogScreenID": "catalog-1",
+      "versionID": "version-1",
+      "libraryID": "library-1",
+      "localScreenID": "screen-1",
+      "sourceRevisionID": "revision-1",
+      "packageDigest": "2765000e0d6fe8f1a07aa2d974df60c494cca3355c88058ae3687329b70ba43a",
+      "capturedAt": "2026-11-05T20:00:00.000Z",
+      "source": "exact_package",
+      "preview": {
+        "mediaType": "image/png",
+        "byteLength": 70,
+        "digest": "9268b26dfeccddb39e9e238f715eef95af87831b6ef6dbb7fa750f26d9d749fe",
+        "width": 1,
+        "height": 1
+      }
+    },
+    "canonicalBegin": "{\"capturedAt\":\"2026-11-05T20:00:00.000Z\",\"catalogScreenID\":\"catalog-1\",\"libraryID\":\"library-1\",\"localScreenID\":\"screen-1\",\"operationID\":\"preview-operation-1\",\"packageDigest\":\"2765000e0d6fe8f1a07aa2d974df60c494cca3355c88058ae3687329b70ba43a\",\"preview\":{\"byteLength\":70,\"digest\":\"9268b26dfeccddb39e9e238f715eef95af87831b6ef6dbb7fa750f26d9d749fe\",\"height\":1,\"mediaType\":\"image/png\",\"width\":1},\"schemaVersion\":1,\"source\":\"exact_package\",\"sourceRevisionID\":\"revision-1\",\"versionID\":\"version-1\"}",
+    "beginDigest": "ca4a586998b5e66e81b5ae1b8f149031e5414e8f81c08c1d7865a10cf4c30dae",
+    "candidates": {
+      "schemaVersion": 1,
+      "candidates": [
+        {
+          "catalogScreenID": "catalog-1",
+          "versionID": "version-1",
+          "libraryID": "library-1",
+          "localScreenID": "screen-1",
+          "sourceRevisionID": "revision-1",
+          "packageDigest": "2765000e0d6fe8f1a07aa2d974df60c494cca3355c88058ae3687329b70ba43a",
+          "packageBytes": 388
+        }
+      ]
+    },
+    "status": {
+      "schemaVersion": 1,
+      "operationID": "preview-operation-1",
+      "catalogScreenID": "catalog-1",
+      "versionID": "version-1",
+      "state": "pending",
+      "uploadID": "preview-upload-1",
+      "expiresAt": "2026-11-05T20:15:00.000Z"
+    },
+    "available": {
+      "status": "available",
+      "mediaType": "image/png",
+      "byteLength": 70,
+      "digest": "9268b26dfeccddb39e9e238f715eef95af87831b6ef6dbb7fa750f26d9d749fe",
+      "width": 1,
+      "height": 1,
+      "capturedAt": "2026-11-05T20:00:00.000Z",
+      "source": "exact_package"
+    }
   }
 }

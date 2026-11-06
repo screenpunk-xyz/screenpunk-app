@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import ScreenpunkApple
 import ScreenpunkCore
 
@@ -275,6 +276,11 @@ import ScreenpunkCore
         let retained = Set(state.screens.map(\.revision) + [state.previous?.revision].compactMap { $0 } + (state.authoring?.revisionPins?.values.map(\.revision) ?? []) + (state.catalog?.entries.map(\.revision) ?? []))
         for url in (try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? [] {
             if UUID(uuidString: url.lastPathComponent) != nil && !retained.contains(url.lastPathComponent) { try? FileManager.default.removeItem(at: url) }
+        }
+        let images = root.appendingPathComponent("catalog-previews", isDirectory: true)
+        let referenced = Set((state.catalog?.previews ?? []).map { $0.id + ".png" })
+        for url in (try? FileManager.default.contentsOfDirectory(at: images, includingPropertiesForKeys: nil)) ?? [] {
+            if url.pathExtension == "png", UUID(uuidString: url.deletingPathExtension().lastPathComponent) != nil, !referenced.contains(url.lastPathComponent) { try? FileManager.default.removeItem(at: url) }
         }
     }
     var preferences: [PreferenceRecordV1] { (state.authoring?.records.values.filter { !$0.deleted } ?? []).sorted { $0.id < $1.id } }
@@ -639,6 +645,20 @@ extension ScreenLibrary {
         var acknowledgedCount: Int = 0
         var maxRevisions: Int = 100
         var maxBytes: Int = 100 * 1024 * 1024
+        var previews: [CatalogCapturedPreview]?
+        var previewFinishedSources: [String]?
+    }
+    struct CatalogCapturedPreview: Codable, Identifiable {
+        var id: String = UUID().uuidString
+        var operationID: String = UUID().uuidString
+        var revision: String
+        var packageDigest: String
+        var capturedAt: String
+        var declaration: CatalogPNGPreviewDeclaration
+        var candidate: CatalogPreviewCandidate?
+        var attempts: Int = 0
+        var retryAt: Double = 0
+        var beginDigest: String?
     }
     var catalogQueue: CatalogQueue? { state.catalog }
 
@@ -696,7 +716,8 @@ extension ScreenLibrary {
         } catch {
             admissionError = "Backups paused: this committed package is unsafe, incomplete, or contains credential markers. Keep the installed screen and contact support to reconcile its pending backup."
         }
-        if queue.paused || !queue.captureAllowed || queue.entries.count >= queue.maxRevisions || bytes > queue.maxBytes - queue.entries.reduce(0, { $0 + $1.packageBytes }) {
+        let outstanding = Set(queue.entries.map(\.revision) + (queue.previews ?? []).map(\.revision))
+        if queue.paused || !queue.captureAllowed || outstanding.count >= queue.maxRevisions || bytes > queue.maxBytes - queue.entries.reduce(0, { $0 + $1.packageBytes }) - (queue.previews ?? []).reduce(0, { $0 + $1.declaration.byteLength }) {
             queue.paused = true
             copy.gapFrom = copy.gapFrom ?? copy.counter
             copy.gapThrough = copy.counter
@@ -813,5 +834,90 @@ extension ScreenLibrary {
         var next = state; next.catalog?.authPaused = false
         for index in next.catalog!.entries.indices { next.catalog?.entries[index].retryAt = 0 }
         try commit(next)
+    }
+}
+
+
+extension ScreenLibrary {
+    func catalogPackage(revision: String, digest: String, binding: CatalogBinding) throws -> CatalogPackageExporter.Export {
+        guard state.catalog?.binding == binding else { throw DeviceError.message("The preview account changed.") }
+        if let intent = state.catalog?.entries.first(where: { $0.revision == revision }) {
+            let exported = try exportCatalogIntent(intent, binding: binding)
+            guard exported.declaration.digest == digest else { throw DeviceError.message("The preview source changed.") }; return exported
+        }
+        guard let saved = (state.screens + [state.previous].compactMap { $0 }).first(where: { $0.revision == revision }) else { throw DeviceError.message("This exact source revision is no longer stored on this device.") }
+        let exported = try CatalogPackageExporter.export(directory: root.appendingPathComponent(revision), title: saved.artifact.title, entry: saved.artifact.entry, paths: saved.artifact.files.map(\.path))
+        guard exported.declaration.digest == digest else { throw DeviceError.message("The preview source changed.") }; return exported
+    }
+    func captureCatalogPreview(bytes: Data, declaration: CatalogPNGPreviewDeclaration, revision: String, packageDigest: String, capturedAt: String, binding: CatalogBinding, candidate: CatalogPreviewCandidate? = nil) throws {
+        guard var queue = state.catalog, queue.binding == binding,
+              declaration.mediaType == "image/png", bytes.count > 0, bytes.count <= CatalogContract.previewBytes,
+              declaration.byteLength == bytes.count, declaration.digest == CatalogContract.digest(bytes),
+              (1...2048).contains(declaration.width), (1...2048).contains(declaration.height),
+              bytes.starts(with: [137,80,78,71,13,10,26,10]), UUID(uuidString: revision) != nil else { throw DeviceError.message("Invalid exact-version preview.") }
+        let date = ISO8601DateFormatter(); date.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        guard let captured = date.date(from: capturedAt), CatalogContract.timestamp(captured) == capturedAt,
+              packageDigest.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil else { throw DeviceError.message("Invalid screenshot source or capture time.") }
+        let ownsRecovered = candidate.map { target in target.libraryID == queue.libraryID && target.sourceRevisionID == revision && target.packageDigest == packageDigest && queue.copies.values.contains(where: { $0.localScreenID == target.localScreenID }) } ?? false
+        guard (try? catalogPackage(revision: revision, digest: packageDigest, binding: binding)) != nil || ownsRecovered else { throw DeviceError.message("This screenshot does not belong to an exact saved revision.") }
+        if queue.previewFinishedSources?.contains(revision + ":" + packageDigest) == true || queue.previews?.contains(where: { $0.revision == revision && $0.packageDigest == packageDigest }) == true { return }
+        let used = queue.entries.reduce(0) { $0 + $1.packageBytes } + (queue.previews ?? []).reduce(0) { $0 + $1.declaration.byteLength }
+        let outstanding = Set(queue.entries.map(\.revision) + (queue.previews ?? []).map(\.revision))
+        guard outstanding.contains(revision) || outstanding.count < queue.maxRevisions,
+              (queue.previews?.count ?? 0) < queue.maxRevisions, bytes.count <= queue.maxBytes - used else { throw DeviceError.message("Preview capture is paused until queued previews finish.") }
+        let preview = CatalogCapturedPreview(revision: revision, packageDigest: packageDigest, capturedAt: capturedAt, declaration: declaration)
+        let directory = root.appendingPathComponent("catalog-previews", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try bytes.write(to: directory.appendingPathComponent(preview.id + ".png"), options: .atomic)
+        queue.previews = (queue.previews ?? []) + [preview]
+        var next = state; next.catalog = queue
+        // The journal fsyncs PNG and directory before making the reference durable.
+        try commit(next, stagedDirectory: "catalog-previews", captureCatalog: false)
+    }
+    func readCatalogPreview(_ preview: CatalogCapturedPreview, binding: CatalogBinding) throws -> Data {
+        guard state.catalog?.binding == binding, state.catalog?.previews?.contains(where: { $0.id == preview.id }) == true,
+              UUID(uuidString: preview.id) != nil else { throw DeviceError.message("The preview account changed.") }
+        let url = root.appendingPathComponent("catalog-previews").appendingPathComponent(preview.id + ".png")
+        let values = try url.resourceValues(forKeys: [.fileSizeKey, .isSymbolicLinkKey, .isRegularFileKey])
+        guard values.isRegularFile == true, values.isSymbolicLink != true, values.fileSize == preview.declaration.byteLength,
+              preview.declaration.byteLength <= CatalogContract.previewBytes else { throw DeviceError.message("The saved preview is missing or unsafe.") }
+        let directory = open(url.deletingLastPathComponent().path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+        guard directory >= 0 else { throw DeviceError.message("Unsafe saved screenshot directory.") }
+        defer { _ = close(directory) }
+        let descriptor = openat(directory, url.lastPathComponent, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+        guard descriptor >= 0 else { throw DeviceError.message("Unsafe saved screenshot file.") }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer { try? handle.close() }
+        var info = stat()
+        guard fstat(descriptor, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG, info.st_size == preview.declaration.byteLength else { throw DeviceError.message("The saved screenshot changed.") }
+        let data = try handle.read(upToCount: preview.declaration.byteLength + 1) ?? Data()
+        guard data.count == preview.declaration.byteLength, CatalogContract.digest(data) == preview.declaration.digest else { throw DeviceError.message("The saved preview changed.") }
+        return data
+    }
+    func updateCatalogPreview(_ preview: CatalogCapturedPreview, binding: CatalogBinding) throws {
+        guard state.catalog?.binding == binding, let index = state.catalog?.previews?.firstIndex(where: { $0.id == preview.id }) else { throw DeviceError.message("The preview account changed.") }
+        let original = state.catalog!.previews![index]
+        guard original.revision == preview.revision, original.packageDigest == preview.packageDigest, original.capturedAt == preview.capturedAt, original.declaration == preview.declaration else { throw DeviceError.message("The immutable screenshot source changed.") }
+        var next = state; next.catalog?.previews?[index] = preview; try commit(next)
+    }
+    func acknowledgeCatalogPreview(_ preview: CatalogCapturedPreview, binding: CatalogBinding) throws {
+        guard state.catalog?.binding == binding, state.catalog?.previews?.contains(where: { $0.id == preview.id && $0.operationID == preview.operationID }) == true else { throw DeviceError.message("The preview account changed.") }
+        var next = state; next.catalog?.previews?.removeAll { $0.id == preview.id }
+        var finished = next.catalog?.previewFinishedSources ?? []
+        let source = preview.revision + ":" + preview.packageDigest
+        if !finished.contains(source) { finished.append(source) }
+        next.catalog?.previewFinishedSources = Array(finished.suffix(200))
+        try commit(next)
+        if UUID(uuidString: preview.id) != nil { try? FileManager.default.removeItem(at: root.appendingPathComponent("catalog-previews").appendingPathComponent(preview.id + ".png")) }
+    }
+}
+
+
+extension ScreenLibrary {
+    func bindCatalogPreview(_ candidate: CatalogPreviewCandidate, binding: CatalogBinding) throws {
+        guard state.catalog?.binding == binding, state.catalog?.libraryID == candidate.libraryID,
+              state.catalog?.copies.values.contains(where: { $0.localScreenID == candidate.localScreenID }) == true else { throw DeviceError.message("The preview copy changed.") }
+        guard let index = state.catalog?.previews?.firstIndex(where: { $0.revision == candidate.sourceRevisionID && $0.packageDigest == candidate.packageDigest }) else { return }
+        var next = state; next.catalog?.previews?[index].candidate = candidate; try commit(next)
     }
 }
