@@ -1716,7 +1716,7 @@ extension DeviceModel {
                     self.drainPreviewCaptures()
                 }
             }
-            func isCurrent() -> Bool {
+            @MainActor func isCurrent() -> Bool {
                 self.catalogFlight == flight && self.previewCaptureFlight == flight &&
                     library.catalogQueue?.authPaused != true && self.catalogPreviewContext == context &&
                     !self.settingsOpen && !Task.isCancelled
@@ -1733,7 +1733,10 @@ extension DeviceModel {
                 guard isCurrent() else { return }
                 let snapshot: CatalogPreviewRenderer.Snapshot
                 do { snapshot = try await CatalogPreviewCaptureRegistry.shared.capture(context: context, revision: revision, package: package, packageDigest: digest, byteLimit: self.previewByteLimit, dimensionLimit: self.previewDimensionLimit) }
-                catch { snapshot = try await CatalogPreviewRenderer().capture(package: package, packageDigest: digest, byteLimit: self.previewByteLimit, dimensionLimit: self.previewDimensionLimit) }
+                catch {
+                    guard isCurrent() else { return }
+                    snapshot = try await CatalogPreviewRenderer().capture(package: package, packageDigest: digest, byteLimit: self.previewByteLimit, dimensionLimit: self.previewDimensionLimit)
+                }
                 guard isCurrent(), snapshot.packageDigest == digest else { return }
                 let d = snapshot.declaration
                 try library.captureCatalogPreview(bytes: snapshot.bytes, declaration: .init(byteLength: d.byteLength, digest: d.digest, width: d.width, height: d.height), revision: revision, packageDigest: digest, capturedAt: CatalogContract.timestamp(Date()), binding: flight.binding, candidate: candidate)
