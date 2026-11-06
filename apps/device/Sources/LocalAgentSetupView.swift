@@ -126,13 +126,6 @@ struct DeviceCloudAccountSection: View {
         } message: {
             Text("Edits made while backups were paused are not saved as history. Resume queues each current screen after the verified backup checkpoint.")
         }
-        .task(id: device.email) {
-            guard device.email != nil else { return }
-            while !Task.isCancelled {
-                await device.refreshCloudListenerStatus()
-                do { try await Task.sleep(nanoseconds: 15_000_000_000) } catch { return }
-            }
-        }
     }
     private var listenerSetup: some View {
         Button("Set up cloud listener", action: showListenerSetup).buttonStyle(.borderless)

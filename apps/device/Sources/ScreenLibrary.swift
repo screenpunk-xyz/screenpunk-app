@@ -8,6 +8,7 @@ import ScreenpunkCore
     struct Saved: Codable, Identifiable { let id: String; let revision: String; let artifact: ScreenArtifact }
     struct State: Codable { var screens: [Saved] = []; var selectedID: String?; var previous: Saved?; var lastRequest: String?; var pendingID: String?; var pendingScreenID: String?; var consumedID: String?; var cancelledRequests: [String]?; var cancelIntents: [String]?; var lastInstruction: String?; var submissionKey: String?; var submissionText: String?; var submissionScreen: ScreenArtifact?; var requestDeadline: Double?; var authoring: AuthoringStoreState?; var linkedProfile: LocalProfileDescriptor?; var localRequestIDs: Set<String>?; var bundledScreenSeeds: Set<String>?; var catalog: CatalogQueue? }
     private(set) var state = State()
+    var onCatalogRevisionCommitted: (() -> Void)?
     private let root: URL
     private let libraryOwner: String
     private var temporary: LocalTemporaryActivationController!
@@ -259,6 +260,13 @@ import ScreenpunkCore
         }
     }
     private func commit(_ proposed: State, stagedDirectory: String? = nil, captureCatalog: Bool = true) throws {
+        let previousCatalogRevision = state.catalog?.entries.last?.id
+        defer {
+            if let latest = state.catalog?.entries.last?.id, latest != previousCatalogRevision,
+               captureCatalog, stagedDirectory != nil {
+                onCatalogRevisionCommitted?()
+            }
+        }
         var next = proposed
         if captureCatalog, let revision = stagedDirectory, let saved = next.screens.first(where: { $0.revision == revision }) {
             captureCatalogRevision(saved, origin: "apply", in: &next)

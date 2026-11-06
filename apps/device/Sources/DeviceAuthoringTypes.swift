@@ -7,6 +7,10 @@ typealias ScreenArtifact = AuthoringScreen
 enum DeviceError: LocalizedError {
     case message(String)
     case http(Int, String)
+    var authorizationRejected: Bool {
+        if case .http(401, _) = self { return true }
+        return false
+    }
     var errorDescription: String? {
         switch self {
         case .message(let value), .http(_, let value): return value
@@ -33,16 +37,35 @@ struct CloudListenerObservation {
     let deviceID: String
     let profileID: String?
     let ready: Bool?
-    let checkedAt: Date
-    static func status(_ observation: Self?, accountID: String?, deviceID: String?, profileID: String?, now: Date = Date()) -> Status {
+    static func status(_ observation: Self?, accountID: String?, deviceID: String?, profileID: String?) -> Status {
         guard let accountID, let deviceID else { return .notSignedIn }
-        guard let observation, observation.accountID == accountID, observation.deviceID == deviceID,
-              now.timeIntervalSince(observation.checkedAt) >= 0,
-              now.timeIntervalSince(observation.checkedAt) < 30 else { return .unchecked }
+        guard let observation, observation.accountID == accountID, observation.deviceID == deviceID else { return .unchecked }
         guard let observedProfile = observation.profileID, !observedProfile.isEmpty,
               profileID == nil || profileID == observedProfile,
               let ready = observation.ready else { return .unavailable }
         return ready ? .connected : .waiting
+    }
+}
+
+/// Socket messages are invalidations only. Unknown or incomplete frames cannot
+/// wake an account sync, and durable values always come from authenticated HTTP.
+enum DeviceCloudNotice: Equatable {
+    case statusChanged
+    case preferenceUpdated(profileID: String)
+    case catalogUpdated
+
+    private struct Wire: Decodable { let type: String; let profileID: String? }
+
+    static func decode(_ data: Data) -> Self? {
+        guard data.count <= 4096, let wire = try? JSONDecoder().decode(Wire.self, from: data) else { return nil }
+        switch wire.type {
+        case "status_changed": return .statusChanged
+        case "preference.updated":
+            guard let profileID = wire.profileID, !profileID.isEmpty else { return nil }
+            return .preferenceUpdated(profileID: profileID)
+        case "catalog.updated": return .catalogUpdated
+        default: return nil
+        }
     }
 }
 
@@ -216,5 +239,58 @@ extension AgentRequestV2 {
         if ["failed", "cancelled", "timed_out"].contains(status) { return .ended(status: status, message: failure) }
         if status == "pending", let deadlineAt, now >= deadlineAt { return .ended(status: "timed_out", message: nil) }
         return .pending(.init(status: status, caption: progress?.caption, updatedAt: progress?.updatedAt ?? createdAt, deadlineAt: deadlineAt))
+    }
+}
+
+/// Coalesces work arriving during a pass and wakes once at a retry deadline.
+@MainActor
+final class CatalogWorkPump {
+    enum Next {
+        case idle
+        case ready
+        case retry(Date)
+    }
+
+    private var worker: Task<Void, Never>?
+    private var timer: Task<Void, Never>?
+    private var pending = false
+
+    func request(_ step: @escaping @MainActor () async -> Next) {
+        timer?.cancel()
+        timer = nil
+        pending = true
+        guard worker == nil else { return }
+        worker = Task { [weak self] in
+            while let self, !Task.isCancelled {
+                self.pending = false
+                let next = await step()
+                guard !Task.isCancelled else { return }
+                if self.pending { continue }
+                switch next {
+                case .ready: continue
+                case .idle:
+                    self.worker = nil
+                    return
+                case .retry(let deadline):
+                    self.worker = nil
+                    self.timer = Task { [weak self] in
+                        do {
+                            try await Task.sleep(for: .seconds(max(0, deadline.timeIntervalSinceNow)))
+                        } catch { return }
+                        guard !Task.isCancelled else { return }
+                        self?.request(step)
+                    }
+                    return
+                }
+            }
+        }
+    }
+
+    func cancel() {
+        worker?.cancel()
+        worker = nil
+        timer?.cancel()
+        timer = nil
+        pending = false
     }
 }
