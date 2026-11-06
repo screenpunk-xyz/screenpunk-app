@@ -8,6 +8,25 @@ final class ScreenLibraryCatalogTests: XCTestCase {
     private func artifact(_ title: String) -> ScreenArtifact { .init(title: title, files: [.init(path: "index.html", content: "<html><body>\(title)</body></html>")]) }
     private var binding: ScreenLibrary.CatalogBinding { .init(origin: "https://example.test", accountID: "account", userID: "user", deviceID: "device", libraryID: "library") }
 
+    @MainActor func testWakeRequiresDurableQueuedRevision() throws {
+        let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
+        let library = try ScreenLibrary(accountID: "library", rootDirectory: root)
+        var wakes = 0
+        library.onCatalogRevisionCommitted = { wakes += 1 }
+        try library.install(artifact("Local only"), requestID: "offline", replacing: "screen")
+        XCTAssertEqual(wakes, 0)
+        try library.activateCatalog(binding: binding)
+        XCTAssertEqual(wakes, 0)
+        try library.install(artifact("New edit"), requestID: "edit", replacing: "screen")
+        XCTAssertEqual(wakes, 1)
+        try library.saveInstruction("No screen mutation")
+        try library.newScreen()
+        let head = try XCTUnwrap(library.catalogQueue?.entries.first)
+        try library.updateCatalogIntent(head, binding: binding)
+        try library.acknowledgeCatalogIntent(id: head.id, binding: binding)
+        XCTAssertEqual(wakes, 1)
+    }
+
     @MainActor func testLegacyInstallPinsEveryQueuedRevisionAcrossPruningAndRestart() throws {
         let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
         var library = try ScreenLibrary(accountID: "library", rootDirectory: root)

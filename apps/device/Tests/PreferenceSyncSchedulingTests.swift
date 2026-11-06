@@ -28,9 +28,14 @@ import ScreenpunkCore
     func release(_ index: Int) { gates[index].release() }
     func releaseAll() { gates.forEach { $0.release() } }
     func delay(_ index: Int) -> UInt64 { delays[index] }
+    var count: Int { delays.count }
 }
 
 final class PreferenceSyncSchedulingTests: XCTestCase {
+    @MainActor private func expectIdle(_ pump: PreferenceSyncPump) async {
+        for _ in 0..<500 where pump.hasWork { await Task.yield() }
+        XCTAssertFalse(pump.hasWork, "A successful reconciliation should leave no timer or work scheduled")
+    }
     func testCloudPreferenceEligibilityRequiresTheSameOriginEvenForTheSameServerUser() {
         let staging = CloudOriginScope(origin: "https://staging.screenpunk.xyz")!
         let production = CloudOriginScope(origin: "https://api.screenpunk.xyz")!
@@ -90,11 +95,11 @@ final class PreferenceSyncSchedulingTests: XCTestCase {
         localApplied = true
         for _ in 0..<20 { pump.wake(operation) }
         XCTAssertTrue(localApplied); XCTAssertEqual(calls, 1)
-        io.release(); await sleeper.untilCount(1)
+        io.release(); await expectIdle(pump)
         XCTAssertEqual(calls, 2)
-        XCTAssertEqual(sleeper.delay(0), 60_000_000_000)
+        XCTAssertEqual(sleeper.count, 0)
     }
-    @MainActor func testIdlePumpPullsRemoteChangesWithoutLocalEventsAndBacksOffFailures() async {
+    @MainActor func testOnlyFailureRetriesAndARealInvalidationWakesAQuietPump() async {
         let sleeper = SyncSleeper()
         let pump = PreferenceSyncPump(sleep: { try await sleeper.sleep($0) })
         defer { pump.cancel(); sleeper.releaseAll() }
@@ -103,20 +108,22 @@ final class PreferenceSyncSchedulingTests: XCTestCase {
         await sleeper.untilCount(1); XCTAssertEqual(sleeper.delay(0), 2_000_000_000)
         sleeper.release(0)
         await sleeper.untilCount(2); XCTAssertEqual(sleeper.delay(1), 4_000_000_000)
-        sleeper.release(1)
-        await sleeper.untilCount(3); XCTAssertEqual(sleeper.delay(2), 60_000_000_000)
-        // No edit or authoring event occurs: the idle cadence still performs a pull.
-        sleeper.release(2); await sleeper.untilCount(4)
+        sleeper.release(1); await expectIdle(pump)
+        XCTAssertEqual(sleeper.count, 2)
+        XCTAssertEqual(calls, 3)
+        pump.wake { calls += 1; return true }
+        await expectIdle(pump)
         XCTAssertEqual(calls, 4)
+        XCTAssertEqual(sleeper.count, 2)
     }
     @MainActor func testCancelledPumpCannotRestartFromAnOldTimer() async {
         let sleeper = SyncSleeper()
         let pump = PreferenceSyncPump(sleep: { try await sleeper.sleep($0) })
         var oldCalls = 0, newCalls = 0
-        pump.wake { oldCalls += 1; return true }
+        pump.wake { oldCalls += 1; return false }
         await sleeper.untilCount(1); pump.cancel()
         pump.wake { newCalls += 1; return true }
-        await sleeper.untilCount(2)
+        await expectIdle(pump)
         sleeper.release(0); await Task.yield()
         XCTAssertEqual(oldCalls, 1); XCTAssertEqual(newCalls, 1)
         pump.cancel(); sleeper.releaseAll()
@@ -148,7 +155,7 @@ final class PreferenceSyncSchedulingTests: XCTestCase {
         await sleeper.untilCount(1)
         XCTAssertEqual(library.preferenceOutbox.count, 1)
         XCTAssertEqual(try ScreenLibrary(accountID: "saved-library", rootDirectory: root).preferenceOutbox.count, 1)
-        sleeper.release(0); await sleeper.untilCount(2)
+        sleeper.release(0); await expectIdle(pump)
         XCTAssertTrue(library.preferenceOutbox.isEmpty)
         XCTAssertEqual(library.state.authoring?.cloudRevisions[record.id], 1)
         try library.retireAuthoringRequest(id: request.requestID)

@@ -101,17 +101,18 @@ struct StatusMessagePresentationState {
     }
 }
 
-/// Account synchronization has its own foreground cadence. Authoring never awaits
-/// this pump: local delivery can finish or cancel while Cloud is unreachable.
+/// An account-scoped invalidation schedules one reconciliation. Successful work
+/// goes idle; only failures get a retry timer. Authoring can finish or cancel
+/// while the Cloud operation is suspended.
 @MainActor final class PreferenceSyncPump {
     typealias Sleep = (UInt64) async throws -> Void
     private let sleep: Sleep
-    private let idleDelay: UInt64
     private var runner: Task<Void, Never>?
     private var timer: Task<Void, Error>?
     private var identity: UUID?
     private var requested = false
-    init(idleDelay: UInt64 = 60_000_000_000, sleep: @escaping Sleep = { try await Task.sleep(nanoseconds: $0) }) { self.idleDelay = idleDelay; self.sleep = sleep }
+    var hasWork: Bool { runner != nil }
+    init(sleep: @escaping Sleep = { try await Task.sleep(nanoseconds: $0) }) { self.sleep = sleep }
     func wake(_ operation: @escaping @MainActor () async -> Bool) {
         requested = true
         timer?.cancel()
@@ -127,7 +128,8 @@ struct StatusMessagePresentationState {
                 failures = success ? 0 : min(failures + 1, 6)
                 // Coalesce any number of notices during I/O into one trailing run.
                 if self.requested { continue }
-                let delay = success ? self.idleDelay : min(UInt64(1 << failures) * 1_000_000_000, 60_000_000_000)
+                if success { self.runner = nil; self.identity = nil; return }
+                let delay = min(UInt64(1 << failures) * 1_000_000_000, 60_000_000_000)
                 let timer = Task { try await self.sleep(delay) }
                 self.timer = timer
                 do { try await timer.value } catch { }
@@ -143,7 +145,7 @@ struct StatusMessagePresentationState {
     }
 }
 
-/// Cloud polling and the independent pump share one mutation flight. A replacement
+/// Explicit Cloud submission and the account pump share one mutation flight. A replacement
 /// binding waits for the cancelled old flight to drain before issuing another call.
 @MainActor final class PreferenceSyncSingleFlight<Binding: Equatable> {
     private struct Flight { let id: UUID; let binding: Binding; let task: Task<Bool, Never> }

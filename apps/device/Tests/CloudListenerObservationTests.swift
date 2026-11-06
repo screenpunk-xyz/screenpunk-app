@@ -2,12 +2,11 @@ import XCTest
 @testable import DeviceAuthoring
 
 final class CloudListenerObservationTests: XCTestCase {
-    private let now = Date(timeIntervalSince1970: 1_000)
-    private func observation(ready: Bool? = true, account: String = "account-a", device: String = "ipad", profile: String? = "profile-a", age: TimeInterval = 0) -> CloudListenerObservation {
-        .init(accountID: account, deviceID: device, profileID: profile, ready: ready, checkedAt: now.addingTimeInterval(-age))
+    private func observation(ready: Bool? = true, account: String = "account-a", device: String = "ipad", profile: String? = "profile-a") -> CloudListenerObservation {
+        .init(accountID: account, deviceID: device, profileID: profile, ready: ready)
     }
     private func status(_ observation: CloudListenerObservation?, account: String? = "account-a", device: String? = "ipad", profile: String? = "profile-a") -> CloudListenerObservation.Status {
-        CloudListenerObservation.status(observation, accountID: account, deviceID: device, profileID: profile, now: now)
+        CloudListenerObservation.status(observation, accountID: account, deviceID: device, profileID: profile)
     }
     func testSignInAloneDoesNotImplyListenerConnected() {
         XCTAssertEqual(status(nil), .unchecked)
@@ -21,11 +20,9 @@ final class CloudListenerObservationTests: XCTestCase {
         XCTAssertEqual(status(observation(device: "another-ipad")), .unchecked)
         XCTAssertEqual(status(observation(profile: "another-profile")), .unavailable)
     }
-    func testOfflineOrExpiredObservationNeverContinuesToClaimConnected() {
+    func testOfflineObservationNeverClaimsConnected() {
         XCTAssertEqual(status(observation(ready: nil)), .unavailable)
-        XCTAssertEqual(status(observation(age: 29)), .connected)
-        XCTAssertEqual(status(observation(age: 30)), .unchecked)
-        XCTAssertEqual(status(observation(age: -1)), .unchecked)
+        XCTAssertEqual(status(nil), .unchecked)
     }
     func testMissingServerProfileCannotEstablishReadiness() {
         XCTAssertEqual(status(observation(profile: nil)), .unavailable)
@@ -33,5 +30,22 @@ final class CloudListenerObservationTests: XCTestCase {
         // A legacy session without a cached profile can use the authenticated
         // server's profile; the current library/Local route does not determine it.
         XCTAssertEqual(status(observation(), profile: nil), .connected)
+    }
+}
+
+final class DeviceCloudNoticeTests: XCTestCase {
+    private func decode(_ wire: String) -> DeviceCloudNotice? { DeviceCloudNotice.decode(Data(wire.utf8)) }
+
+    func testLegacyStatusAndAdditiveNoticesDecodeWithoutMixingDomains() {
+        XCTAssertEqual(decode(#"{"type":"status_changed"}"#), .statusChanged)
+        XCTAssertEqual(decode(#"{"type":"preference.updated","profileID":"profile-a"}"#), .preferenceUpdated(profileID: "profile-a"))
+        XCTAssertEqual(decode(#"{"type":"catalog.updated"}"#), .catalogUpdated)
+    }
+    func testUnknownOrMalformedNoticesNeverTriggerReconciliation() {
+        XCTAssertNil(decode(#"{"type":"new_event"}"#))
+        XCTAssertNil(decode(#"{"type":"preference.updated"}"#))
+        XCTAssertNil(decode(#"{"type":"preference.updated","profileID":""}"#))
+        XCTAssertNil(decode(#"{"type":"preference.updated","profileID":123}"#))
+        XCTAssertNil(decode(#"{"type":"status_changed"}"# + String(repeating: " ", count: 4096)))
     }
 }

@@ -35,12 +35,14 @@ import ScreenpunkLocalTransport
     @Published var preferenceSyncStatus: String?
     @Published private(set) var catalogBackupStatus: String?
     @Published private(set) var catalogCanResume = false
-    private var catalogTask: Task<Void, Never>?
-    private var catalogTaskID = UUID()
+    private let catalogPump = CatalogWorkPump()
+    private var catalogCatchUpNeeded = false
+    private var catalogCapabilityRetry: Date?
     @Published private(set) var catalogPreviewStatus: String?
-    private var previewTask: Task<Void, Never>?
-    private var previewTaskID = UUID()
-    private var previewWakeup = false
+    private let previewPump = CatalogWorkPump()
+    private var previewDiscoveryNeeded = false
+    private var previewDiscoveryRetry: Date?
+    private var pendingPreviewCaptures: [String] = []
     private var previewCaptureTasks: [String: Task<Void, Never>] = [:]
     private var previewCaptureFlight: CatalogFlight?
     private var previewCandidates: [CatalogPreviewCandidate] = []
@@ -57,25 +59,39 @@ import ScreenpunkLocalTransport
         CloudListenerObservation.status(cloudListenerObservation, accountID: cloud.localAccountID,
             deviceID: cloud.session?.deviceId, profileID: cloud.session?.profileID)
     }
-    /// Account-page status only: do not enroll, consume commands, adopt requests,
-    /// change routes or run a Local preflight simply to show listener availability.
-    func refreshCloudListenerStatus() async {
-        guard foreground, let session = cloud.session, let accountID = cloud.localAccountID else { return }
-        let generation = connectionGeneration
-        do {
-            let status: AgentStatus = try await cloud.call("api/device/status")
-            guard !Task.isCancelled, foreground, connectionGeneration == generation,
-                  cloud.session?.accessToken == session.accessToken,
-                  cloud.session?.deviceId == session.deviceId, cloud.localAccountID == accountID else { return }
-            cloudListenerObservation = .init(accountID: accountID, deviceID: session.deviceId,
-                profileID: status.profileID, ready: status.agentReady, checkedAt: Date())
-        } catch {
-            guard !Task.isCancelled, foreground, connectionGeneration == generation,
-                  cloud.session?.accessToken == session.accessToken,
-                  cloud.session?.deviceId == session.deviceId, cloud.localAccountID == accountID else { return }
-            cloudListenerObservation = .init(accountID: accountID, deviceID: session.deviceId,
-                profileID: session.profileID, ready: nil, checkedAt: Date())
+    /// A status invalidation while Local is selected only reads listener state.
+    /// It never discovers Cloud authoring requests or consumes Cloud commands.
+    private func requestCloudListenerStatus() {
+        guard let epoch = cloudSocketEpoch, let session = cloud.session else { return }
+        listenerStatusPump.wake { [weak self] in
+            guard let self, self.cloudSocketEpoch == epoch,
+                  self.cloud.session?.accessToken == session.accessToken else { return true }
+            do {
+                let status: AgentStatus = try await self.cloud.call("api/device/status", authorizationToken: session.accessToken)
+                guard !Task.isCancelled, self.cloudSocketEpoch == epoch,
+                      self.cloud.session?.accessToken == session.accessToken else { return true }
+                self.observeCloudListener(status)
+                if !self.routeChangeBlocked { try self.reconcileCloudProfile(status.profileID) }
+                return true
+            } catch {
+                guard !Task.isCancelled, self.cloudSocketEpoch == epoch,
+                      self.cloud.session?.accessToken == session.accessToken else { return true }
+                if (error as? DeviceError)?.authorizationRejected == true {
+                    self.rejectCloudAuthorization()
+                    return true
+                }
+                if let accountID = self.cloud.localAccountID {
+                    self.cloudListenerObservation = .init(accountID: accountID, deviceID: session.deviceId,
+                        profileID: session.profileID, ready: nil)
+                }
+                return false
+            }
         }
+    }
+    private func observeCloudListener(_ status: AgentStatus) {
+        guard cloudSocketEpoch != nil, let session = cloud.session, let accountID = cloud.localAccountID else { return }
+        cloudListenerObservation = .init(accountID: accountID, deviceID: session.deviceId,
+            profileID: status.profileID, ready: status.agentReady)
     }
     @Published private(set) var resolvedAgentName: String?
     private var cloudSupportsV2 = false
@@ -121,7 +137,11 @@ import ScreenpunkLocalTransport
     private var cancelledLocally = Set<String>()
     @Published var assets: PackageAssetStore?
     @Published var settingsOpen = false {
-        didSet { if !settingsOpen { requestCatalogPreviewSync(); if let revision = screen?.revision { captureExactCatalogPreview(revision: revision) } } }
+        didSet {
+            guard !settingsOpen else { return }
+            if let revision = screen?.revision { captureExactCatalogPreview(revision: revision) }
+            enqueuePreviewCaptures(previewCandidates)
+        }
     }
     @Published var settingsPage: DeviceSettingsPage = .overview
     @Published var canRollback = false
@@ -139,6 +159,10 @@ import ScreenpunkLocalTransport
     private var consumedID: String?
     private var inventorySignature: String?
     private let connection = DeviceConnection()
+    private var cloudSocketToken: String?
+    private var cloudAuthorizationRejected = false
+    private var cloudSocketEpoch: UUID?
+    private let listenerStatusPump = PreferenceSyncPump()
     private var foreground = false
     private var connectionActive = false
     private var connectionGeneration = UUID()
@@ -157,7 +181,7 @@ import ScreenpunkLocalTransport
     private let preferenceSyncPump = PreferenceSyncPump()
     private let preferenceSyncFlight = PreferenceSyncSingleFlight<PreferenceSyncBinding>()
     private var preferenceSyncBinding: PreferenceSyncBinding? {
-        guard foreground, connectionActive,
+        guard foreground, connectionActive, !cloudAuthorizationRejected,
               CloudPreferenceSyncEligibility.matches(profile: activeProfile, accountID: cloud.localAccountID, deviceID: cloud.session?.deviceId, profileID: cloud.session?.profileID),
               let profile = activeProfile, let binding = profile.cloudBinding,
               let library, let session = cloud.session else { return nil }
@@ -179,7 +203,7 @@ import ScreenpunkLocalTransport
     func signIn() async {
         guard !accountOperationInProgress else { return }
         guard !routeChangeBlocked else { message = "Finish or cancel the current request before changing accounts."; return }
-        accountOperationInProgress = true; defer { accountOperationInProgress = false }
+        accountOperationInProgress = true; defer { accountOperationInProgress = false; startConnection() }
         stopConnection()
         busy = true; defer { busy = pendingID != nil }
         do {
@@ -191,15 +215,14 @@ import ScreenpunkLocalTransport
             if let profile = activeProfile, let account = cloud.localAccountID {
                 try library?.resumeCatalogAuthentication(binding: .init(origin: CloudClient.origin.absoluteString, accountID: account, userID: authenticated.user.id, deviceID: authenticated.deviceId, libraryID: profile.libraryOwner))
             }
-            startConnection()
         }
-        catch is CancellationError { message = nil; startConnection() }
-        catch { message = error.localizedDescription; startConnection() }
+        catch is CancellationError { message = nil }
+        catch { message = error.localizedDescription }
     }
     func signOut() async {
         guard !accountOperationInProgress else { return }
         guard !routeChangeBlocked else { message = "Finish or cancel the current request before changing accounts."; return }
-        accountOperationInProgress = true; defer { accountOperationInProgress = false }
+        accountOperationInProgress = true; defer { accountOperationInProgress = false; startConnection() }
         stopConnection()
         do { try await cloud.signOut(); message = nil }
         catch CloudSignOutError.secureCredentialsNotCleared {
@@ -207,7 +230,7 @@ import ScreenpunkLocalTransport
         }
         catch { message = "Signed out on this device. Cloud revocation could not be confirmed; disconnect it from your account when online." }
         email = nil
-        do { try profileRepository?.signOut(); try openLibrary(); startConnection() }
+        do { try profileRepository?.signOut(); try openLibrary() }
         catch { message = error.localizedDescription }
         settingsOpen = false
     }
@@ -225,10 +248,31 @@ import ScreenpunkLocalTransport
         do { try library?.reconcileTemporary(); if screen?.id != library?.selected?.id { refreshScreen() } }
         catch { message = error.localizedDescription }
     }
+    private var pollsLocalAuthoring: Bool {
+        currentRequestRoute == .local && (pendingID != nil || routePreference == .local || !cloudAccountMatches)
+    }
+    private func reconcileCloudProfile(_ profileID: String?) throws {
+        guard let profileID, cloudAccountMatches, let session = cloud.session,
+              let profile = activeProfile, let library, let accountID = cloud.localAccountID else { return }
+        let binding = LocalCloudBinding(accountID: accountID, profileID: profileID, deviceID: session.deviceId)
+        guard profile.cloudBinding != binding || session.profileID != profileID else { return }
+        if profile.cloudBinding == nil {
+            try profileRepository?.validateLink(profileID: profile.id, binding: binding)
+            let linked = try library.linkLocalProfile(profile, to: binding)
+            try profileRepository?.adoptLinkedProfile(linked); activeProfile = linked
+        } else if profile.cloudBinding != binding {
+            activeProfile = try profileRepository?.activateCloudProfile(accountID: accountID, profileID: profileID, deviceID: session.deviceId)
+        }
+        try cloud.rememberProfile(profileID)
+        refreshPreferences()
+        requestPreferenceSync()
+        requestCatalogCatchUp()
+    }
     private func poll(generation: UUID) async -> Bool {
         if settleAcknowledgedPending() { return true }
-        if currentRequestRoute == .local, pendingID != nil || routePreference == .local || !cloudAccountMatches { return await pollLocal(generation: generation) }
-        guard cloudAccountMatches, let token = cloud.session?.accessToken, email != nil, foreground, generation == connectionGeneration else { return true }
+        if pollsLocalAuthoring { return await pollLocal(generation: generation) }
+        guard !cloudAuthorizationRejected, cloudAccountMatches, let token = cloud.session?.accessToken,
+              email != nil, foreground, generation == connectionGeneration else { return true }
         guard library != nil, authoring != nil else { agentReady = false; return true }
         do {
             try await cloud.enrollInstallation()
@@ -237,32 +281,13 @@ import ScreenpunkLocalTransport
             guard cloud.session?.accessToken == token, foreground, generation == connectionGeneration, !Task.isCancelled else { return true }
             try await syncInventory()
             guard cloud.session?.accessToken == token, foreground, generation == connectionGeneration, !Task.isCancelled else { return true }
-            var preferencesSynced = await syncPreferencesWhenAvailable()
-            guard cloud.session?.accessToken == token, foreground, generation == connectionGeneration, !Task.isCancelled else { return true }
+            let socketEpoch = cloudSocketEpoch
             let status: AgentStatus = try await cloud.call("api/device/status")
             guard cloud.session?.accessToken == token, foreground, generation == connectionGeneration, !Task.isCancelled else { return true }
-            if let profileID = status.profileID {
-                let profileChanged = cloud.session?.profileID != profileID
-                try cloud.rememberProfile(profileID)
-                if profileChanged {
-                    preferencesSynced = await syncPreferencesWhenAvailable() && preferencesSynced
-                    guard cloud.session?.accessToken == token, foreground, generation == connectionGeneration, !Task.isCancelled else { return true }
-                }
-            }
-            if let profileID = status.profileID, let session = cloud.session {
-                if let profile = activeProfile, profile.cloudBinding == nil, let library {
-                    let binding = LocalCloudBinding(accountID: CloudClient.originScope.localAccountID(serverUserID: session.user.id), profileID: profileID, deviceID: session.deviceId)
-                    try profileRepository?.validateLink(profileID: profile.id, binding: binding)
-                    let linked = try library.linkLocalProfile(profile, to: binding)
-                    try profileRepository?.adoptLinkedProfile(linked); activeProfile = linked
-                } else {
-                    activeProfile = try profileRepository?.activateCloudProfile(accountID: CloudClient.originScope.localAccountID(serverUserID: session.user.id), profileID: profileID, deviceID: session.deviceId)
-                }
-            }
-            refreshPreferences()
+            if cloudSocketEpoch == socketEpoch { observeCloudListener(status) }
+            try reconcileCloudProfile(status.profileID)
             if cloudBindingMatches {
                 try await syncInventory()
-                preferencesSynced = await syncPreferencesWhenAvailable() && preferencesSynced
                 guard cloud.session?.accessToken == token, foreground, generation == connectionGeneration, !Task.isCancelled else { return true }
             }
             cloudAgentReady = status.agentReady && cloudBindingMatches
@@ -297,7 +322,7 @@ import ScreenpunkLocalTransport
                     }
                     if let unsupported = restored.canonicalUnsupported {
                         try finishRequest(id, status: unsupported.code, failure: unsupported.message)
-                        return preferencesSynced
+                        return true
                     }
                     guard let snapshot = restored.snapshot, snapshot.delivery.route == "cloud", snapshot.context.profileID == cloud.session?.profileID, snapshot.context.deviceID == cloud.session?.deviceId else {
                         throw DeviceError.message("This request has no matching authoring snapshot. Your screen is unchanged.")
@@ -323,7 +348,6 @@ import ScreenpunkLocalTransport
                     try persistPending()
                     try await syncInventory()
                     guard cloud.session?.accessToken == token, foreground, generation == connectionGeneration, !Task.isCancelled else { return true }
-                    preferencesSynced = await syncPreferencesWhenAvailable() && preferencesSynced
                 case .deliveryUncertain(let failure), .needsAttention(let failure):
                     busy = true; requestPending = true; canCancelRequest = true; canRetry = false; progressCaption = failure
                 case .ended(let status, let failure):
@@ -338,15 +362,16 @@ import ScreenpunkLocalTransport
                     lastProgressAt = Date(timeIntervalSince1970: (progress.updatedAt ?? Date().timeIntervalSince1970 * 1000) / 1000)
                 }
             }
-            return preferencesSynced
+            return true
         } catch {
             guard cloud.session?.accessToken == token, foreground, generation == connectionGeneration, !Task.isCancelled else { return true }
-            agentReady = false
+            if (error as? DeviceError)?.authorizationRejected == true { rejectCloudAuthorization() }
+            agentReady = routePreference == .automatic && localAgent != nil
             if pendingID != nil { busy = true }
             message = (library?.state.cancelIntents?.isEmpty == false)
                 ? "Result cancelled on this device. Cloud confirmation will retry when connected; the agent may still be running."
                 : error.localizedDescription
-            return false
+            return cloudAuthorizationRejected
         }
     }
     /// Resolve a new request before sealing source or preparing delivery. A prepared
@@ -544,7 +569,9 @@ import ScreenpunkLocalTransport
             switch delivery {
             case .completed(let result):
                 let receipt = try coordinator.apply(result)
-                requestPreferenceSync() // Do not wait for the Mac/Cloud acknowledgement.
+                if snapshot.delivery.route == "cloud" || (receipt.status == "applied" && result.preferenceMutations?.isEmpty == false) {
+                    requestPreferenceSync() // A stalled acknowledgement must not delay a committed preference.
+                }
                 refreshScreen(); refreshPreferences()
                 message = receipt.status == "applied" ? (result.preferenceMutations?.isEmpty == false ? "Preference saved" : result.answer) : (receipt.message ?? "Your screen is unchanged.")
                 // Keep pending identity until acknowledgement; restart can finish the exact receipt.
@@ -586,7 +613,7 @@ import ScreenpunkLocalTransport
             else if preference == .cloud { selectedRoute = .cloud }
             else { selectedRoute = localAgent == nil && cloudBindingMatches ? .cloud : .local }
             availableProfiles = try profileRepository?.snapshot().profiles ?? []
-            startConnection()
+            refreshAuthoringRoute()
         } catch { message = error.localizedDescription }
     }
     private func sendV1(_ text: String) async {
@@ -736,34 +763,38 @@ import ScreenpunkLocalTransport
                     if library.authoringRequestV2(id: receipt.requestID) != nil, let cloudAuthoringV2 { try await cloudAuthoringV2.acknowledge(receipt) }
                     else { try await authoring.acknowledge(receipt) }
                 }
-                catch DeviceError.http(let status, let text) where (400..<500).contains(status) { deferredFailure = DeviceError.http(status, text) }
+                catch DeviceError.http(let status, let text) where status != 401 && (400..<500).contains(status) { deferredFailure = DeviceError.http(status, text) }
                 try requireCurrent()
             }
         }
         guard let profileID = session.profileID else { return }
         let conflictsAwaitingReview = Set(library.preferenceConflicts.map(\.id))
+        var receivedCurrentRecords = false
         for entry in library.preferenceOutbox where !conflictsAwaitingReview.contains(entry.record.id) && (entry.record.scope != "device" || entry.record.targetID == session.deviceId) {
             try requireCurrent()
             let response: PreferenceSyncResponse
             do {
                 response = try await cloud.call("api/device/preferences/sync", method: "POST", body: ["operationID": entry.id, "profileID": profileID, "mutations": try CloudAuthoringTransport.object([entry.mutation]), "origins": [entry.record.id: entry.record.originRequestID]])
-            } catch DeviceError.http(let status, let text) where (400..<500).contains(status) {
+            } catch DeviceError.http(let status, let text) where status != 401 && (400..<500).contains(status) {
                 try requireCurrent(); deferredFailure = DeviceError.http(status, text); continue
             }
             try requireCurrent()
             guard response.operationID == entry.id else { throw DeviceError.message("Cloud did not confirm preference synchronization.") }
             try library.applyPreferenceSync(records: response.records, accepted: try response.acceptedMap(), sent: [entry], conflicts: try response.conflictMap(), profileID: profileID, deviceID: session.deviceId)
+            receivedCurrentRecords = true
         }
-        let operationID = UUID().uuidString
-        let response: PreferenceSyncResponse = try await cloud.call("api/device/preferences/sync", method: "POST", body: ["operationID": operationID, "profileID": profileID, "mutations": []])
-        try requireCurrent()
-        guard response.operationID == operationID else { throw DeviceError.message("Cloud did not confirm preference synchronization.") }
-        try library.applyPreferenceSync(records: response.records, accepted: [:], sent: [], conflicts: try response.conflictMap(), profileID: profileID, deviceID: session.deviceId)
+        if !receivedCurrentRecords {
+            let operationID = UUID().uuidString
+            let response: PreferenceSyncResponse = try await cloud.call("api/device/preferences/sync", method: "POST", body: ["operationID": operationID, "profileID": profileID, "mutations": []])
+            try requireCurrent()
+            guard response.operationID == operationID else { throw DeviceError.message("Cloud did not confirm preference synchronization.") }
+            try library.applyPreferenceSync(records: response.records, accepted: [:], sent: [], conflicts: try response.conflictMap(), profileID: profileID, deviceID: session.deviceId)
+        }
         refreshPreferences()
         if let deferredFailure { throw deferredFailure }
     }
-    /// Foreground idle pulls run once a minute even with Local selected. Local
-    /// changes/notices wake sooner; failures retry independently with bounded backoff.
+    /// Foreground recovery, committed edits and matching preference notices wake
+    /// the same account sync. Only failed work retries while the account is idle.
     private func requestPreferenceSync() {
         guard preferenceSyncBinding != nil else { preferenceSyncPump.cancel(); return }
         preferenceSyncPump.wake { [weak self] in
@@ -771,7 +802,7 @@ import ScreenpunkLocalTransport
             return await self.syncPreferencesWhenAvailable()
         }
     }
-    /// Cloud polling and the independent pump share exactly one scoped sync flight.
+    /// Explicit Cloud submission and the account pump share one scoped sync flight.
     private func syncPreferencesWhenAvailable() async -> Bool {
         guard let binding = preferenceSyncBinding else { return true }
         return await preferenceSyncFlight.run(binding: binding) { [weak self] in
@@ -785,26 +816,39 @@ import ScreenpunkLocalTransport
         do {
             // Enrollment is account maintenance, independent of whether an agent is ready.
             try await cloud.enrollInstallation()
-            guard preferenceSyncBinding == binding, cloud.session?.accessToken == token, !Task.isCancelled else {
-                // Enrollment can fill a previously nil profile ID. Start a fresh
-                // exact session flight immediately rather than waiting for idle cadence.
-                requestPreferenceSync(); return true
+            guard !Task.isCancelled, connectionGeneration == binding.generation,
+                  cloud.session?.accessToken == token else { return true }
+            guard preferenceSyncBinding == binding else {
+                // Enrollment can fill a previously nil profile ID; only wake
+                // the same active library and Cloud binding under its new identity.
+                if let next = preferenceSyncBinding, next.library == binding.library,
+                   next.profileID == binding.profileID, next.cloud == binding.cloud {
+                    requestPreferenceSync()
+                }
+                return true
             }
+            var deviceNameSynced = true
             do {
                 try await cloud.syncDeviceName()
                 guard preferenceSyncBinding == binding, cloud.session?.accessToken == token, !Task.isCancelled else { return true }
                 deviceNameSyncStatus = nil
             } catch {
                 guard preferenceSyncBinding == binding, cloud.session?.accessToken == token, !Task.isCancelled else { return true }
+                if (error as? DeviceError)?.authorizationRejected == true { throw error }
                 deviceNameSyncStatus = "Saved on this iPad. Cloud will retry the device name when connected."
+                deviceNameSynced = false
             }
             guard preferenceSyncBinding == binding, cloud.session?.accessToken == token, !Task.isCancelled else { return true }
             try await syncPreferencesAndReceipts()
             guard preferenceSyncBinding == binding, cloud.session?.accessToken == token, !Task.isCancelled else { return true }
             preferenceSyncStatus = nil
-            return true
+            return deviceNameSynced
         } catch {
             guard preferenceSyncBinding == binding, cloud.session?.accessToken == token, !Task.isCancelled else { return true }
+            if (error as? DeviceError)?.authorizationRejected == true {
+                rejectCloudAuthorization()
+                return true
+            }
             preferenceSyncStatus = "Cloud synchronization will retry. You can continue using preferences saved on this device."
             return false
         }
@@ -969,34 +1013,90 @@ import ScreenpunkLocalTransport
         if active { startConnection() } else { stopConnection() }
     }
     private func startConnection() {
-        guard foreground else { return }
-        stopConnection()
-        // This independent pump does not open a Cloud authoring channel or consume
-        // commands/results when Local is selected. Its idle pulls also find remote
-        // preference changes, which do not currently emit socket invalidations.
+        guard foreground, !connectionActive, !accountOperationInProgress else { return }
         connectionActive = true
-        requestPreferenceSync()
-        requestCatalogSync()
-        if currentRequestRoute == .local, pendingID != nil || routePreference == .local || !cloudAccountMatches {
-            connectionActive = true; agentReady = localAgent != nil
-            requestRefresh(); return
+        if pollsLocalAuthoring { agentReady = localAgent != nil; requestRefresh() }
+        guard let session = cloud.session else { return }
+        if cloudSocketToken == session.accessToken {
+            // A Local adapter rebuild retained this socket; the new library
+            // scope still needs catch-up, even without a new handshake.
+            requestPreferenceSync()
+            requestCatalogCatchUp()
+            requestCloudStatusReconciliation()
+            return
         }
-        guard cloudAccountMatches, let token = cloud.session?.accessToken else { agentReady = false; return }
-        connectionActive = true
-        let generation = connectionGeneration
-        connection.start(token: token, changed: { [weak self] in
-            guard let self, self.connectionGeneration == generation else { return }
-            self.requestRefresh()
-        }, disconnected: { [weak self] in
-            guard let self, self.connectionGeneration == generation else { return }
-            self.agentReady = false
+        cloudSocketToken = session.accessToken
+        connection.start(token: session.accessToken, received: { [weak self] notice, initial in
+            guard let self, self.foreground, self.cloudSocketToken == session.accessToken,
+                  self.cloud.session?.accessToken == session.accessToken else { return }
+            if initial {
+                self.cloudSocketEpoch = UUID()
+                self.requestPreferenceSync()
+                self.requestCatalogCatchUp()
+                self.requestCloudStatusReconciliation()
+            }
+            switch notice {
+            case .statusChanged:
+                if !initial { self.requestCloudStatusReconciliation() }
+            case .preferenceUpdated(let profileID):
+                if self.preferenceSyncBinding?.cloud.profileID == profileID, !initial { self.requestPreferenceSync() }
+            case .catalogUpdated:
+                if !initial { self.requestCatalogPreviewSync(discoverCandidates: true) }
+            }
+        }, disconnected: { [weak self] authorizationRejected in
+            guard let self, self.foreground, self.cloudSocketToken == session.accessToken,
+                  self.cloud.session?.accessToken == session.accessToken else { return }
+            if authorizationRejected { self.rejectCloudAuthorization() }
+            else { self.clearCloudSocketObservation() }
         })
     }
-    private func stopConnection() {
+    private func rejectCloudAuthorization() {
+        cloudAuthorizationRejected = true
+        connection.stop()
+        clearCloudSocketObservation()
+        if !pollsLocalAuthoring {
+            refreshTask?.cancel(); refreshTask = nil; refreshNeeded = false
+        }
+        preferenceSyncPump.cancel()
+        preferenceSyncFlight.cancel()
+        cancelCatalogWork()
+        preferenceSyncStatus = "Sign in again to synchronize with Cloud. Preferences saved on this iPad are still available."
+    }
+    private func requestCloudStatusReconciliation() {
+        if pollsLocalAuthoring || !cloudAccountMatches || library == nil {
+            requestCloudListenerStatus()
+        } else {
+            requestRefresh()
+        }
+    }
+    private func clearCloudSocketObservation() {
+        cloudSocketEpoch = nil
+        listenerStatusPump.cancel()
         cloudListenerObservation = nil
+        cloudAgentReady = false; cloudSupportsV2 = false
+        if !pollsLocalAuthoring { agentReady = routePreference == .automatic && localAgent != nil }
+    }
+    private func refreshAuthoringRoute() {
+        // Discard old route work without changing Cloud account or socket identity.
+        refreshTask?.cancel(); refreshTask = nil; refreshNeeded = false
+        listenerStatusPump.cancel()
+        if pollsLocalAuthoring {
+            agentReady = localAgent != nil
+            if cloudSocketEpoch != nil, cloudListenerObservation == nil { requestCloudListenerStatus() }
+        }
+        requestRefresh()
+    }
+    private func stopConnection(releaseCloudSocket: Bool = true) {
         connectionActive = false
         connectionGeneration = UUID()
-        connection.stop()
+        if releaseCloudSocket {
+            cloudSocketToken = nil
+            cloudAuthorizationRejected = false
+            connection.stop()
+            clearCloudSocketObservation()
+        } else {
+            listenerStatusPump.cancel()
+        }
         let previousV1 = localTransport, previousV2 = localTransportV2
         if previousV1 != nil || previousV2 != nil {
             localConnectionLifecycle.enqueue {
@@ -1007,17 +1107,12 @@ import ScreenpunkLocalTransport
         refreshTask?.cancel(); refreshTask = nil; refreshNeeded = false
         preferenceSyncPump.cancel()
         preferenceSyncFlight.cancel()
-        catalogTask?.cancel(); catalogTask = nil; catalogTaskID = UUID()
-        previewTask?.cancel(); previewTask = nil; previewTaskID = UUID()
-        previewCaptureTasks.values.forEach { $0.cancel() }; previewCaptureTasks = [:]
-        previewCaptureFlight = nil; previewCandidates = []; previewCursor = nil
+        cancelCatalogWork()
     }
     /// One in-flight reconciliation plus one trailing refresh, regardless of notice volume.
     /// Transient HTTP failures retry with bounded backoff even when the socket stays open.
     private func requestRefresh() {
         guard foreground, connectionActive else { return }
-        requestPreferenceSync()
-        requestCatalogSync()
         refreshNeeded = true
         guard refreshTask == nil else { return }
         let generation = connectionGeneration
@@ -1025,7 +1120,7 @@ import ScreenpunkLocalTransport
             var failures = 0
             while !Task.isCancelled {
                 do { try await Task.sleep(nanoseconds: 250_000_000) } catch { return }
-                guard let self, self.foreground, self.connectionGeneration == generation else { return }
+                guard !Task.isCancelled, let self, self.foreground, self.connectionGeneration == generation else { return }
                 self.refreshNeeded = false
                 let success = await self.poll(generation: generation)
                 guard !Task.isCancelled, self.connectionGeneration == generation else { return }
@@ -1081,6 +1176,10 @@ import ScreenpunkLocalTransport
         }
         try opened.installStarterScreensIfNeeded(StarterScreens.templates())
         library = opened
+        opened.onCatalogRevisionCommitted = { [weak self, weak opened] in
+            guard let self, let opened, self.library === opened else { return }
+            self.requestCatalogSync()
+        }
         CatalogPreviewCaptureRegistry.shared.onReady = { [weak self] revision in self?.captureExactCatalogPreview(revision: revision) }
         func coordinator(_ transport: any AuthoringTransport) -> AuthoringCoordinator {
             let requireCurrent: () throws -> Void = { [weak self] in
@@ -1161,11 +1260,11 @@ import ScreenpunkLocalTransport
             try profileRepository?.setPreferredRoute(route, profileID: profile.id)
             activeProfile?.preferredRoute = route; activeProfile?.routePreference = route == .local ? .local : .cloud; routePreference = route == .local ? .local : .cloud; selectedRoute = route; agentReady = false
             availableProfiles = try profileRepository?.snapshot().profiles ?? []
-            startConnection()
+            refreshAuthoringRoute()
         } catch { message = error.localizedDescription }
     }
     private func reloadLocalAgent() {
-        stopConnection()
+        stopConnection(releaseCloudSocket: false)
         do { try openLibrary(); startConnection() } catch { message = error.localizedDescription }
     }
     private func sendLocal(_ text: String) async {
@@ -1253,7 +1352,9 @@ import ScreenpunkLocalTransport
             switch delivery {
             case .completed(let result):
                 let receipt = try authoring.apply(result)
-                requestPreferenceSync() // A stalled Mac acknowledgement must not stall preferences.
+                if receipt.status == "applied", result.preferenceMutations?.isEmpty == false {
+                    requestPreferenceSync() // A stalled Mac acknowledgement must not stall preferences.
+                }
                 // The application receipt is committed before the Mac delivery is acknowledged.
                 try await authoring.acknowledge(receipt)
                 guard self.library === library, generation == connectionGeneration else { return true }
@@ -1338,24 +1439,36 @@ extension DeviceModel {
         var token: String // Memory only; never persisted or logged.
     }
     private var catalogFlight: CatalogFlight? {
-        guard foreground, connectionActive, cloudBindingMatches, let library, let profile = activeProfile,
+        guard foreground, connectionActive, !cloudAuthorizationRejected, cloudBindingMatches, let library, let profile = activeProfile,
               let session = cloud.session, let account = cloud.localAccountID else { return nil }
         return CatalogFlight(generation: connectionGeneration, library: ObjectIdentifier(library),
             binding: .init(origin: CloudClient.origin.absoluteString, accountID: account, userID: session.user.id,
                 deviceID: session.deviceId, libraryID: profile.libraryOwner), token: session.accessToken)
     }
+    private func cancelCatalogWork() {
+        catalogPump.cancel()
+        previewPump.cancel()
+        catalogCatchUpNeeded = false
+        catalogCapabilityRetry = nil
+        previewDiscoveryNeeded = false
+        previewDiscoveryRetry = nil
+        previewCaptureTasks.values.forEach { $0.cancel() }
+        previewCaptureTasks = [:]
+        pendingPreviewCaptures = []
+        previewCaptureFlight = nil
+        previewCandidates = []
+        previewCursor = nil
+    }
+    private func requestCatalogCatchUp() {
+        guard catalogFlight != nil else { return }
+        catalogCatchUpNeeded = true
+        requestCatalogSync()
+    }
     private func requestCatalogSync() {
-        requestCatalogPreviewSync()
-        guard catalogTask == nil, catalogFlight != nil else { return }
-        let taskID = UUID(); catalogTaskID = taskID
-        catalogTask = Task { [weak self] in
-            defer { if self?.catalogTaskID == taskID { self?.catalogTask = nil } }
-            while !Task.isCancelled {
-                guard let self, let flight = self.catalogFlight else { return }
-                let wait = await self.syncCatalog(flight: flight)
-                guard self.catalogFlight == flight, !Task.isCancelled else { return }
-                do { try await Task.sleep(nanoseconds: UInt64(max(1, min(60, wait))) * 1_000_000_000) } catch { return }
-            }
+        guard catalogFlight != nil else { return }
+        catalogPump.request { [weak self] in
+            guard let self, let flight = self.catalogFlight else { return .idle }
+            return await self.syncCatalog(flight: flight)
         }
     }
     func resumeCatalogBackups() {
@@ -1364,12 +1477,13 @@ extension DeviceModel {
             try library.resumeCatalog(binding: flight.binding)
             catalogBackupStatus = library.catalogQueue?.status
             catalogCanResume = false
+            requestCatalogSync()
         } catch { catalogBackupStatus = error.localizedDescription }
     }
-    private func syncCatalog(flight: CatalogFlight) async -> Int {
-        guard catalogFlight == flight, let library else { return 60 }
+    private func syncCatalog(flight: CatalogFlight) async -> CatalogWorkPump.Next {
+        guard catalogFlight == flight, let library else { return .idle }
         func current() throws {
-            guard self.catalogFlight == flight, !Task.isCancelled else { throw CancellationError() }
+            guard self.catalogFlight == flight, library.catalogQueue?.authPaused != true, !Task.isCancelled else { throw CancellationError() }
         }
         func refreshStatus() {
             guard self.catalogFlight == flight else { return }
@@ -1378,16 +1492,33 @@ extension DeviceModel {
             self.catalogBackupStatus = queue?.status ?? queue.map { $0.entries.isEmpty ? "Backup queue is up to date. Catalog shows completed backups; previews may be unavailable." : "\($0.entries.count) screen backups queued. Current screens are saved on this device." }
         }
         var activeIntent: ScreenLibrary.CatalogIntent?
-        if library.catalogQueue?.binding == flight.binding, library.catalogQueue?.authPaused == true {
+        if let queue = library.catalogQueue, queue.binding != flight.binding {
+            catalogBackupStatus = "Backups for this library need their original account and device connection."
+            return .idle
+        }
+        if library.catalogQueue?.authPaused == true {
             catalogBackupStatus = "Backups paused. Sign in again to the original account to continue."
             catalogCanResume = false
-            return 60
+            return .idle
         }
+        let catchUp = catalogCatchUpNeeded
+        let head = library.catalogQueue?.entries.first
+        let now = Date()
+        if let retry = catalogCapabilityRetry, retry > now { return .retry(retry) }
+        if !catchUp {
+            guard let head else { refreshStatus(); return .idle }
+            if let reason = head.blockedReason { catalogBackupStatus = reason; return .idle }
+            if head.retryAt > now.timeIntervalSince1970 { return .retry(Date(timeIntervalSince1970: head.retryAt)) }
+        }
+        catalogCatchUpNeeded = false
+        catalogCapabilityRetry = nil
         do {
             try await cloud.enrollInstallation()
             try current()
             guard let capability = try await cloud.catalogCapability(token: flight.token) else {
-                try current(); catalogBackupStatus = "Cloud backups are unavailable on this server."; return 60
+                try current()
+                previewCaptureFlight = nil
+                catalogBackupStatus = "Cloud backups are unavailable on this server."; return .idle
             }
             try current()
             if capability.entitlement.backupEnabled {
@@ -1397,43 +1528,43 @@ extension DeviceModel {
                     previewByteLimit = min(CatalogContract.previewBytes, capability.entitlement.previewBytes)
                     previewDimensionLimit = min(CatalogContract.previewDimension, capability.entitlement.previewDimension)
                     if let revision = screen?.revision { captureExactCatalogPreview(revision: revision) }
-                    requestCatalogPreviewSync()
-                }
-            }
+                    if catchUp { requestCatalogPreviewSync(discoverCandidates: true) }
+                } else { previewCaptureFlight = nil }
+            } else { previewCaptureFlight = nil }
             guard library.catalogQueue?.binding == flight.binding else {
                 catalogBackupStatus = capability.entitlement.backupEnabled ? "Backups for this library need their original account and device connection." : "Cloud backups are not enabled for this account."
-                return 60
+                return .idle
             }
             try library.setCatalogEntitlement(capability.entitlement.backupEnabled, binding: flight.binding)
             refreshStatus()
             guard var intent = library.catalogQueue?.entries.first else {
                 if !capability.entitlement.backupEnabled { catalogBackupStatus = "Cloud backups are not enabled for this account. Existing completed backups are retained." }
-                return 5
+                return .idle
             }
             activeIntent = intent
-            if intent.retryAt > Date().timeIntervalSince1970 { return max(1, min(60, Int(ceil(intent.retryAt - Date().timeIntervalSince1970)))) }
+            if intent.retryAt > Date().timeIntervalSince1970 { return .retry(Date(timeIntervalSince1970: intent.retryAt)) }
             // Recover a terminal acknowledgement even after entitlement is disabled.
             if intent.packageDigest != nil {
                 do {
                     let known: CatalogBackupStatus = try await cloud.catalogRequest(CatalogContract.operationsPath + intent.operationID, token: flight.token)
                     try current()
-                    if try handleCatalogStatus(known, intent: intent, binding: flight.binding, library: library) { refreshStatus(); return 1 }
-                } catch let error as CloudClient.CatalogHTTPError where error.status == 404 { }
+                    if try handleCatalogStatus(known, intent: intent, binding: flight.binding, library: library) { refreshStatus(); return .ready }
+                } catch let error as CloudClient.CatalogHTTPError where error.status == 404 { try current() }
             }
             guard capability.entitlement.backupEnabled else {
-                catalogBackupStatus = "Cloud backups are paused for this account. Existing queued screens stay saved on this device."; return 60
+                catalogBackupStatus = "Cloud backups are paused for this account. Existing queued screens stay saved on this device."; return .idle
             }
-            if let reason = intent.blockedReason { catalogBackupStatus = reason; return 60 }
+            if let reason = intent.blockedReason { catalogBackupStatus = reason; return .idle }
             let exported: CatalogPackageExporter.Export
             do { exported = try library.exportCatalogIntent(intent, binding: flight.binding) }
             catch {
                 intent.blockedReason = "Backups paused: this committed package is missing, unsafe, or contains credential markers. Keep the screen on this device and contact support to reconcile its backup; later revisions cannot bypass it."
                 try library.updateCatalogIntent(intent, binding: flight.binding)
-                catalogBackupStatus = intent.blockedReason; return 60
+                catalogBackupStatus = intent.blockedReason; return .idle
             }
             guard exported.bytes.count <= capability.entitlement.packageBytes else {
                 intent.blockedReason = "Backups paused: this complete screen package exceeds the account limit. Its installed screen is unchanged."
-                try library.updateCatalogIntent(intent, binding: flight.binding); catalogBackupStatus = intent.blockedReason; return 60
+                try library.updateCatalogIntent(intent, binding: flight.binding); catalogBackupStatus = intent.blockedReason; return .idle
             }
             let begin = try library.catalogBegin(intent, declaration: exported.declaration, binding: flight.binding)
             let beginBytes = try CatalogContract.canonical(begin)
@@ -1443,7 +1574,7 @@ extension DeviceModel {
             try library.updateCatalogIntent(intent, binding: flight.binding); activeIntent = intent
             let started: CatalogBackupStatus = try await cloud.catalogRequest(CatalogContract.beginPath, method: "POST", bytes: beginBytes, token: flight.token)
             try current()
-            if try handleCatalogStatus(started, intent: intent, binding: flight.binding, library: library) { refreshStatus(); return 1 }
+            if try handleCatalogStatus(started, intent: intent, binding: flight.binding, library: library) { refreshStatus(); return .ready }
             guard started.operationID == intent.operationID, let upload = started.uploadID,
                   upload.range(of: "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$", options: .regularExpression) != nil else { throw DeviceError.message("Cloud did not confirm this backup operation.") }
             intent.uploadID = upload; try library.updateCatalogIntent(intent, binding: flight.binding); activeIntent = intent
@@ -1452,22 +1583,22 @@ extension DeviceModel {
             let completed: CatalogBackupStatus = try await cloud.catalogRequest(CatalogContract.uploadsPath + upload + "/complete", method: "POST", bytes: CatalogContract.canonical(CatalogCompleteBackup(operationID: intent.operationID)), token: flight.token)
             try current()
             guard try handleCatalogStatus(completed, intent: intent, binding: flight.binding, library: library) else { throw DeviceError.message("The backup has not completed yet.") }
-            refreshStatus(); return 1
-        } catch is CancellationError { return 60 }
+            refreshStatus(); return .ready
+        } catch is CancellationError { return .idle }
         catch DeviceError.http(let status, _) where status == 401 {
-            guard catalogFlight == flight, !Task.isCancelled else { return 60 }
+            guard catalogFlight == flight, !Task.isCancelled else { return .idle }
             try? library.pauseCatalogAuthentication(binding: flight.binding)
             catalogBackupStatus = "Backups paused. Sign in again to the original account to continue."
             catalogCanResume = false
-            return 60
+            return .idle
         }
         catch {
-            guard catalogFlight == flight, !Task.isCancelled else { return 60 }
+            guard catalogFlight == flight, !Task.isCancelled else { return .idle }
             if let detail = error as? CloudClient.CatalogHTTPError, detail.status == 401 || detail.code == "unauthorized" {
                 try? library.pauseCatalogAuthentication(binding: flight.binding)
                 catalogBackupStatus = "Backups paused. Sign in again to the original account to continue."
                 catalogCanResume = false
-                return 60
+                return .idle
             }
             if var intent = activeIntent, library.catalogQueue?.entries.first?.id == intent.id {
                 intent.attempts = min(16, intent.attempts + 1)
@@ -1477,10 +1608,17 @@ extension DeviceModel {
                 if ["invalid_package", "conflict"].contains(detail?.code ?? "") {
                     intent.blockedReason = "Backups paused: Cloud rejected this saved package or its history. Keep the installed screen and contact support to reconcile the pending backup."
                 }
-                try? library.updateCatalogIntent(intent, binding: flight.binding)
+                do { try library.updateCatalogIntent(intent, binding: flight.binding) }
+                catch { catalogCapabilityRetry = Date(timeIntervalSince1970: intent.retryAt) }
                 catalogBackupStatus = intent.blockedReason ?? (detail?.status == 401 || detail?.status == 403 ? "Backups paused. Sign in to the original account to continue." : "Screen backups will retry when Cloud is available. Queued revisions stay on this device.")
-            } else { catalogBackupStatus = "Cloud backups will retry. Your installed screens are saved on this device." }
-            return 5
+                return intent.blockedReason == nil ? .retry(Date(timeIntervalSince1970: intent.retryAt)) : .idle
+            }
+            catalogBackupStatus = "Cloud backups will retry. Your installed screens are saved on this device."
+            catalogCatchUpNeeded = catalogCatchUpNeeded || catchUp
+            let delay = max(5, (error as? CloudClient.CatalogHTTPError)?.retryAfterSeconds ?? 0)
+            let retry = Date().addingTimeInterval(Double(delay))
+            catalogCapabilityRetry = retry
+            return .retry(retry)
         }
     }
     private func handleCatalogStatus(_ status: CatalogBackupStatus, intent: ScreenLibrary.CatalogIntent, binding: ScreenLibrary.CatalogBinding, library: ScreenLibrary) throws -> Bool {
@@ -1495,7 +1633,13 @@ extension DeviceModel {
         }
         guard ["completed", "duplicate", "superseded", "deleted"].contains(status.state) else { return false }
         if ["completed", "duplicate"].contains(status.state), let version = status.versionID, let queue = library.catalogQueue, let copy = queue.copies[intent.screenID], let digest = intent.packageDigest {
-            try? library.bindCatalogPreview(.init(catalogScreenID: status.catalogScreenID, versionID: version, libraryID: queue.libraryID, localScreenID: copy.localScreenID, sourceRevisionID: intent.revision, packageDigest: digest, packageBytes: intent.packageBytes), binding: binding)
+            let candidate = CatalogPreviewCandidate(catalogScreenID: status.catalogScreenID, versionID: version, libraryID: queue.libraryID, localScreenID: copy.localScreenID, sourceRevisionID: intent.revision, packageDigest: digest, packageBytes: intent.packageBytes)
+            try? library.bindCatalogPreview(candidate, binding: binding)
+            if previewCaptureFlight == catalogFlight {
+                rememberPreviewCandidate(candidate)
+                enqueuePreviewCaptures([candidate])
+                requestCatalogPreviewSync()
+            }
         } else if ["deleted", "superseded"].contains(status.state), let preview = library.catalogQueue?.previews?.first(where: { $0.revision == intent.revision }) {
             try? library.acknowledgeCatalogPreview(preview, binding: binding)
         }
@@ -1528,27 +1672,37 @@ extension DeviceModel {
         guard cloudBindingMatches, let profile = activeProfile, let binding = profile.cloudBinding else { return nil }
         return .init(origin: CloudClient.origin.absoluteString, accountID: binding.accountID, profileID: profile.id, libraryID: profile.libraryOwner, deviceID: binding.deviceID)
     }
-    private func requestCatalogPreviewSync() {
-        previewWakeup = true
-        guard previewTask == nil, catalogFlight != nil else { return }
-        let taskID = UUID(); previewTaskID = taskID
-        previewTask = Task { [weak self] in
-            defer { if self?.previewTaskID == taskID { self?.previewTask = nil } }
-            while !Task.isCancelled {
-                guard let self, let flight = self.catalogFlight else { return }
-                self.previewWakeup = false
-                let wait = await self.syncCatalogPreviews(flight: flight)
-                guard self.catalogFlight == flight, !Task.isCancelled else { return }
-                for _ in 0..<max(1, min(60, wait)) {
-                    if self.previewWakeup { break }
-                    do { try await Task.sleep(nanoseconds: 1_000_000_000) } catch { return }
-                }
-            }
+    private func requestCatalogPreviewSync(discoverCandidates: Bool = false) {
+        guard catalogFlight != nil else { return }
+        if discoverCandidates { previewDiscoveryNeeded = true }
+        previewPump.request { [weak self] in
+            guard let self, let flight = self.catalogFlight else { return .idle }
+            return await self.syncCatalogPreviews(flight: flight)
+        }
+    }
+    private func rememberPreviewCandidate(_ candidate: CatalogPreviewCandidate) {
+        if let index = previewCandidates.firstIndex(where: { $0.sourceRevisionID == candidate.sourceRevisionID }) {
+            previewCandidates[index] = candidate
+        } else if previewCandidates.count < 100 {
+            previewCandidates.append(candidate)
+        }
+    }
+    private func enqueuePreviewCaptures(_ candidates: [CatalogPreviewCandidate]) {
+        for candidate in candidates where pendingPreviewCaptures.count < 100 && !pendingPreviewCaptures.contains(candidate.sourceRevisionID) {
+            pendingPreviewCaptures.append(candidate.sourceRevisionID)
+        }
+        drainPreviewCaptures()
+    }
+    private func drainPreviewCaptures() {
+        guard !settingsOpen, previewCaptureFlight != nil else { return }
+        while previewCaptureTasks.count < 2, !pendingPreviewCaptures.isEmpty {
+            captureExactCatalogPreview(revision: pendingPreviewCaptures.removeFirst())
         }
     }
     private func captureExactCatalogPreview(revision: String) {
         guard let flight = catalogFlight, previewCaptureFlight == flight, !settingsOpen,
               let context = catalogPreviewContext, let library, library.catalogQueue?.binding == flight.binding,
+              library.catalogQueue?.authPaused != true,
               previewCaptureTasks[revision] == nil, previewCaptureTasks.count < 2 else { return }
         let candidate = previewCandidates.first { $0.sourceRevisionID == revision }
         let digest = library.catalogQueue?.entries.first(where: { $0.revision == revision })?.packageDigest ?? candidate?.packageDigest
@@ -1556,8 +1710,19 @@ extension DeviceModel {
               library.catalogQueue?.previews?.contains(where: { $0.revision == revision && $0.packageDigest == digest }) != true else { return }
         previewCaptureTasks[revision] = Task { [weak self] in
             guard let self else { return }
-            defer { self.previewCaptureTasks[revision] = nil }
+            defer {
+                if self.catalogFlight == flight, !Task.isCancelled {
+                    self.previewCaptureTasks[revision] = nil
+                    self.drainPreviewCaptures()
+                }
+            }
+            @MainActor func isCurrent() -> Bool {
+                self.catalogFlight == flight && self.previewCaptureFlight == flight &&
+                    library.catalogQueue?.authPaused != true && self.catalogPreviewContext == context &&
+                    !self.settingsOpen && !Task.isCancelled
+            }
             do {
+                guard isCurrent() else { return }
                 let package: CatalogPackage
                 if let recovered = try? library.catalogPackage(revision: revision, digest: digest, binding: flight.binding) { package = recovered.package }
                 else if let candidate {
@@ -1565,11 +1730,14 @@ extension DeviceModel {
                     path.queryItems = [.init(name: "sourceRevisionID", value: revision), .init(name: "packageDigest", value: digest)]
                     package = try await self.cloud.catalogPackage(path.string!, token: flight.token, declaration: .init(byteLength: candidate.packageBytes, digest: digest))
                 } else { return }
-                guard self.catalogFlight == flight, self.catalogPreviewContext == context, !self.settingsOpen, !Task.isCancelled else { return }
+                guard isCurrent() else { return }
                 let snapshot: CatalogPreviewRenderer.Snapshot
                 do { snapshot = try await CatalogPreviewCaptureRegistry.shared.capture(context: context, revision: revision, package: package, packageDigest: digest, byteLimit: self.previewByteLimit, dimensionLimit: self.previewDimensionLimit) }
-                catch { snapshot = try await CatalogPreviewRenderer().capture(package: package, packageDigest: digest, byteLimit: self.previewByteLimit, dimensionLimit: self.previewDimensionLimit) }
-                guard self.catalogFlight == flight, self.catalogPreviewContext == context, !self.settingsOpen, !Task.isCancelled, snapshot.packageDigest == digest else { return }
+                catch {
+                    guard isCurrent() else { return }
+                    snapshot = try await CatalogPreviewRenderer().capture(package: package, packageDigest: digest, byteLimit: self.previewByteLimit, dimensionLimit: self.previewDimensionLimit)
+                }
+                guard isCurrent(), snapshot.packageDigest == digest else { return }
                 let d = snapshot.declaration
                 try library.captureCatalogPreview(bytes: snapshot.bytes, declaration: .init(byteLength: d.byteLength, digest: d.digest, width: d.width, height: d.height), revision: revision, packageDigest: digest, capturedAt: CatalogContract.timestamp(Date()), binding: flight.binding, candidate: candidate)
                 if let candidate { try library.bindCatalogPreview(candidate, binding: flight.binding) }
@@ -1581,39 +1749,66 @@ extension DeviceModel {
             }
         }
     }
-    private func syncCatalogPreviews(flight: CatalogFlight) async -> Int {
-        guard catalogFlight == flight, let library, library.catalogQueue?.binding == flight.binding, library.catalogQueue?.authPaused != true else { return 60 }
-        func current() throws { guard self.catalogFlight == flight, !Task.isCancelled else { throw CancellationError() } }
+    private func syncCatalogPreviews(flight: CatalogFlight) async -> CatalogWorkPump.Next {
+        guard catalogFlight == flight, let library, library.catalogQueue?.binding == flight.binding, library.catalogQueue?.authPaused != true else { return .idle }
+        func current() throws {
+            guard self.catalogFlight == flight, library.catalogQueue?.authPaused != true,
+                  !Task.isCancelled else { throw CancellationError() }
+        }
         var attempted: ScreenLibrary.CatalogCapturedPreview?
+        let now = Date()
+        let discover = (previewDiscoveryNeeded || previewCursor != nil) &&
+            (previewDiscoveryRetry.map { $0 <= now } ?? true)
         do {
-            guard let capability = try await cloud.catalogCapability(token: flight.token) else { return 60 }
-            try current()
-            guard capability.previewBackfillVersion == "1", capability.previewMediaTypes.contains("image/png"), capability.entitlement.backupEnabled else { previewCaptureFlight = nil; return 60 }
-            previewByteLimit = min(CatalogContract.previewBytes, capability.entitlement.previewBytes)
-            previewDimensionLimit = min(CatalogContract.previewDimension, capability.entitlement.previewDimension)
-            previewCaptureFlight = flight
-            var path = URLComponents(); path.path = CatalogContract.previewCandidatesPath
-            if let cursor = previewCursor { path.queryItems = [.init(name: "cursor", value: cursor)] }
-            let page: CatalogPreviewCandidates = try await cloud.catalogRequest(path.string!, token: flight.token)
-            try current()
-            guard page.schemaVersion == 1, page.candidates.count <= 20 else { throw DeviceError.message("Invalid preview candidates.") }
-            if previewCursor == nil { previewCandidates = [] }
-            for candidate in page.candidates {
-                guard candidate.libraryID == library.catalogQueue?.libraryID,
-                      library.catalogQueue?.copies.values.contains(where: { $0.localScreenID == candidate.localScreenID }) == true,
-                      [candidate.catalogScreenID, candidate.versionID, candidate.sourceRevisionID].allSatisfy({ $0.range(of: "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$", options: .regularExpression) != nil }) else { continue }
-                if previewCandidates.count < 100 { previewCandidates.append(candidate) }
-                try library.bindCatalogPreview(candidate, binding: flight.binding)
+            if discover {
+                if previewDiscoveryNeeded { previewCursor = nil }
+                previewDiscoveryNeeded = false
+                guard let capability = try await cloud.catalogCapability(token: flight.token) else {
+                    try current()
+                    previewCaptureFlight = nil; previewCursor = nil
+                    return .idle
+                }
+                try current()
+                guard capability.previewBackfillVersion == "1", capability.previewMediaTypes.contains("image/png"), capability.entitlement.backupEnabled else {
+                    previewCaptureFlight = nil; previewCursor = nil
+                    return .idle
+                }
+                previewByteLimit = min(CatalogContract.previewBytes, capability.entitlement.previewBytes)
+                previewDimensionLimit = min(CatalogContract.previewDimension, capability.entitlement.previewDimension)
+                previewCaptureFlight = flight
+                var path = URLComponents(); path.path = CatalogContract.previewCandidatesPath
+                if let cursor = previewCursor { path.queryItems = [.init(name: "cursor", value: cursor)] }
+                let page: CatalogPreviewCandidates = try await cloud.catalogRequest(path.string!, token: flight.token)
+                try current()
+                guard page.schemaVersion == 1, page.candidates.count <= 20,
+                      page.nextCursor == nil || page.nextCursor != previewCursor else {
+                    throw DeviceError.message("Invalid preview candidates.")
+                }
+                if previewCursor == nil { previewCandidates = [] }
+                let candidates = page.candidates.filter { candidate in
+                    candidate.libraryID == library.catalogQueue?.libraryID &&
+                        library.catalogQueue?.copies.values.contains(where: { $0.localScreenID == candidate.localScreenID }) == true &&
+                        [candidate.catalogScreenID, candidate.versionID, candidate.sourceRevisionID].allSatisfy {
+                            $0.range(of: "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$", options: .regularExpression) != nil
+                        }
+                }
+                for candidate in candidates {
+                    rememberPreviewCandidate(candidate)
+                    try library.bindCatalogPreview(candidate, binding: flight.binding)
+                }
+                previewDiscoveryRetry = nil
+                previewCursor = page.nextCursor
+                if let revision = screen?.revision { captureExactCatalogPreview(revision: revision) }
+                enqueuePreviewCaptures(candidates)
             }
-            previewCursor = page.nextCursor
-            if let revision = screen?.revision { captureExactCatalogPreview(revision: revision) }
-            // Static packages may render without the active view. Dynamic ones
-            // remain unavailable until their exact live revision is selected.
-            for candidate in page.candidates.prefix(2) { captureExactCatalogPreview(revision: candidate.sourceRevisionID) }
+            guard previewCaptureFlight == flight else {
+                return previewDiscoveryRetry.map(CatalogWorkPump.Next.retry) ?? .idle
+            }
             let jobs = (library.catalogQueue?.previews ?? []).filter { $0.candidate != nil }
-            let now = Date().timeIntervalSince1970
-            guard var preview = jobs.first(where: { $0.retryAt <= now }) else {
-                return jobs.map { min(60, max(1, Int(ceil($0.retryAt - now)))) }.min() ?? (previewCursor == nil ? 30 : 1)
+            guard var preview = jobs.first(where: { $0.retryAt <= now.timeIntervalSince1970 }) else {
+                if previewDiscoveryRetry == nil, previewCursor != nil || previewDiscoveryNeeded { return .ready }
+                let uploadRetry = jobs.map { Date(timeIntervalSince1970: $0.retryAt) }.min()
+                return [uploadRetry, previewDiscoveryRetry].compactMap { $0 }.min().map(CatalogWorkPump.Next.retry) ?? .idle
             }
             attempted = preview
             let candidate = preview.candidate!
@@ -1624,40 +1819,47 @@ extension DeviceModel {
                 do {
                     let status: CatalogPreviewStatus = try await cloud.catalogRequest(CatalogContract.previewOperationsPath + preview.operationID, token: flight.token)
                     try current()
-                    if try handlePreviewStatus(status, preview: preview, binding: flight.binding, library: library) { return 1 }
-                } catch let error as CloudClient.CatalogHTTPError where error.status == 404 { }
+                    if try handlePreviewStatus(status, preview: preview, binding: flight.binding, library: library) { return .ready }
+                } catch let error as CloudClient.CatalogHTTPError where error.status == 404 { try current() }
             }
             let bytes = try library.readCatalogPreview(preview, binding: flight.binding)
             preview.beginDigest = digest; try library.updateCatalogPreview(preview, binding: flight.binding); attempted = preview
             let begun: CatalogPreviewStatus = try await cloud.catalogRequest(CatalogContract.previewBeginPath, method: "POST", bytes: CatalogContract.canonical(begin), token: flight.token)
             try current()
-            if try handlePreviewStatus(begun, preview: preview, binding: flight.binding, library: library) { return 1 }
+            if try handlePreviewStatus(begun, preview: preview, binding: flight.binding, library: library) { return .ready }
             guard let upload = begun.uploadID, upload.range(of: "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$", options: .regularExpression) != nil else { throw DeviceError.message("Cloud did not confirm the screenshot upload.") }
             let uploaded: CatalogPreviewStatus = try await cloud.catalogRequest(CatalogContract.previewUploadsPath + upload + "/image", method: "PUT", bytes: bytes, token: flight.token, image: true)
             try current()
-            if try handlePreviewStatus(uploaded, preview: preview, binding: flight.binding, library: library) { return 1 }
+            if try handlePreviewStatus(uploaded, preview: preview, binding: flight.binding, library: library) { return .ready }
             let completed: CatalogPreviewStatus = try await cloud.catalogRequest(CatalogContract.previewUploadsPath + upload + "/complete", method: "POST", bytes: CatalogContract.canonical(CatalogCompleteBackup(operationID: preview.operationID)), token: flight.token)
             try current()
             guard try handlePreviewStatus(completed, preview: preview, binding: flight.binding, library: library) else { throw DeviceError.message("Screenshot publication will retry.") }
-            catalogPreviewStatus = nil; return 1
-        } catch {
-            guard catalogFlight == flight, !Task.isCancelled else { return 60 }
+            catalogPreviewStatus = nil; return .ready
+        } catch is CancellationError { return .idle }
+        catch {
+            guard catalogFlight == flight, !Task.isCancelled else { return .idle }
             if let detail = error as? CloudClient.CatalogHTTPError, detail.status == 401 || detail.code == "unauthorized" {
                 try? library.pauseCatalogAuthentication(binding: flight.binding)
                 previewCaptureFlight = nil
+                return .idle
             }
             if let preview = attempted, let detail = error as? CloudClient.CatalogHTTPError, detail.code == "deleted" {
                 try? library.acknowledgeCatalogPreview(preview, binding: flight.binding)
-                return 1
+                return .ready
             }
             if var preview = attempted {
                 preview.attempts = min(16, preview.attempts + 1)
                 let delay = max((error as? CloudClient.CatalogHTTPError)?.retryAfterSeconds ?? 0, Int(min(3600, pow(2, Double(min(12, preview.attempts)))) * Double.random(in: 0.75...1.25)))
                 preview.retryAt = Date().timeIntervalSince1970 + Double(max(2, delay))
-                try? library.updateCatalogPreview(preview, binding: flight.binding)
+                do { try library.updateCatalogPreview(preview, binding: flight.binding) }
+                catch { return .retry(Date().addingTimeInterval(Double(max(2, delay)))) }
+            } else if discover {
+                if previewCursor == nil { previewDiscoveryNeeded = true }
+                let delay = max(30, (error as? CloudClient.CatalogHTTPError)?.retryAfterSeconds ?? 0)
+                previewDiscoveryRetry = Date().addingTimeInterval(Double(delay))
             }
             catalogPreviewStatus = "Screenshot upload will retry. Completed screen backups are unaffected."
-            return 30
+            return .ready
         }
     }
     private func handlePreviewStatus(_ status: CatalogPreviewStatus, preview: ScreenLibrary.CatalogCapturedPreview, binding: ScreenLibrary.CatalogBinding, library: ScreenLibrary) throws -> Bool {
