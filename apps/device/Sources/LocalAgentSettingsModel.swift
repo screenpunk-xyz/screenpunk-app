@@ -148,18 +148,22 @@ import ScreenpunkLocalTransport
                 }
             }
             defer { progress.cancel() }
+            let setupCandidate = isSetup ? candidate : nil
             let receipt: LocalAgentTestReceipt
             do {
                 if isSetup {
-                    guard let candidate else { throw DeviceError.message("Scan or import this Mac’s connection code first.") }
-                    receipt = try await transport.testConnection(configuration: candidate.configuration)
+                    guard let setupCandidate else { throw DeviceError.message("Scan or import this Mac’s connection code first.") }
+                    receipt = try await transport.testConnection(configuration: setupCandidate.configuration)
                 } else { receipt = try await transport.testConnection() }
                 await transport.disconnect()
             } catch { await transport.disconnect(); throw error }
+            try Task.checkCancellation()
             guard profileID() == id else { throw DeviceError.message("The current connection changed. Review this setup again before connecting.") }
-            if isSetup {
-                guard let candidate else { throw DeviceError.message("The pending connection changed. Scan its code again.") }
-                let committed = try pairing.commit(importID: candidate.id, replyDigest: candidate.replyDigest, now: Self.now, credentials: vault)
+            if let setupCandidate {
+                guard candidate?.id == setupCandidate.id, candidate?.replyDigest == setupCandidate.replyDigest else {
+                    throw DeviceError.message("The pending connection changed. Scan its code again.")
+                }
+                let committed = try pairing.commit(importID: setupCandidate.id, replyDigest: setupCandidate.replyDigest, now: Self.now, credentials: vault)
                 try configurations.markSuccessfulConnection(configurationID: committed.id, at: receipt.testedAt)
                 self.candidate = nil; pendingRequest = nil; removeShareFile()
             }

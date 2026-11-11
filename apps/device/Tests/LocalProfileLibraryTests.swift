@@ -139,4 +139,36 @@ final class LocalProfileLibraryTests: XCTestCase {
         XCTAssertTrue(account.state.screens.isEmpty); XCTAssertNil(account.selected)
         XCTAssertEqual(try ScreenLibrary(profile: profile(), rootDirectory: first).selected?.id, "stable-screen")
     }
+
+    @MainActor func testDeleteOnlyRemovesTheMatchingAccountsLibraryAndAssets() throws {
+        let root = directory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        var linked = profile()
+        linked.cloudBinding = .init(accountID: "A", profileID: "cloud-A", deviceID: "device-A")
+        let target = root.appendingPathComponent(Data(linked.libraryOwner.utf8).base64EncodedString())
+        let other = root.appendingPathComponent(Data("B".utf8).base64EncodedString())
+        let screen = ScreenArtifact(title: "Saved", files: [.init(path: "index.html", content: "<html><body>Saved screen</body></html>")])
+        try ScreenLibrary(profile: linked, rootDirectory: target).install(screen, requestID: "a", replacing: "screen-a")
+        try ScreenLibrary(accountID: "B", rootDirectory: other).install(screen, requestID: "b", replacing: "screen-b")
+
+        XCTAssertThrowsError(try ScreenLibrary.deleteAccountScreens(accountID: "B", profile: linked, librariesDirectory: root))
+        XCTAssertEqual(try ScreenLibrary(profile: linked, rootDirectory: target).selected?.id, "screen-a")
+        try ScreenLibrary.deleteAccountScreens(accountID: "A", profile: linked, librariesDirectory: root)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+        try ScreenLibrary.deleteAccountScreens(accountID: "A", profile: linked, librariesDirectory: root)
+        XCTAssertTrue(try ScreenLibrary(profile: linked, rootDirectory: target).state.screens.isEmpty)
+        XCTAssertEqual(try ScreenLibrary(accountID: "B", rootDirectory: other).selected?.id, "screen-b")
+    }
+
+    @MainActor func testLibraryDoesNotReopenFilesFromAnInterruptedDelete() throws {
+        let parent = directory()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let root = parent.appendingPathComponent("account")
+        let discarded = parent.appendingPathComponent(".discarded-account")
+        let screen = ScreenArtifact(title: "Deleted", files: [.init(path: "index.html", content: "<html><body>Old screen</body></html>")])
+        try ScreenLibrary(accountID: "A", rootDirectory: root).install(screen, requestID: "old", replacing: "old")
+        try FileManager.default.moveItem(at: root, to: discarded)
+        XCTAssertTrue(try ScreenLibrary(accountID: "A", rootDirectory: root).state.screens.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: discarded.path))
+    }
 }

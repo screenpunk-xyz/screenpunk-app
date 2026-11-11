@@ -10,7 +10,64 @@ import AppKit
 #endif
 
 #if os(iOS)
+/// A weak handle to the visible dashboard. The caller owns any in-memory snapshot.
+public final class DashboardSnapshotSource {
+    private weak var view: WKWebView?
+    private var rendererID: String?
+    private var capturing = false
+
+    public init() {}
+
+    @MainActor fileprivate func attach(_ view: WKWebView, rendererID: String) {
+        self.view = view
+        self.rendererID = rendererID
+    }
+
+    @MainActor public func snapshot(rendererID: String) async -> UIImage? {
+        guard !Task.isCancelled, !capturing, rendererID == self.rendererID,
+              let view, let window = view.window else { return nil }
+        let bounds = view.bounds
+        guard bounds.width > 0, bounds.height > 0 else { return nil }
+
+        let configuration = WKSnapshotConfiguration()
+        configuration.rect = bounds
+        configuration.afterScreenUpdates = false
+        // Bound the longest bitmap dimension, including the screen's pixel scale.
+        let pixelBudget = 1400 / window.screen.scale
+        configuration.snapshotWidth = NSNumber(value: Double(min(bounds.width,
+            pixelBudget * bounds.width / max(bounds.width, bounds.height))))
+
+        capturing = true
+        defer { capturing = false }
+        let image = try? await view.takeSnapshot(configuration: configuration)
+        guard !Task.isCancelled, view === self.view, rendererID == self.rendererID else { return nil }
+        return image
+    }
+}
+
+public struct DashboardSnapshotRegistration {
+    public let source: DashboardSnapshotSource
+    public let rendererID: String
+
+    public init(source: DashboardSnapshotSource, rendererID: String) {
+        self.source = source
+        self.rendererID = rendererID
+    }
+}
+
+private struct DashboardSnapshotKey: EnvironmentKey {
+    static let defaultValue: DashboardSnapshotRegistration? = nil
+}
+
+public extension EnvironmentValues {
+    var dashboardSnapshotRegistration: DashboardSnapshotRegistration? {
+        get { self[DashboardSnapshotKey.self] }
+        set { self[DashboardSnapshotKey.self] = newValue }
+    }
+}
+
 public struct DashboardWebView: UIViewRepresentable {
+    @Environment(\.dashboardSnapshotRegistration) private var snapshotRegistration
     public var store: PackageAssetStore
     public var onReady: () -> Void
     public var onUnlinkHold: () -> Void
@@ -41,14 +98,23 @@ public struct DashboardWebView: UIViewRepresentable {
     }
 
     public func makeUIView(context: Context) -> WKWebView {
-        context.coordinator.makeWebView()
+        let view = context.coordinator.makeWebView()
+        registerSnapshotView(view)
+        return view
     }
 
     public static func dismantleUIView(_ view: WKWebView, coordinator: DashboardWebCoordinator) { coordinator.stop() }
 
     public func updateUIView(_ uiView: WKWebView, context: Context) {
+        registerSnapshotView(uiView)
         context.coordinator.onUnlinkHold = onUnlinkHold
         context.coordinator.update(settings: settings, active: active, onSettingsApplied: onSettingsApplied)
+    }
+
+    @MainActor private func registerSnapshotView(_ view: WKWebView) {
+        if let snapshotRegistration {
+            snapshotRegistration.source.attach(view, rendererID: snapshotRegistration.rendererID)
+        }
     }
 }
 

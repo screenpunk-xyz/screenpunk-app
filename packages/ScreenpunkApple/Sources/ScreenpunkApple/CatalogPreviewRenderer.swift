@@ -25,6 +25,7 @@ import UniformTypeIdentifiers
     private enum Failure: Error { case unavailable, timeout, invalidPackage, oversized, cancelled }
 
     public func capture(package: CatalogPackage, packageDigest: String, byteLimit: Int = 512 * 1024, dimensionLimit: Int = 2048) async throws -> Snapshot {
+        try Task.checkCancellation()
         guard webView == nil, byteLimit > 0, byteLimit <= CatalogContract.previewBytes,
               dimensionLimit > 0, dimensionLimit <= CatalogContract.previewDimension,
               CatalogContract.digest(try CatalogContract.encodePackage(package)) == packageDigest else { throw Failure.invalidPackage }
@@ -180,14 +181,14 @@ import UniformTypeIdentifiers
         register(view: view, revision: old.revision, assets: old.assets, context: old.context, active: old.active)
     }
     public func navigationFinished(view: WKWebView) {
-        guard let current = entry, current.view === view else { return }
+        guard let current = entry, current.view === view, current.context != nil else { return }
         let generation = current.generation
         readinessTask?.cancel()
         readinessTask = Task { [weak self, weak view] in
             for _ in 0..<30 {
                 guard let self, let view, self.entry?.generation == generation, self.entry?.active == true, !Task.isCancelled else { return }
                 if (try? await Self.isReady(view)) == true {
-                    guard self.entry?.generation == generation, self.entry?.active == true else { return }
+                    guard self.entry?.generation == generation, self.entry?.active == true, !Task.isCancelled else { return }
                     self.onReady?(current.revision); return
                 }
                 do { try await Task.sleep(nanoseconds: 1_000_000_000) } catch { return }
@@ -199,7 +200,7 @@ import UniformTypeIdentifiers
               CatalogPreviewCapturePolicy.allows(proof(current), scope: context, revision: revision, generation: current.generation, package: package, packageDigest: packageDigest),
               try await Self.isReady(view) else { throw CaptureError.notReady }
         let generation = current.generation
-        guard entry?.generation == generation, entry?.context == context, entry?.revision == revision, entry?.active == true else { throw CaptureError.changed }
+        guard entry?.generation == generation, entry?.context == context, entry?.revision == revision, entry?.active == true, !Task.isCancelled else { throw CaptureError.changed }
         let config = WKSnapshotConfiguration(); config.rect = view.bounds
         guard config.rect.width > 0, config.rect.height > 0 else { throw CaptureError.notReady }
         config.snapshotWidth = 1024; config.afterScreenUpdates = true

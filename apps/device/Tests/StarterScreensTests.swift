@@ -8,7 +8,7 @@ final class StarterScreensTests: XCTestCase {
     @MainActor func testOnlySelectedWeatherAndNASAResourcesAreValidEditablePackages() throws {
         let templates = try StarterScreens.templates()
         XCTAssertEqual(templates.map(\.id), ["starter-weather", "starter-nasa"])
-        XCTAssertEqual(templates.map { $0.artifact.title }, ["Ann Arbor Weather", "NASA — A wider view"])
+        XCTAssertEqual(templates.map { $0.artifact.title }, ["Weather", "NASA — A wider view"])
         for template in templates {
             try ScreenLibrary.validate(template.artifact)
             let file = try XCTUnwrap(template.artifact.files.first { $0.path == "manifest.json" })

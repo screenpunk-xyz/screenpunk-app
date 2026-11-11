@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import MapKit
 import ScreenpunkCore
 
 /// Recognizers live on the parent hosting view so one-finger web content stays interactive.
@@ -7,7 +8,14 @@ struct DeviceGestures: UIViewRepresentable {
     var began: () -> Void
     var ended: () -> Void
     var cancelled: () -> Void
-    var swipe: (Int) -> Void
+    var canSwipe: Bool
+    var pagePan: (PagePan) -> Void
+    enum PagePan {
+        case began(width: CGFloat)
+        case changed(translation: CGFloat)
+        case ended(translation: CGFloat, velocity: CGFloat)
+        case cancelled
+    }
     var settings: () -> Void
     func makeUIView(context: Context) -> GestureAnchor {
         let view = GestureAnchor(); view.isUserInteractionEnabled = false
@@ -25,6 +33,8 @@ struct DeviceGestures: UIViewRepresentable {
         var owner: DeviceGestures
         weak var parent: UIView?
         var recognizers: [UIGestureRecognizer] = []
+        private weak var pageGesture: UIPanGestureRecognizer?
+        private var paging = false
         init(_ owner: DeviceGestures) { self.owner = owner }
         func attach(to view: UIView) {
             guard parent !== view else { return }; detach(); parent = view
@@ -32,26 +42,61 @@ struct DeviceGestures: UIViewRepresentable {
             talk.numberOfTouchesRequired = 3; talk.minimumPressDuration = 0.3; talk.allowableMovement = 80
             let menu = UILongPressGestureRecognizer(target: self, action: #selector(menu(_:)))
             menu.numberOfTouchesRequired = UnlinkGestureSpec.fingers; menu.minimumPressDuration = TimeInterval(UnlinkGestureSpec.holdSeconds)
-            // Keep tracking both fingers even while the underlying page pans.
-            menu.allowableMovement = .greatestFiniteMagnitude
+            menu.allowableMovement = 32
             menu.cancelsTouchesInView = false
-            let left = UISwipeGestureRecognizer(target: self, action: #selector(page(_:))); left.direction = .left; left.numberOfTouchesRequired = 2
-            let right = UISwipeGestureRecognizer(target: self, action: #selector(page(_:))); right.direction = .right; right.numberOfTouchesRequired = 2
-            recognizers = [talk, menu, left, right]
+            let page = UIPanGestureRecognizer(target: self, action: #selector(page(_:)))
+            page.minimumNumberOfTouches = 2
+            page.maximumNumberOfTouches = 2
+            page.cancelsTouchesInView = false
+            pageGesture = page
+            recognizers = [talk, menu, page]
             recognizers.forEach { $0.delegate = self; view.addGestureRecognizer($0) }
         }
         func detach() { recognizers.forEach { parent?.removeGestureRecognizer($0) }; recognizers = []; parent = nil }
+        func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+            guard let pan = pageGesture, gestureRecognizer === pan else { return true }
+            let velocity = pan.velocity(in: parent)
+            return owner.canSwipe && abs(velocity.x) > abs(velocity.y) * 1.25
+        }
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
             // Reject at touch begin, rather than checking visibility when the
             // action fires: dismissal can remove the status card mid-gesture.
-            !DeviceStatusInteractionRegions.contains(touch)
+            guard !DeviceStatusInteractionRegions.contains(touch) else { return false }
+            if let pageGesture, gestureRecognizer === pageGesture {
+                var hit = touch.view
+                while let view = hit {
+                    if view is MKMapView { return false }
+                    hit = view.superview
+                }
+            }
+            return true
         }
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool { true }
         @objc func talk(_ gesture: UILongPressGestureRecognizer) {
             switch gesture.state { case .began: owner.began(); case .ended: owner.ended(); case .cancelled, .failed: owner.cancelled(); default: break }
         }
-        @objc func menu(_ gesture: UILongPressGestureRecognizer) { if gesture.state == .began { owner.settings() } }
-        @objc func page(_ gesture: UISwipeGestureRecognizer) { if gesture.state == .ended { owner.swipe(gesture.direction == .left ? 1 : -1) } }
+        @objc func menu(_ gesture: UILongPressGestureRecognizer) {
+            if gesture.state == .began && !paging { owner.settings() }
+        }
+        @objc func page(_ gesture: UIPanGestureRecognizer) {
+            guard let parent else { return }
+            let translation = gesture.translation(in: parent).x
+            switch gesture.state {
+            case .began:
+                paging = true
+                owner.pagePan(.began(width: parent.bounds.width))
+                owner.pagePan(.changed(translation: translation))
+            case .changed:
+                owner.pagePan(.changed(translation: translation))
+            case .ended:
+                paging = false
+                owner.pagePan(.ended(translation: translation, velocity: gesture.velocity(in: parent).x))
+            case .cancelled, .failed:
+                paging = false
+                owner.pagePan(.cancelled)
+            default: break
+            }
+        }
     }
 }
 

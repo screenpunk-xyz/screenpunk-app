@@ -28,14 +28,9 @@ public struct CloudOriginScope: Equatable, Sendable {
         permitsLegacyMigration ? serverUserID : "cloud-origin:" + AuthoringContract.contentDigest(Data((canonicalOrigin + "\n" + serverUserID).utf8))
     }
 
-    /// Restoring a session must also restore its Cloud library after an origin/account
-    /// switch. Libraries explicitly selected for Local use remain available locally.
+    /// A saved session always selects its own Cloud library, independent of agent route.
     public func shouldRestoreAccountProfile(activeProfile: LocalProfileDescriptor?, serverUserID: String) -> Bool {
-        guard let activeProfile else { return true }
-        if activeProfile.routePreference == .local { return false }
-        if activeProfile.cloudBinding == nil, activeProfile.libraryOwner.hasPrefix("local:") { return false }
-        let activeAccountID = activeProfile.cloudBinding?.accountID ?? activeProfile.libraryOwner
-        return activeAccountID != localAccountID(serverUserID: serverUserID)
+        activeProfile?.cloudAccountID != localAccountID(serverUserID: serverUserID)
     }
 
     private static func encode(_ value: String) -> String {

@@ -7,6 +7,10 @@ typealias ScreenArtifact = AuthoringScreen
 enum DeviceError: LocalizedError {
     case message(String)
     case http(Int, String)
+    var authorizationRejected: Bool {
+        if case .http(401, _) = self { return true }
+        return false
+    }
     var errorDescription: String? {
         switch self {
         case .message(let value), .http(_, let value): return value
@@ -33,16 +37,88 @@ struct CloudListenerObservation {
     let deviceID: String
     let profileID: String?
     let ready: Bool?
-    let checkedAt: Date
-    static func status(_ observation: Self?, accountID: String?, deviceID: String?, profileID: String?, now: Date = Date()) -> Status {
+    let pluginConnected: Bool?
+
+    init(accountID: String, deviceID: String, profileID: String?, ready: Bool?, pluginConnected: Bool? = nil) {
+        self.accountID = accountID
+        self.deviceID = deviceID
+        self.profileID = profileID
+        self.ready = ready
+        self.pluginConnected = pluginConnected
+    }
+
+    var canCompleteCloudSetup: Bool {
+        ready == true && pluginConnected != false
+    }
+
+    func matches(accountID: String?, deviceID: String?, profileID: String?) -> Bool {
+        guard self.accountID == accountID, self.deviceID == deviceID,
+              let observedProfile = self.profileID, !observedProfile.isEmpty else { return false }
+        return profileID == nil || profileID == observedProfile
+    }
+
+    func pluginConnection(accountID: String?, deviceID: String?, profileID: String?) -> Bool? {
+        guard matches(accountID: accountID, deviceID: deviceID, profileID: profileID) else { return nil }
+        return pluginConnected
+    }
+
+    static func status(_ observation: Self?, accountID: String?, deviceID: String?, profileID: String?) -> Status {
         guard let accountID, let deviceID else { return .notSignedIn }
-        guard let observation, observation.accountID == accountID, observation.deviceID == deviceID,
-              now.timeIntervalSince(observation.checkedAt) >= 0,
-              now.timeIntervalSince(observation.checkedAt) < 30 else { return .unchecked }
-        guard let observedProfile = observation.profileID, !observedProfile.isEmpty,
-              profileID == nil || profileID == observedProfile,
+        guard let observation, observation.accountID == accountID, observation.deviceID == deviceID else { return .unchecked }
+        guard observation.matches(accountID: accountID, deviceID: deviceID, profileID: profileID),
               let ready = observation.ready else { return .unavailable }
         return ready ? .connected : .waiting
+    }
+}
+
+/// Status reads can overlap. The newest published read wins even if an older
+/// request returns later, and only socket-owned observations expire on disconnect.
+struct CloudListenerObservations {
+    enum Source { case direct, socket }
+
+    private(set) var observation: CloudListenerObservation?
+    private var source: Source?
+    private var publishedRead: UInt64 = 0
+
+    @discardableResult
+    mutating func publish(_ observation: CloudListenerObservation, source: Source, read: UInt64) -> Bool {
+        guard read >= publishedRead else { return false }
+        if source == .socket, observation.ready == nil, self.source == .direct { return false }
+        self.observation = observation
+        self.source = source
+        publishedRead = read
+        return true
+    }
+
+    mutating func clearSocket() {
+        if source == .socket { clear() }
+    }
+
+    mutating func clear() {
+        observation = nil
+        source = nil
+    }
+}
+
+/// Socket messages are invalidations only. Unknown or incomplete frames cannot
+/// wake an account sync, and durable values always come from authenticated HTTP.
+enum DeviceCloudNotice: Equatable {
+    case statusChanged
+    case preferenceUpdated(profileID: String)
+    case catalogUpdated
+
+    private struct Wire: Decodable { let type: String; let profileID: String? }
+
+    static func decode(_ data: Data) -> Self? {
+        guard data.count <= 4096, let wire = try? JSONDecoder().decode(Wire.self, from: data) else { return nil }
+        switch wire.type {
+        case "status_changed": return .statusChanged
+        case "preference.updated":
+            guard let profileID = wire.profileID, !profileID.isEmpty else { return nil }
+            return .preferenceUpdated(profileID: profileID)
+        case "catalog.updated": return .catalogUpdated
+        default: return nil
+        }
     }
 }
 
@@ -216,5 +292,85 @@ extension AgentRequestV2 {
         if ["failed", "cancelled", "timed_out"].contains(status) { return .ended(status: status, message: failure) }
         if status == "pending", let deadlineAt, now >= deadlineAt { return .ended(status: "timed_out", message: nil) }
         return .pending(.init(status: status, caption: progress?.caption, updatedAt: progress?.updatedAt ?? createdAt, deadlineAt: deadlineAt))
+    }
+}
+
+/// Coalesces work arriving during a pass and wakes once at a retry deadline.
+@MainActor
+final class CatalogWorkPump {
+    enum Next {
+        case idle
+        case ready
+        case retry(Date)
+    }
+
+    private var worker: Task<Void, Never>?
+    private var timer: Task<Void, Never>?
+    private var pending = false
+
+    func request(_ step: @escaping @MainActor () async -> Next) {
+        timer?.cancel()
+        timer = nil
+        pending = true
+        guard worker == nil else { return }
+        worker = Task { [weak self] in
+            while let self, !Task.isCancelled {
+                self.pending = false
+                let next = await step()
+                guard !Task.isCancelled else { return }
+                if self.pending { continue }
+                switch next {
+                case .ready: continue
+                case .idle:
+                    self.worker = nil
+                    return
+                case .retry(let deadline):
+                    self.worker = nil
+                    self.timer = Task { [weak self] in
+                        do {
+                            try await Task.sleep(for: .seconds(max(0, deadline.timeIntervalSinceNow)))
+                        } catch { return }
+                        guard !Task.isCancelled else { return }
+                        self?.request(step)
+                    }
+                    return
+                }
+            }
+        }
+    }
+
+    func cancel() {
+        worker?.cancel()
+        worker = nil
+        timer?.cancel()
+        timer = nil
+        pending = false
+    }
+}
+
+/// Request-local silence timer, reset before a new preflight becomes visible.
+struct RequestProgressTiming {
+    var lastProgressAt: Date = Date()
+    var warningDismissedAt: Date = .distantPast
+
+    mutating func begin(at now: Date) {
+        lastProgressAt = now
+        warningDismissedAt = .distantPast
+    }
+    func isTakingLonger(at now: Date) -> Bool {
+        now.timeIntervalSince(max(lastProgressAt, warningDismissedAt)) >= 60
+    }
+}
+
+/// A valid pending Cloud response is a successful read: await the next push.
+/// The existing Local adapter has no device wake callback and still needs its
+/// bounded reconciliation fallback until that separate transport gains one.
+enum AuthoringRefreshPolicy {
+    static func reconciliationSucceeded(_ delivery: AuthoringDeliveryStateV2, route: String) -> Bool {
+        switch delivery {
+        case .pending: return route == "cloud"
+        case .completed, .ended: return true
+        case .deliveryUncertain, .needsAttention: return false
+        }
     }
 }

@@ -30,6 +30,7 @@ public struct LocalProfileDescriptor: Codable, Equatable, Sendable, Identifiable
     }
     public var authoringProfileID: String { cloudBinding?.profileID ?? id }
     public var authoringDeviceID: String { cloudBinding?.deviceID ?? localDeviceID }
+    public var cloudAccountID: String? { cloudBinding?.accountID ?? (libraryOwner.hasPrefix("local:") ? nil : libraryOwner) }
 }
 public struct LocalProfileState: Codable, Equatable, Sendable {
     public var installationID: String
@@ -69,13 +70,28 @@ public final class LocalProfileRepository: @unchecked Sendable {
             state.activeProfileID = id; try file.save(state)
         }
     }
+    /// Opens the standalone library while signed out and leaves account libraries on disk.
+    public func activateLocalProfile() throws -> LocalProfileDescriptor {
+        try lock.locallyLocked {
+            var state = try load()
+            if let active = state.activeProfile, active.cloudAccountID == nil { return active }
+            guard let local = state.profiles.first(where: { $0.cloudAccountID == nil }) else { return try createLocalProfile() }
+            state.activeProfileID = local.id
+            try file.save(state)
+            return local
+        }
+    }
+    public func accountProfile(accountID: String) throws -> LocalProfileDescriptor? {
+        try lock.locallyLocked { try load().profiles.first { $0.cloudAccountID == accountID } }
+    }
     /// Opens a known signed-in legacy account library even before profile enrollment is reachable.
     @discardableResult public func activateAccountProfile(accountID: String, deviceID: String) throws -> LocalProfileDescriptor {
         try lock.locallyLocked {
             guard !accountID.isEmpty, !deviceID.isEmpty, !accountID.hasPrefix("local:") else { throw LocalPersistenceError.invalid("The existing account identity is incomplete.") }
             var state = try load()
-            if let existing = state.profiles.first(where: { $0.cloudBinding?.accountID == accountID || ($0.libraryOwner == accountID && $0.permissionOwner == accountID) }) {
-                state.activeProfileID = existing.id; try file.save(state); return existing
+            if let existing = state.profiles.first(where: { $0.cloudAccountID == accountID }) {
+                if state.activeProfileID != existing.id { state.activeProfileID = existing.id; try file.save(state) }
+                return existing
             }
             let profile = LocalProfileDescriptor(id: UUID().uuidString, libraryOwner: accountID, permissionOwner: accountID, localDeviceID: deviceID, preferredRoute: .cloud, routePreference: .automatic)
             state.profiles.append(profile); state.activeProfileID = profile.id; try file.save(state); return profile
@@ -120,7 +136,7 @@ public final class LocalProfileRepository: @unchecked Sendable {
             let state = try load()
             guard let profile = state.profiles.first(where: { $0.id == profileID }), !binding.accountID.isEmpty, !binding.profileID.isEmpty, !binding.deviceID.isEmpty else { throw LocalPersistenceError.invalid("The local or Cloud profile is incomplete.") }
             guard profile.cloudBinding == nil || profile.cloudBinding == binding,
-                  !state.profiles.contains(where: { $0.id != profileID && ($0.cloudBinding?.accountID == binding.accountID || ($0.libraryOwner == binding.accountID && $0.permissionOwner == binding.accountID)) }) else { throw LocalPersistenceError.conflict("An existing account library cannot be merged automatically. Choose that account library instead.") }
+                  !state.profiles.contains(where: { $0.id != profileID && $0.cloudAccountID == binding.accountID }) else { throw LocalPersistenceError.conflict("An existing account library cannot be merged automatically. Sign in to that account to open its library.") }
         }
     }
     /// Adopt only the descriptor committed alongside preferences by ScreenLibrary.linkLocalProfile.
@@ -137,10 +153,6 @@ public final class LocalProfileRepository: @unchecked Sendable {
         }
     }
     public func signOut() throws {
-        try lock.locallyLocked {
-            var state = try load()
-            if let index = state.profiles.firstIndex(where: { $0.id == state.activeProfileID }) { state.profiles[index].preferredRoute = .local; if state.profiles[index].routePreference == .cloud { state.profiles[index].routePreference = .local } }
-            try file.save(state)
-        }
+        _ = try activateLocalProfile()
     }
 }
