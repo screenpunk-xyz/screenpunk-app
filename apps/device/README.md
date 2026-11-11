@@ -23,6 +23,8 @@ Real Apple and Google sign-in, speech permissions, three-finger gesture behavior
 
 Billing reflects the signed-in account on the selected Cloud origin. Purchases require sales to be enabled for that origin and the product to be available from the App Store. Cloud backups require an eligible account and user opt-in.
 
+Google Calendar uses a separate native Google iOS OAuth client for the app’s bundle identifier. Official signed releases supply `SCREENPUNK_GOOGLE_CALENDAR_CLIENT_ID` and `SCREENPUNK_GOOGLE_CALENDAR_CALLBACK_SCHEME` from the reviewed release selection; the callback scheme is the client ID’s dot-separated components in reverse order. Release validation checks both the archived and exported app. Forks can supply their own values using the example in `config/Fork.xcconfig.example`. Without them, Calendar sign-in stays disabled. No Google client secret belongs in the app.
+
 Do not check in provisioning profiles, signing keys, bearer tokens, or generated build output.
 
 ## Shared authoring v1 (Phase 1)
