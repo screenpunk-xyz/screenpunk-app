@@ -1771,9 +1771,11 @@ private struct RecordingRippleSurface: UIViewRepresentable {
                     let phase = completed.status == .completed ? "first frame completed" : "first frame failed"
                     RecordingRippleDiagnostics.event(phase, since: started, token: token)
                 }
+                #if !targetEnvironment(simulator)
                 drawable.addPresentedHandler { _ in
                     RecordingRippleDiagnostics.event("first frame presented", since: started, token: token)
                 }
+                #endif
             }
             #endif
             command.present(drawable)
