@@ -2,7 +2,8 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>ScreenpunkAPIOrigin</key><string>$(SCREENPUNK_API_ORIGIN)</string>
-<key>CFBundleURLTypes</key><array><dict><key>CFBundleURLSchemes</key><array><string>screenpunk-one</string></array></dict></array>
+<key>ScreenpunkGoogleCalendarClientID</key><string>$(SCREENPUNK_GOOGLE_CALENDAR_CLIENT_ID)</string>
+<key>CFBundleURLTypes</key><array><dict><key>CFBundleURLSchemes</key><array><string>screenpunk-one</string></array></dict><dict><key>CFBundleURLSchemes</key><array><string>$(SCREENPUNK_GOOGLE_CALENDAR_CALLBACK_SCHEME)</string></array></dict></array>
 <key>NSCameraUsageDescription</key><string>Scan connection codes for your computer and Home Assistant. Codes are processed on this device.</string>
 <key>NSMicrophoneUsageDescription</key><string>Hold three fingers to speak instructions to your Screenpunk agent.</string>
 <key>NSSpeechRecognitionUsageDescription</key><string>Screenpunk transcribes your instructions so your agent can create and change screens. Speech may be processed by Apple when on-device recognition is unavailable.</string>

@@ -3,3 +3,8 @@ DEVELOPMENT_TEAM = YOURTEAMID
 PRODUCT_BUNDLE_IDENTIFIER = com.example.screenpunk
 // xcconfig URL slashes need an expansion to avoid comment parsing.
 SCREENPUNK_API_ORIGIN = https:/$()/your-server.example
+
+// Optional native Google Calendar OAuth: use your Google iOS client for this bundle.
+// Callback is the client ID components reversed (not the Cloud web OAuth callback).
+SCREENPUNK_GOOGLE_CALENDAR_CLIENT_ID = YOUR_IOS_CLIENT_ID.apps.googleusercontent.com
+SCREENPUNK_GOOGLE_CALENDAR_CALLBACK_SCHEME = com.googleusercontent.apps.YOUR_IOS_CLIENT_ID
