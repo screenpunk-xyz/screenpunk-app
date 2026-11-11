@@ -3297,7 +3297,7 @@
       "snapshotDigest": "dabad7a6461fb119dbd766d6e6698988c8cb214c88293ecb83679006fe32005f"
     },
     {
-      "name": "unavailable-calendar-config",
+      "name": "invalid-calendar-config-state",
       "kind": "request",
       "path": [
         "services",
@@ -3305,8 +3305,8 @@
         "configured",
         "state"
       ],
-      "value": "yes",
-      "snapshotDigest": "180469065e3d70c81fbecdc641301330259ae45de1240370ec0bccc5f37a8422"
+      "value": "ready",
+      "snapshotDigest": "6c1249fb4144250cfea272a96d8d0faa7ae611566405a7027559a07dcdb3d82d"
     },
     {
       "name": "future-capability",

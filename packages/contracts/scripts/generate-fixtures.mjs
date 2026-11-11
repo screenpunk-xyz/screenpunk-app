@@ -21,7 +21,7 @@ const invalidCases=[
 {name:'missing-required-nullable',kind:'request',path:['context','baseRevision'],remove:true},
 {name:'unsupported-runtime',kind:'request',path:['runtime','features',0],value:'arbitrarySocket'},
 {name:'unknown-provider',kind:'request',path:['services',0,'provider'],value:'invented'},
-{name:'unavailable-calendar-config',kind:'request',path:['services',2,'configured','state'],value:'yes'},
+{name:'invalid-calendar-config-state',kind:'request',path:['services',2,'configured','state'],value:'ready'},
 {name:'future-capability',kind:'request',path:['services',0,'reachable','observedAt'],value:time+1},
 {name:'credential-shaped-capability-extra',kind:'request',path:['services',0,'token'],value:'not-a-credential'},
 {name:'preference-target-mismatch',kind:'request',path:['preferences',0,'targetID'],value:'other-profile'},

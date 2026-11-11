@@ -120,7 +120,6 @@ export function validateAuthoringRequest(value: unknown): AuthoringRequestV1 {
     if (seen.has(service.id)) fail("duplicate service id"); seen.add(service.id);
     const catalog = AUTHORING_DEFINITION.serviceCatalog.find(x => x.provider === service.provider);
     if (!catalog || canonicalJSON(catalog.operations) !== canonicalJSON(service.operations)) fail("unsupported provider operation definitions");
-    if (service.provider === "googleCalendar" && service.configured.state !== "no") fail("Calendar OAuth configuration is unavailable in this build");
     for (const key of ["supported","configured","authorized","entitled","reachable"] as const) if (service[key].observedAt > request.createdAt) fail("capability observation is in the future");
   }
   const prefs = new Set<string>();
