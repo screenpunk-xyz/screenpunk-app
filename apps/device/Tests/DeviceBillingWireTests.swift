@@ -5,60 +5,115 @@ import XCTest
 
 final class DeviceBillingWireTests: XCTestCase {
 
-    func testTestCheckoutRequiresVerifiedSandboxForThisBundleAndCurrentSession() {
-        let bundleID = "xyz.screenpunk.ios"
-        XCTAssertTrue(DeviceTestCheckout.allows(verifiedEnvironment: .sandbox, verifiedBundleID: bundleID,
-                                                installedBundleID: bundleID, sessionIsCurrent: true))
-        for environment in [AppStore.Environment.production, .xcode] {
-            XCTAssertFalse(DeviceTestCheckout.allows(verifiedEnvironment: environment, verifiedBundleID: bundleID,
-                                                     installedBundleID: bundleID, sessionIsCurrent: true))
+    private let bundleID = "xyz.screenpunk.ios"
+    private struct AppUnavailable: Error {}
+
+    @MainActor func testTestCheckoutChecksVerifiedEvidenceWithoutRefresh() async {
+        let cases: [(DeviceTestCheckout.Evidence, DeviceTestCheckout.Outcome)] = [
+            (.verified(environment: .sandbox, bundleID: bundleID), .allowed),
+            (.verified(environment: .production, bundleID: bundleID), .production),
+            (.verified(environment: .xcode, bundleID: bundleID), .xcode),
+            (.verified(environment: .sandbox, bundleID: "xyz.other"), .bundleMismatch),
+        ]
+        for (evidence, expected) in cases {
+            let outcome = await DeviceTestCheckout.check(
+                installedBundleID: bundleID, loadApp: { evidence },
+                refreshApp: { XCTFail("A verified transaction must not be refreshed"); return .unverified },
+                sessionIsCurrent: { true }
+            )
+            XCTAssertEqual(outcome, expected)
         }
-        // A failed or unverified AppTransaction provides no trusted environment or bundle ID.
-        XCTAssertFalse(DeviceTestCheckout.allows(verifiedEnvironment: nil, verifiedBundleID: nil,
-                                                 installedBundleID: bundleID, sessionIsCurrent: true))
-        XCTAssertFalse(DeviceTestCheckout.allows(verifiedEnvironment: .sandbox, verifiedBundleID: "xyz.other",
-                                                 installedBundleID: bundleID, sessionIsCurrent: true))
-        XCTAssertFalse(DeviceTestCheckout.allows(verifiedEnvironment: .sandbox, verifiedBundleID: bundleID,
-                                                 installedBundleID: nil, sessionIsCurrent: true))
-        XCTAssertFalse(DeviceTestCheckout.allows(verifiedEnvironment: .sandbox, verifiedBundleID: bundleID,
-                                                 installedBundleID: bundleID, sessionIsCurrent: false))
-    }
-    @MainActor func testTestCheckoutChecksSessionAfterAppVerificationSuspends() async {
-        let bundleID = "xyz.screenpunk.ios"
-        var currentSession = true
-        let authorized = await DeviceTestCheckout.check(
-            installedBundleID: bundleID,
-            loadVerifiedApp: {
-                await Task.yield()
-                currentSession = false
-                return (.sandbox, bundleID)
-            },
-            sessionIsCurrent: { currentSession }
-        )
-        XCTAssertFalse(authorized)
     }
 
-    @MainActor func testTestCheckoutRejectsThrowingAndCancelledAppVerification() async {
-        struct VerificationUnavailable: Error {}
-        let bundleID = "xyz.screenpunk.ios"
-        let unavailable = await DeviceTestCheckout.check(
-            installedBundleID: bundleID, loadVerifiedApp: { throw VerificationUnavailable() },
-            sessionIsCurrent: { true }
+    @MainActor func testTestCheckoutRefreshesOnceAfterRetrievalFailureOrUnverifiedEvidence() async {
+        let cases: [(DeviceTestCheckout.Evidence, DeviceTestCheckout.Outcome)] = [
+            (.verified(environment: .sandbox, bundleID: bundleID), .allowedAfterRefresh),
+            (.verified(environment: .production, bundleID: bundleID), .production),
+            (.verified(environment: .xcode, bundleID: bundleID), .xcode),
+            (.verified(environment: .sandbox, bundleID: "xyz.other"), .bundleMismatch),
+            (.unverified, .unverified),
+        ]
+        for sharedWasUnavailable in [true, false] {
+            for (evidence, expected) in cases {
+                var refreshes = 0
+                let outcome = await DeviceTestCheckout.check(
+                    installedBundleID: bundleID,
+                    loadApp: {
+                        if sharedWasUnavailable { throw AppUnavailable() }
+                        return .unverified
+                    },
+                    refreshApp: { refreshes += 1; return evidence }, sessionIsCurrent: { true }
+                )
+                XCTAssertEqual(outcome, expected)
+                XCTAssertEqual(refreshes, 1)
+            }
+        }
+        var refreshes = 0
+        let failure = await DeviceTestCheckout.check(
+            installedBundleID: bundleID, loadApp: { throw AppUnavailable() },
+            refreshApp: { refreshes += 1; throw AppUnavailable() }, sessionIsCurrent: { true }
         )
-        XCTAssertFalse(unavailable)
+        XCTAssertEqual(failure, .refreshFailed)
+        XCTAssertEqual(refreshes, 1)
+    }
 
-        let cancelled = await Task { @MainActor in
+    @MainActor func testTestCheckoutCancelsWithoutRetryingOrAcceptingLateSuccess() async {
+        let errors: [Error] = [
+            StoreKitError.userCancelled,
+            StoreKitError.systemError(CancellationError()),
+            StoreKitError.networkError(URLError(.cancelled)),
+            SKError(.paymentCancelled),
+        ]
+        for error in errors {
+            let outcome = await DeviceTestCheckout.check(
+                installedBundleID: bundleID, loadApp: { throw error },
+                refreshApp: { XCTFail("A cancelled retrieval must not be refreshed"); return .unverified },
+                sessionIsCurrent: { true }
+            )
+            XCTAssertEqual(outcome, .cancelled)
+        }
+
+        let cancelledRefresh = await DeviceTestCheckout.check(
+            installedBundleID: bundleID, loadApp: { throw AppUnavailable() },
+            refreshApp: { throw StoreKitError.userCancelled }, sessionIsCurrent: { true }
+        )
+        XCTAssertEqual(cancelledRefresh, .cancelled)
+
+        let cancelledTask = await Task { @MainActor in
             await DeviceTestCheckout.check(
-                installedBundleID: bundleID,
-                loadVerifiedApp: {
+                installedBundleID: bundleID, loadApp: { throw AppUnavailable() },
+                refreshApp: {
                     await Task.yield()
                     withUnsafeCurrentTask { $0?.cancel() }
-                    return (.sandbox, bundleID)
+                    return .verified(environment: .sandbox, bundleID: bundleID)
                 },
                 sessionIsCurrent: { true }
             )
         }.value
-        XCTAssertFalse(cancelled)
+        XCTAssertEqual(cancelledTask, .cancelled)
+    }
+
+    @MainActor func testTestCheckoutFencesSessionBeforeAndAfterRefresh() async {
+        var currentSession = true
+        let staleLoad = await DeviceTestCheckout.check(
+            installedBundleID: bundleID,
+            loadApp: { await Task.yield(); currentSession = false; throw AppUnavailable() },
+            refreshApp: { XCTFail("A stale checkout must not prompt"); return .unverified },
+            sessionIsCurrent: { currentSession }
+        )
+        XCTAssertEqual(staleLoad, .staleSession)
+
+        currentSession = true
+        let staleRefresh = await DeviceTestCheckout.check(
+            installedBundleID: bundleID, loadApp: { throw AppUnavailable() },
+            refreshApp: {
+                await Task.yield()
+                currentSession = false
+                return .verified(environment: .sandbox, bundleID: bundleID)
+            },
+            sessionIsCurrent: { currentSession }
+        )
+        XCTAssertEqual(staleRefresh, .staleSession)
     }
 
     func testCreditsPanelAndNewPurchasePolicyFollowVerifiedPlan() {

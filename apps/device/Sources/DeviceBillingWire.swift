@@ -4,26 +4,83 @@ import CryptoKit
 import StoreKit
 
 enum DeviceTestCheckout {
+    enum Evidence {
+        case verified(environment: AppStore.Environment, bundleID: String)
+        case unverified
+
+        init(_ result: VerificationResult<AppTransaction>) {
+            switch result {
+            case .verified(let app): self = .verified(environment: app.environment, bundleID: app.bundleID)
+            case .unverified: self = .unverified
+            }
+        }
+    }
+
+    enum Outcome: String {
+        case allowed, allowedAfterRefresh, cancelled, staleSession, refreshFailed, unverified, bundleMismatch
+        case production, xcode, unsupportedEnvironment
+    }
+
+    private static func isCancellation(_ error: Error) -> Bool {
+        if error is CancellationError { return true }
+        if let error = error as? StoreKitError {
+            switch error {
+            case .userCancelled: return true
+            case .networkError(let underlying): return underlying.code == .cancelled
+            case .systemError(let underlying): return isCancellation(underlying)
+            default: return false
+            }
+        }
+        if let error = error as? SKError { return error.code == .paymentCancelled }
+        return (error as? URLError)?.code == .cancelled
+    }
+
     @MainActor
     static func check(
         installedBundleID: String?,
-        loadVerifiedApp: () async throws -> (environment: AppStore.Environment, bundleID: String),
+        loadApp: () async throws -> Evidence,
+        refreshApp: () async throws -> Evidence,
         sessionIsCurrent: () -> Bool
-    ) async -> Bool {
-        let app = try? await loadVerifiedApp()
-        return allows(verifiedEnvironment: app?.environment, verifiedBundleID: app?.bundleID,
-                      installedBundleID: installedBundleID, sessionIsCurrent: sessionIsCurrent() && !Task.isCancelled)
-    }
+    ) async -> Outcome {
+        func interruption(_ error: Error? = nil) -> Outcome? {
+            if Task.isCancelled || error.map(isCancellation) == true { return .cancelled }
+            return sessionIsCurrent() ? nil : .staleSession
+        }
 
-    static func allows(
-        verifiedEnvironment: AppStore.Environment?,
-        verifiedBundleID: String?,
-        installedBundleID: String?,
-        sessionIsCurrent: Bool
-    ) -> Bool {
-        guard sessionIsCurrent, verifiedEnvironment == .sandbox,
-              let installedBundleID, !installedBundleID.isEmpty else { return false }
-        return verifiedBundleID == installedBundleID
+        guard let installedBundleID, !installedBundleID.isEmpty else { return .bundleMismatch }
+        if let interrupted = interruption() { return interrupted }
+        let shared: Evidence?
+        do {
+            shared = try await loadApp()
+        } catch {
+            if let interrupted = interruption(error) { return interrupted }
+            shared = nil
+        }
+        if let interrupted = interruption() { return interrupted }
+
+        let evidence: Evidence
+        let refreshed: Bool
+        if let shared, case .verified = shared {
+            evidence = shared
+            refreshed = false
+        } else {
+            // StoreKit may prompt for authentication. Only explicit checkout calls this check.
+            do {
+                evidence = try await refreshApp()
+                refreshed = true
+            } catch {
+                return interruption(error) ?? .refreshFailed
+            }
+        }
+        if let interrupted = interruption() { return interrupted }
+        guard case .verified(let environment, let bundleID) = evidence else { return .unverified }
+        guard bundleID == installedBundleID else { return .bundleMismatch }
+        switch environment {
+        case .sandbox: return refreshed ? .allowedAfterRefresh : .allowed
+        case .production: return .production
+        case .xcode: return .xcode
+        default: return .unsupportedEnvironment
+        }
     }
 }
 

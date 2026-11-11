@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import StoreKit
+import OSLog
 
 struct DeviceBillingSnapshot {
     struct Apple: Equatable {
@@ -470,16 +471,30 @@ final class DeviceBillingStore: ObservableObject {
 
         // Checkout is sandbox-only for this release. Enabling live sales requires
         // deliberate client and server policy changes for verified production purchases.
-        guard await DeviceTestCheckout.check(
+        let checkout = await DeviceTestCheckout.check(
             installedBundleID: Bundle.main.bundleIdentifier,
-            loadVerifiedApp: {
-                let verification = try await AppTransaction.shared
-                let app = try verification.payloadValue
-                return (app.environment, app.bundleID)
-            },
+            loadApp: { try await .init(AppTransaction.shared) },
+            refreshApp: { try await .init(AppTransaction.refresh()) },
             sessionIsCurrent: { self.isCurrent(cloud, session) }
-        ), isCurrent(cloud, session), !Task.isCancelled else {
-            currentNotice("Purchases require a verified Apple sandbox build.", cloud: cloud, session: session)
+        )
+        let logger = Logger(subsystem: "xyz.screenpunk.ios", category: "Billing")
+        logger.notice("Sandbox checkout app verification: \(checkout.rawValue, privacy: .public)")
+        guard isCurrent(cloud, session), !Task.isCancelled else { return }
+        let verificationNotice: String?
+        switch checkout {
+        case .allowed, .allowedAfterRefresh:
+            verificationNotice = nil
+        case .cancelled, .staleSession:
+            return
+        case .refreshFailed:
+            verificationNotice = "The App Store couldn’t verify this app right now. Try the purchase again."
+        case .unverified, .bundleMismatch:
+            verificationNotice = "The App Store couldn’t verify this copy of Screenpunk."
+        case .production, .xcode, .unsupportedEnvironment:
+            verificationNotice = "Test purchases are available in Apple’s sandbox environment."
+        }
+        if let verificationNotice {
+            currentNotice("\(verificationNotice) (\(checkout.rawValue))", cloud: cloud, session: session)
             return
         }
         do {
