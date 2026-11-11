@@ -21,10 +21,9 @@ final class LocalPersistenceTests: XCTestCase {
         let restart = try LocalProfileRepository(rootDirectory: root)
         XCTAssertEqual(try restart.snapshot().installationID, initial.installationID)
         XCTAssertEqual(try restart.snapshot().localDeviceID, initial.localDeviceID)
-        XCTAssertEqual(try restart.snapshot().activeProfile?.id, accountB.id)
-        XCTAssertEqual(try restart.snapshot().activeProfile?.preferredRoute, .local)
-        try restart.activateProfile(id: local.id)
         XCTAssertEqual(try restart.snapshot().activeProfile, local)
+        XCTAssertEqual(try restart.accountProfile(accountID: "B"), accountB)
+        XCTAssertEqual(try restart.activateAccountProfile(accountID: "B", deviceID: "cloud-device-B"), accountB)
         XCTAssertEqual(try restart.activateCloudProfile(accountID: "A", profileID: "cloud-profile-A", deviceID: "cloud-device-A").preferredRoute, .local)
         XCTAssertThrowsError(try restart.setPreferredRoute(.cloud, profileID: local.id))
         var illegal = local; illegal.cloudBinding = accountA.cloudBinding
@@ -150,5 +149,32 @@ final class LocalPersistenceTests: XCTestCase {
         try ledger.update(record); try ledger.compactSources()
         XCTAssertEqual(try ledger.record(requestID: "request")?.receipt, record.receipt)
         XCTAssertNil(try ledger.unresolvedRecord())
+    }
+
+    func testDiscardingAccountScreenResultsLeavesOtherProfilesAndFencesLateResults() throws {
+        let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
+        let ledger = try LocalDeliveryLedger(rootDirectory: root)
+        var other = binding()
+        other.requestID = "other-request"; other.profileID = "other-profile"
+        try ledger.prepare(other)
+        other.status = .submitting; try ledger.update(other)
+        other.status = .completed
+        other.finalResult = .init(requestID: other.requestID, inputDigest: other.inputDigest, baseRevision: other.baseRevision, preferenceRevisions: [:], operationID: "other-operation", answer: "Other screen")
+        try ledger.update(other)
+        other.status = .applied; try ledger.update(other)
+
+        var target = binding()
+        try ledger.prepare(target)
+        target.status = .submitting; try ledger.update(target)
+        target.status = .completed
+        target.finalResult = .init(requestID: target.requestID, inputDigest: target.inputDigest, baseRevision: target.baseRevision, preferenceRevisions: [:], operationID: "target-operation", answer: "Account screen")
+        try ledger.update(target)
+
+        try ledger.discardScreenResults(profileID: target.profileID)
+        let reopened = try LocalDeliveryLedger(rootDirectory: root)
+        XCTAssertEqual(try reopened.record(requestID: other.requestID)?.finalResult, other.finalResult)
+        XCTAssertNil(try reopened.record(requestID: target.requestID)?.finalResult)
+        XCTAssertEqual(try reopened.record(requestID: target.requestID)?.status, .cancelled)
+        XCTAssertThrowsError(try reopened.update(target))
     }
 }

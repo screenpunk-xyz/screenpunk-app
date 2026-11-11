@@ -5,29 +5,137 @@ import ScreenpunkCore
 
 /// One atomic metadata replacement commits an installation. Failed writes never replace the current screen.
 @MainActor final class ScreenLibrary {
+    static let instructionsID = "screenpunk.instructions"
+    enum Onboarding: String, Codable {
+        case connectAgent, gallery, complete
+
+        static func agentIsReady(route: AuthoringRoutePreference, verifiedLocal: Bool, cloudListenerConnected: Bool) -> Bool {
+            switch route {
+            case .local: return verifiedLocal
+            case .cloud: return cloudListenerConnected
+            case .automatic: return verifiedLocal || cloudListenerConnected
+            }
+        }
+    }
+    var needsAgentSetup: Bool { state.onboarding == .connectAgent }
+    var galleryIntroPending: Bool { state.onboarding == .gallery }
+    var temporaryActivationID: String? { temporary.activeActivationID }
+    var hasTemporaryScreen: Bool { state.selectedID.map { temporary.isActiveTarget($0) } ?? false }
+    var rotationIDs: [String] { needsAgentSetup ? [Self.instructionsID] : state.screens.map(\.id) + [Self.instructionsID] }
+    var instructionsSelected: Bool { state.selectedID == Self.instructionsID || (state.selectedID == nil && isScreenShown(Self.instructionsID)) }
+    func containsRotationScreen(_ id: String) -> Bool { id == Self.instructionsID || state.screens.contains { $0.id == id } }
+
     struct Saved: Codable, Identifiable { let id: String; let revision: String; let artifact: ScreenArtifact }
-    struct State: Codable { var screens: [Saved] = []; var selectedID: String?; var previous: Saved?; var lastRequest: String?; var pendingID: String?; var pendingScreenID: String?; var consumedID: String?; var cancelledRequests: [String]?; var cancelIntents: [String]?; var lastInstruction: String?; var submissionKey: String?; var submissionText: String?; var submissionScreen: ScreenArtifact?; var requestDeadline: Double?; var authoring: AuthoringStoreState?; var linkedProfile: LocalProfileDescriptor?; var localRequestIDs: Set<String>?; var bundledScreenSeeds: Set<String>?; var catalog: CatalogQueue? }
+    struct State: Codable { var screens: [Saved] = []; var selectedID: String?; var previous: Saved?; var lastRequest: String?; var pendingID: String?; var pendingScreenID: String?; var consumedID: String?; var cancelledRequests: [String]?; var cancelIntents: [String]?; var lastInstruction: String?; var submissionKey: String?; var submissionText: String?; var submissionScreen: ScreenArtifact?; var requestDeadline: Double?; var authoring: AuthoringStoreState?; var linkedProfile: LocalProfileDescriptor?; var localRequestIDs: Set<String>?; var bundledScreenSeeds: Set<String>?; var catalog: CatalogQueue?; var hiddenScreenIDs: Set<String>?; var onboarding: Onboarding?; var publicDataRevocations: Set<String>? }
     private(set) var state = State()
     var onCatalogRevisionCommitted: (() -> Void)?
     private let root: URL
     private let libraryOwner: String
+    private var approvalOwner: String
+    private let catalogDefaults: UserDefaults
+    private var catalogBackupScope: CatalogBinding?
+    private var catalogBackupValidUntil: Date?
+    private var catalogConsentGeneration = UUID()
+    private var catalogCapabilityChecked = false
     private var temporary: LocalTemporaryActivationController!
     private var journal: AuthoringJournal!
-    init(accountID: String, rootDirectory: URL? = nil, journalFault: AuthoringJournal.Fault? = nil) throws {
+    init(accountID: String, rootDirectory: URL? = nil, permissionOwner: String? = nil, catalogDefaults: UserDefaults = .standard, journalFault: AuthoringJournal.Fault? = nil, onboardNewLibrary: Bool = false) throws {
         libraryOwner = accountID
-        root = try rootDirectory ?? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true).appendingPathComponent("ScreenpunkScreens", isDirectory: true).appendingPathComponent(accountID.data(using: .utf8)!.base64EncodedString().replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "+", with: "-"), isDirectory: true)
+        approvalOwner = permissionOwner ?? accountID
+        self.catalogDefaults = catalogDefaults
+        root = try rootDirectory ?? Self.directory(for: accountID)
+        let discarded = Self.discardedDirectory(for: root)
+        if FileManager.default.fileExists(atPath: discarded.path),
+           let data = try AuthoringJournal(root: discarded).recover() {
+            let deleted = try Self.decodeState(data)
+            PublicDataApprovalStore(defaults: catalogDefaults).forget(owner: approvalOwner,
+                dashboardIDs: Self.publicDashboardIDs(deleted.screens + [deleted.previous].compactMap { $0 }).union(deleted.publicDataRevocations ?? []))
+        }
+        try Self.removeIfPresent(discarded)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         journal = try AuthoringJournal(root: root, fault: journalFault)
-        if let data = try journal.recover() { state = try JSONDecoder().decode(State.self, from: data) }
+        if let data = try journal.recover() {
+            state = try Self.decodeState(data)
+        } else if onboardNewLibrary {
+            var next = state
+            next.onboarding = .connectAgent
+            next.selectedID = Self.instructionsID
+            try commit(next)
+        }
+        try flushPublicDataRevocations()
         try retireCancelledLocalSources()
         temporary = try LocalTemporaryActivationController(root: root, owner: accountID)
         try reconcileTemporary()
         // Recover the index (including unresolved pins) before any startup pruning.
         pruneUnusedRevisions()
     }
-    convenience init(profile: LocalProfileDescriptor, rootDirectory: URL? = nil, journalFault: AuthoringJournal.Fault? = nil) throws {
-        try self.init(accountID: profile.libraryOwner, rootDirectory: rootDirectory, journalFault: journalFault)
+    convenience init(profile: LocalProfileDescriptor, rootDirectory: URL? = nil, journalFault: AuthoringJournal.Fault? = nil, onboardNewLibrary: Bool = false) throws {
+        try self.init(accountID: profile.libraryOwner, rootDirectory: rootDirectory, permissionOwner: profile.permissionOwner, journalFault: journalFault, onboardNewLibrary: onboardNewLibrary)
     }
+
+    private static func directory(for owner: String, librariesDirectory: URL? = nil) throws -> URL {
+        let parent = try librariesDirectory ?? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+            .appendingPathComponent("ScreenpunkScreens", isDirectory: true)
+        let name = Data(owner.utf8).base64EncodedString().replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "+", with: "-")
+        return parent.appendingPathComponent(name, isDirectory: true)
+    }
+
+    private static func discardedDirectory(for root: URL) -> URL {
+        root.deletingLastPathComponent().appendingPathComponent(".discarded-" + root.lastPathComponent, isDirectory: true)
+    }
+
+    private static func removeIfPresent(_ url: URL) throws {
+        do { try FileManager.default.removeItem(at: url) }
+        catch let error as CocoaError where error.code == .fileNoSuchFile || error.code == .fileReadNoSuchFile {}
+    }
+
+    static func deleteAccountScreens(accountID: String, profile: LocalProfileDescriptor?, librariesDirectory: URL? = nil, approvalDefaults: UserDefaults = .standard) throws {
+        let owner = profile?.libraryOwner ?? accountID
+        guard !accountID.isEmpty, !accountID.hasPrefix("local:"), !owner.isEmpty,
+              profile == nil || profile?.cloudBinding?.accountID == accountID ||
+                (profile?.cloudBinding == nil && owner == accountID && profile?.permissionOwner == accountID) else {
+            throw DeviceError.message("The saved screens belong to a different account.")
+        }
+        let root = try directory(for: owner, librariesDirectory: librariesDirectory)
+        let discarded = discardedDirectory(for: root)
+        // Inspect only the selected library before explicit deletion, never unrelated profiles.
+        var dashboards = Set<String>()
+        for directory in [root, discarded] where FileManager.default.fileExists(atPath: directory.path) {
+            if let data = try AuthoringJournal(root: directory).recover() {
+                let state = try Self.decodeState(data)
+                let pending = Self.publicDashboardIDs(state.screens + [state.previous].compactMap { $0 }).union(state.publicDataRevocations ?? [])
+                dashboards.formUnion(pending)
+                if directory == discarded {
+                    PublicDataApprovalStore(defaults: approvalDefaults).forget(owner: profile?.permissionOwner ?? accountID, dashboardIDs: pending)
+                }
+            }
+        }
+        try removeIfPresent(discarded)
+        // Move the journal and its assets together so an interrupted removal cannot reopen a partial library.
+        do { try FileManager.default.moveItem(at: root, to: discarded) }
+        catch let error as CocoaError where error.code == .fileNoSuchFile || error.code == .fileReadNoSuchFile {
+            PublicDataApprovalStore(defaults: approvalDefaults).forget(owner: profile?.permissionOwner ?? accountID, dashboardIDs: dashboards)
+            return
+        }
+        PublicDataApprovalStore(defaults: approvalDefaults).forget(owner: profile?.permissionOwner ?? accountID, dashboardIDs: dashboards)
+        try removeIfPresent(discarded)
+    }
+
+    private func flushPublicDataRevocations() throws {
+        guard let pending = state.publicDataRevocations, !pending.isEmpty else { return }
+        PublicDataApprovalStore(defaults: catalogDefaults).forget(owner: approvalOwner, dashboardIDs: pending)
+        var next = state; next.publicDataRevocations = nil
+        try commit(next, captureCatalog: false)
+    }
+
+    private static func publicDashboardIDs(_ screens: [Saved]) -> Set<String> {
+        Set(screens.compactMap { saved in
+            guard let file = saved.artifact.files.first(where: { $0.path == "manifest.json" }),
+                  let manifest = try? JSONDecoder().decode(DashboardManifest.self, from: Data(file.content.utf8)) else { return nil }
+            return manifest.dashboardId
+        })
+    }
+
     var linkedProfile: LocalProfileDescriptor? { state.linkedProfile }
     /// Explicit native migration: owner paths and screen IDs stay fixed. The descriptor is
     /// the authoritative recovery receipt if the separate profile index adoption is interrupted.
@@ -69,9 +177,59 @@ import ScreenpunkCore
         next.authoring = authoring; next.linkedProfile = linked
         try commit(next); return linked
     }
-    var selected: Saved? { state.screens.first { $0.id == state.selectedID } }
+    var selected: Saved? {
+        guard !needsAgentSetup || hasTemporaryScreen else { return nil }
+        return state.screens.first { $0.id == state.selectedID }
+    }
+
+    func finishAgentSetup() throws {
+        guard needsAgentSetup, !hasTemporaryScreen else { return }
+        var next = state
+        next.onboarding = .gallery
+        next.selectedID = Self.instructionsID
+        try commit(next)
+    }
+
+    #if DEBUG
+    private struct GuideResetReceipt: Encodable {
+        let stage: Onboarding
+        let libraryMetadataPreserved: Bool
+        let screensPreserved: Bool
+        let selectionPreserved: Bool
+        let showPreferencesPreserved: Bool
+        let backupConsentPreserved: Bool
+    }
+
+    func restartGuideForTesting(receiptURL: URL? = nil) throws {
+        let before = state
+        var expected = before
+        expected.onboarding = .connectAgent
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let expectedBytes = try encoder.encode(expected)
+        // Write exactly the reset state. Regular commits may also prune catalog metadata.
+        try persist(expected, encoded: expectedBytes)
+        let receipt = GuideResetReceipt(
+            stage: .connectAgent,
+            libraryMetadataPreserved: expectedBytes == (try encoder.encode(state)),
+            screensPreserved: before.screens.map(\.id) == state.screens.map(\.id) &&
+                before.screens.map(\.revision) == state.screens.map(\.revision),
+            selectionPreserved: before.selectedID == state.selectedID,
+            showPreferencesPreserved: before.hiddenScreenIDs == state.hiddenScreenIDs,
+            backupConsentPreserved: before.catalog?.captureAllowed == state.catalog?.captureAllowed
+        )
+        if let receiptURL { try encoder.encode(receipt).write(to: receiptURL, options: .atomic) }
+    }
+    #endif
+
+    func dismissGalleryIntro() throws {
+        guard galleryIntroPending else { return }
+        var next = state
+        next.onboarding = .complete
+        try commit(next)
+    }
     func store(for screen: Saved) throws -> PackageAssetStore { try PackageAssetStore.load(directory: root.appendingPathComponent(screen.revision)) }
-    func install(_ artifact: ScreenArtifact, requestID: String, replacing id: String?) throws {
+    func install(_ artifact: ScreenArtifact, requestID: String, replacing id: String?, selectInstalled: Bool = true, preserveRequestHistory: Bool = false) throws {
         guard state.lastRequest != requestID else { return }
         guard !(state.cancelledRequests ?? []).contains(requestID), !(state.authoring?.cancelledRequestIDs ?? []).contains(requestID) else { throw DeviceError.message("This request was cancelled on this device.") }
         try Self.validate(artifact)
@@ -90,12 +248,42 @@ import ScreenpunkCore
             let saved = Saved(id: id ?? UUID().uuidString, revision: revision, artifact: artifact)
             if let position = next.screens.firstIndex(where: { $0.id == saved.id }) { next.previous = next.screens[position]; next.screens[position] = saved }
             else { next.screens.append(saved) }
-            next.selectedID = saved.id; next.lastRequest = requestID
+            if selectInstalled && selectsInstalledRevision(saved.id) { next.selectedID = saved.id }
+            if !preserveRequestHistory { next.lastRequest = requestID }
             committing = true
             try commit(next, stagedDirectory: revision)
             pruneUnusedRevisions()
         } catch { if !committing { try? FileManager.default.removeItem(at: directory) }; throw error }
     }
+    /// Upgrade only the exact pristine shipped Weather package. A committed replacement
+    /// is recognizable on retry; edited/configured/deleted screens are never recreated.
+    func migratePristineWeatherIfNeeded() throws {
+        guard state.pendingID == nil, state.submissionKey == nil,
+              let index = state.screens.firstIndex(where: { $0.id == "starter-weather" }),
+              let artifact = try StarterWeather.migrateOriginalIfNeeded(state.screens[index].artifact) else { return }
+        let revision = UUID().uuidString
+        let directory = root.appendingPathComponent(revision, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var committing = false
+        do {
+            try Self.validate(artifact)
+            for file in artifact.files {
+                let url = directory.appendingPathComponent(file.path)
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try Data(file.content.utf8).write(to: url, options: .atomic)
+            }
+            _ = try PackageAssetStore.load(directory: directory)
+            var next = state
+            next.screens[index] = Saved(id: state.screens[index].id, revision: revision, artifact: artifact)
+            committing = true
+            try commit(next, stagedDirectory: revision, captureCatalog: false)
+            pruneUnusedRevisions()
+        } catch {
+            if !committing { try? FileManager.default.removeItem(at: directory) }
+            throw error
+        }
+    }
+
     /// Seed once per library. A durable per-template marker survives edits/removal;
     /// an interrupted first install resumes only its missing templates.
     func installStarterScreensIfNeeded(_ templates: [StarterScreens.Template]) throws {
@@ -205,49 +393,131 @@ import ScreenpunkCore
         clearTerminalDelivery(id, in: &next)
         try commit(next); pruneUnusedRevisions()
     }
-    func select(offset: Int) throws {
-        guard !state.screens.isEmpty else { return }
-        try temporary.manualSelection()
-        let current = state.screens.firstIndex { $0.id == state.selectedID } ?? 0
-        var next = state; next.selectedID = next.screens[(current + offset + state.screens.count) % state.screens.count].id
+    func isScreenShown(_ id: String) -> Bool { state.hiddenScreenIDs?.contains(id) != true }
+
+    private func selectsInstalledRevision(_ id: String) -> Bool {
+        guard !needsAgentSetup, isScreenShown(id) else { return false }
+        if let selected = state.selectedID { return !temporary.isActiveTarget(selected) }
+        return true
+    }
+
+    func setScreenShown(_ shown: Bool, id: String) throws {
+        guard !needsAgentSetup, containsRotationScreen(id), shown != isScreenShown(id) else { return }
+        var next = state
+        var hidden = next.hiddenScreenIDs ?? []
+        if shown { hidden.remove(id) } else { hidden.insert(id) }
+        next.hiddenScreenIDs = hidden.isEmpty ? nil : hidden
+        if !shown, (next.selectedID == id || (id == Self.instructionsID && instructionsSelected)), !temporary.isActiveTarget(id) {
+            next.selectedID = nextVisible(after: id, in: next)
+        } else if shown, next.selectedID == nil, rotationIDs.allSatisfy({ !isScreenShown($0) }) {
+            next.selectedID = id
+        }
         try commit(next)
     }
+
+    private func nextVisible(after id: String?, in snapshot: State, backwards: Bool = false) -> String? {
+        let ids = snapshot.onboarding == .connectAgent ? [Self.instructionsID] : snapshot.screens.map(\.id) + [Self.instructionsID]
+        let shown: (String) -> Bool = { snapshot.hiddenScreenIDs?.contains($0) != true }
+        guard let id, let current = ids.firstIndex(of: id) else {
+            return backwards ? ids.last(where: shown) : ids.first(where: shown)
+        }
+        let direction = backwards ? -1 : 1
+        return (1...ids.count).lazy.map { ids[(current + direction * $0 + ids.count) % ids.count] }.first(where: shown)
+    }
+
+    func selectVisible(_ id: String) throws {
+        guard !needsAgentSetup, isScreenShown(id), containsRotationScreen(id) else { return }
+        try temporary.manualSelection()
+        var next = state; next.selectedID = id; try commit(next)
+    }
+
+    func select(offset: Int) throws {
+        guard !needsAgentSetup, offset != 0 else { return }
+        let visible = rotationIDs.filter(isScreenShown)
+        guard !visible.isEmpty else { return }
+        if let selected = state.selectedID, let current = visible.firstIndex(of: selected) {
+            let step = offset % visible.count
+            try selectVisible(visible[(current + step + visible.count) % visible.count])
+        } else if let next = nextVisible(after: state.selectedID, in: state, backwards: offset < 0) {
+            try selectVisible(next)
+        }
+    }
+
     func remove(_ id: String) throws {
         guard state.screens.contains(where: { $0.id == id }) else { return }
         guard state.pendingID == nil, state.submissionKey == nil else {
             throw DeviceError.message("Finish or cancel the current request before removing a screen.")
         }
-        // A manual library change ends temporary activation and its restore target.
-        try temporary.manualSelection()
+        let deletedDashboards = Self.publicDashboardIDs(state.screens.filter { $0.id == id } + [state.previous].compactMap { $0 }.filter { $0.id == id })
+        if state.selectedID == id { try temporary.manualSelection() }
         var next = state
         var authoring = next.authoring ?? .init(); var knownScreens = authoring.knownScreenIDs ?? []; knownScreens.insert(id); authoring.knownScreenIDs = knownScreens; next.authoring = authoring
         next.screens.removeAll { $0.id == id }
-        if next.selectedID == id { next.selectedID = next.screens.first?.id }
+        next.hiddenScreenIDs?.remove(id)
+        if next.hiddenScreenIDs?.isEmpty == true { next.hiddenScreenIDs = nil }
+        if next.selectedID == id {
+            let fallback = nextVisible(after: id, in: state)
+            next.selectedID = fallback == id ? nil : fallback
+        }
         if next.previous?.id == id { next.previous = nil }
         if next.pendingScreenID == id { next.pendingScreenID = nil }
+        next.publicDataRevocations = (next.publicDataRevocations ?? []).union(deletedDashboards)
         try commit(next)
+        try flushPublicDataRevocations()
         pruneUnusedRevisions()
     }
-    func newScreen() throws { try temporary.manualSelection(); var next = state; next.selectedID = nil; try commit(next) }
+
+    func newScreen() throws { guard !needsAgentSetup else { return }; try temporary.manualSelection(); var next = state; next.selectedID = nil; try commit(next) }
+
+    // Installed screen IDs are non-empty. The checkpoint stores this sentinel as
+    // an explicit neutral selection, distinct from no pending selection.
+    private static let neutralSelection = ""
+
     /// Only call from an authenticated, account-scoped external command handler.
     func activateTemporarily(id: String, screenID: String, expiresAt: Date) throws {
-        guard state.screens.contains(where: { $0.id == screenID }), let selected = state.selectedID else { throw DeviceError.message("Temporary screen is not installed.") }
+        guard !screenID.isEmpty, state.screens.contains(where: { $0.id == screenID }) else {
+            throw DeviceError.message("Temporary screen is not installed.")
+        }
+        let selected = state.selectedID ?? (instructionsSelected ? Self.instructionsID : Self.neutralSelection)
         try applyTemporary(temporary.activate(id: id, target: screenID, expiresAt: expiresAt, selected: selected))
     }
+
     func endTemporary(id: String) throws {
-        guard let selected = state.selectedID else { return }; try applyTemporary(temporary.end(id: id, selected: selected))
+        let selected = state.selectedID ?? (instructionsSelected ? Self.instructionsID : Self.neutralSelection)
+        try applyTemporary(temporary.end(id: id, selected: selected, fallbackSelection: temporaryFallback))
     }
-    func reconcileTemporary() throws {
-        guard let selected = state.selectedID else { return }; try applyTemporary(temporary.reconcile(selected: selected))
+
+    func reconcileTemporary(now: Date = Date()) throws {
+        let selected = state.selectedID ?? (instructionsSelected ? Self.instructionsID : Self.neutralSelection)
+        try applyTemporary(temporary.reconcile(selected: selected, now: now, fallbackSelection: temporaryFallback))
     }
+
+    private var temporaryFallback: String? {
+        guard let selected = state.selectedID, temporary.isActiveTarget(selected), !isScreenShown(selected) else { return nil }
+        return nextVisible(after: selected, in: state) ?? Self.neutralSelection
+    }
+
     private func applyTemporary(_ id: String?) throws {
-        guard let id, state.screens.contains(where: { $0.id == id }) else { return }
-        var next = state; next.selectedID = id; try commit(next); try temporary.acknowledgeSelection()
+        guard let id else { return }
+        var next = state
+        if id == Self.neutralSelection {
+            next.selectedID = nil
+        } else if temporary.expiresAt == nil {
+            next.selectedID = isScreenShown(id) && containsRotationScreen(id)
+                ? id : nextVisible(after: id, in: next)
+        } else if next.screens.contains(where: { $0.id == id }) {
+            next.selectedID = id
+        }
+        try commit(next)
+        try temporary.acknowledgeSelection()
     }
+
     func rollback() throws {
+        guard !needsAgentSetup, let previous = state.previous, let position = state.screens.firstIndex(where: { $0.id == previous.id }) else { return }
         try temporary.manualSelection()
-        guard let previous = state.previous, let position = state.screens.firstIndex(where: { $0.id == previous.id }) else { return }
-        var next = state; next.previous = next.screens[position]; next.screens[position] = previous; next.selectedID = previous.id
+        var next = state; next.previous = next.screens[position]; next.screens[position] = previous
+        if isScreenShown(previous.id) { next.selectedID = previous.id }
+        else if let selected = next.selectedID, !isScreenShown(selected) { next.selectedID = nextVisible(after: selected, in: next) }
         try commit(next)
     }
     private func clearTerminalDelivery(_ id: String, in next: inout State) {
@@ -268,17 +538,48 @@ import ScreenpunkCore
             }
         }
         var next = proposed
-        if captureCatalog, let revision = stagedDirectory, let saved = next.screens.first(where: { $0.revision == revision }) {
+        if captureCatalog, catalogCapabilityChecked, let revision = stagedDirectory,
+           let saved = next.screens.first(where: { $0.revision == revision }) {
             captureCatalogRevision(saved, origin: "apply", in: &next)
         }
+        if let known = next.catalog?.knownSavedRevisions {
+            let retained = next.screens.map(\.revision) + [next.previous?.revision].compactMap { $0 }
+            next.catalog?.knownSavedRevisions = known.intersection(retained)
+        }
+        try persist(next, encoded: JSONEncoder().encode(next), stagedDirectory: stagedDirectory)
+    }
+    private func persist(_ next: State, encoded: Data, stagedDirectory: String? = nil) throws {
         do {
-            try journal.commit(JSONEncoder().encode(next), stagedDirectory: stagedDirectory)
+            try journal.commit(encoded, stagedDirectory: stagedDirectory)
             state = next
         } catch {
             // A durable intent may already have committed. Refresh before another mutation.
-            if let recovered = try? journal.recover(), let decoded = try? JSONDecoder().decode(State.self, from: recovered) { state = decoded }
+            if let recovered = try? journal.recover(), let decoded = try? Self.decodeState(recovered) { state = decoded }
             throw error
         }
+    }
+    private static func decodeState(_ data: Data) throws -> State {
+        var state = try JSONDecoder().decode(State.self, from: data)
+        // Before opt-in existed, eligible commits were always journaled. Recover
+        // rollback provenance once, before any new opt-out edits can occur.
+        if var queue = state.catalog, queue.knownSavedRevisions == nil {
+            var known = Set<String>()
+            let queued = Set(queue.entries.map(\.revision))
+            for saved in state.screens + [state.previous].compactMap({ $0 }) {
+                let copy = queue.copies[saved.id]
+                if copy?.head == saved.revision || copy?.acknowledgedRevision == saved.revision || queued.contains(saved.revision) {
+                    known.insert(saved.revision)
+                }
+            }
+            if let previous = state.previous, let current = state.screens.first(where: { $0.id == previous.id }),
+               let copy = queue.copies[current.id], copy.counter > 1, copy.gapFrom == nil,
+               copy.head == previous.revision || copy.head == current.revision {
+                known.formUnion([previous.revision, current.revision])
+            }
+            queue.knownSavedRevisions = known
+            state.catalog = queue
+        }
+        return state
     }
     private func pruneUnusedRevisions() {
         let retained = Set(state.screens.map(\.revision) + [state.previous?.revision].compactMap { $0 } + (state.authoring?.revisionPins?.values.map(\.revision) ?? []) + (state.catalog?.entries.map(\.revision) ?? []))
@@ -462,7 +763,7 @@ import ScreenpunkCore
             let saved = Saved(id: request.context.screenID, revision: revision, artifact: artifact)
             if let index = next.screens.firstIndex(where: { $0.id == saved.id }) { next.previous = next.screens[index]; next.screens[index] = saved }
             else { next.screens.append(saved) }
-            next.selectedID = saved.id; next.lastRequest = result.requestID
+            if selectsInstalledRevision(saved.id) { next.selectedID = saved.id }; next.lastRequest = result.requestID
         }
         next.consumedID = result.requestID; clearTerminalDelivery(result.requestID, in: &next)
         try commit(next, stagedDirectory: stagedRevision)
@@ -515,7 +816,7 @@ import ScreenpunkCore
                 let saved = Saved(id: request.context.screenID, revision: revision, artifact: artifact)
                 if let index = next.screens.firstIndex(where: { $0.id == saved.id }) { next.previous = next.screens[index]; next.screens[index] = saved }
                 else { next.screens.append(saved) }
-                next.selectedID = saved.id; next.lastRequest = result.requestID
+                if selectsInstalledRevision(saved.id) { next.selectedID = saved.id }; next.lastRequest = result.requestID
             } catch {
                 try? FileManager.default.removeItem(at: directory)
                 return try rejectAuthoringResult(result, reason: "The screen package could not be installed: " + error.localizedDescription, now: now)
@@ -606,6 +907,12 @@ extension ScreenLibrary {
         var userID: String
         var deviceID: String
         var libraryID: String
+
+        var preferenceKey: String {
+            let fields = [origin, accountID, userID, deviceID, libraryID]
+            let scope = fields.map { "\($0.utf8.count):\($0)" }.joined()
+            return "cloudBackups.v1." + CatalogContract.digest(Data(scope.utf8))
+        }
     }
     struct CatalogCopy: Codable {
         var id: String = UUID().uuidString
@@ -655,6 +962,9 @@ extension ScreenLibrary {
         var maxBytes: Int = 100 * 1024 * 1024
         var previews: [CatalogCapturedPreview]?
         var previewFinishedSources: [String]?
+        // Bounded to revisions still visible in the saved library or rollback.
+        // Retains provenance after an upload is acknowledged or removed in Cloud.
+        var knownSavedRevisions: Set<String>?
     }
     struct CatalogCapturedPreview: Codable, Identifiable {
         var id: String = UUID().uuidString
@@ -670,32 +980,86 @@ extension ScreenLibrary {
     }
     var catalogQueue: CatalogQueue? { state.catalog }
 
+    @discardableResult
+    func setCatalogBackupScope(_ binding: CatalogBinding?, validUntil: Date? = nil) -> Bool {
+        let scope = binding?.libraryID == libraryOwner && validUntil != nil ? binding : nil
+        let deadline = scope == nil ? nil : validUntil
+        guard scope != catalogBackupScope || deadline != catalogBackupValidUntil else { return false }
+        catalogBackupScope = scope
+        catalogBackupValidUntil = deadline
+        catalogConsentGeneration = UUID()
+        catalogCapabilityChecked = false
+        return true
+    }
+
+    func catalogAuthorization(binding: CatalogBinding) -> UUID? {
+        guard catalogBackupScope == binding, let deadline = catalogBackupValidUntil, Date() < deadline,
+              catalogBackupsPreference(binding: binding) else { return nil }
+        return catalogConsentGeneration
+    }
+
+    func catalogWorkAllowed(binding: CatalogBinding) -> Bool { catalogAuthorization(binding: binding) != nil }
+
+    func catalogBackupsPreference(binding: CatalogBinding) -> Bool {
+        binding.libraryID == libraryOwner && catalogDefaults.bool(forKey: binding.preferenceKey)
+    }
+
+    /// Turn off consent even when an unknown entitlement has already suspended work.
+    func disableCatalogBackups(binding: CatalogBinding) {
+        guard binding.libraryID == libraryOwner, catalogBackupScope == nil || catalogBackupScope == binding,
+              catalogBackupsPreference(binding: binding) else { return }
+        catalogDefaults.set(false, forKey: binding.preferenceKey)
+        catalogConsentGeneration = UUID()
+        catalogCapabilityChecked = false
+    }
+
+    func setCatalogBackupsEnabled(_ enabled: Bool, binding: CatalogBinding) throws {
+        guard catalogBackupScope == binding else { throw DeviceError.message("The backup account changed.") }
+        if enabled, (catalogBackupValidUntil ?? .distantPast) <= Date() {
+            throw DeviceError.message("Verify Screenpunk Pro before enabling backups.")
+        }
+        guard enabled != catalogBackupsPreference(binding: binding) else { return }
+        catalogDefaults.set(enabled, forKey: binding.preferenceKey)
+        catalogConsentGeneration = UUID()
+        catalogCapabilityChecked = false
+    }
+
     /// Only call after an authenticated capability response for this exact library.
     /// Existing content is an honestly labelled current-screen seed, never history.
     func activateCatalog(binding: CatalogBinding, maxRevisions: Int = 100, maxBytes: Int = 100 * 1024 * 1024) throws {
-        guard binding.libraryID == libraryOwner, !binding.origin.isEmpty, !binding.accountID.isEmpty,
+        guard catalogWorkAllowed(binding: binding), !binding.origin.isEmpty, !binding.accountID.isEmpty,
               !binding.userID.isEmpty, !binding.deviceID.isEmpty else { throw DeviceError.message("The backup account binding is incomplete.") }
-        if let queue = state.catalog {
-            guard queue.binding == binding else {
-                if queue.captureAllowed {
-                    var next = state; next.catalog?.captureAllowed = false
-                    next.catalog?.status = "Backups paused: queued revisions belong to an earlier device connection. Sign in to that connection or contact support to reconcile this library."
-                    try commit(next)
-                }
-                throw DeviceError.message("Saved backups belong to an earlier account or device connection.")
-            }
-            return
+        guard state.catalog == nil || state.catalog?.binding == binding else {
+            throw DeviceError.message("Saved backups belong to an earlier account or device connection.")
         }
         var next = state
-        next.catalog = CatalogQueue(binding: binding, maxRevisions: max(1, min(100, maxRevisions)), maxBytes: max(1, min(100 * 1024 * 1024, maxBytes)))
-        next.catalog?.seedAnnounced = true
-        next.catalog?.status = "Cloud backups are enabled. Current screens are queued once; earlier edits are not available."
-        for saved in next.screens { captureCatalogRevision(saved, origin: "seed", in: &next) }
-        try commit(next)
+        var changed = state.catalog == nil || state.catalog?.captureAllowed == false
+        if next.catalog == nil {
+            next.catalog = CatalogQueue(binding: binding, maxRevisions: max(1, min(100, maxRevisions)), maxBytes: max(1, min(100 * 1024 * 1024, maxBytes)))
+            next.catalog?.knownSavedRevisions = []
+            next.catalog?.seedAnnounced = true
+            next.catalog?.status = "Current screens are queued for backup."
+        }
+        next.catalog?.captureAllowed = true
+        if next.catalog?.paused != true {
+            for saved in next.screens where needsCatalogSeed(saved, in: next) {
+                captureCatalogRevision(saved, origin: "seed", in: &next)
+                changed = true
+            }
+        }
+        if changed { try commit(next) }
+        catalogCapabilityChecked = true
+    }
+
+    private func needsCatalogSeed(_ saved: Saved, in state: State) -> Bool {
+        guard let queue = state.catalog, let copy = queue.copies[saved.id] else { return true }
+        if saved.revision == copy.head || saved.revision == copy.acknowledgedRevision || queue.knownSavedRevisions?.contains(saved.revision) == true ||
+            queue.entries.contains(where: { $0.screenID == saved.id && $0.revision == saved.revision }) { return false }
+        return true
     }
 
     private func captureCatalogRevision(_ saved: Saved, origin: String, in next: inout State) {
-        guard var queue = next.catalog else { return }
+        guard var queue = next.catalog, catalogWorkAllowed(binding: queue.binding), !queue.authPaused else { return }
         var copy = queue.copies[saved.id] ?? CatalogCopy()
         // Journal recovery/replay must not assign a new operation or counter.
         guard copy.head != saved.revision else { return }
@@ -735,17 +1099,18 @@ extension ScreenLibrary {
                 parentIDs: parents, title: saved.artifact.title, entry: saved.artifact.entry, paths: saved.artifact.files.map(\.path),
                 appliedAt: Int64(Date().timeIntervalSince1970 * 1000), origin: origin, packageBytes: bytes, packageDigest: packageDigest, blockedReason: admissionError))
             copy.lastQueuedCounter = copy.counter
+            queue.knownSavedRevisions?.insert(saved.revision)
         }
         queue.copies[saved.id] = copy
         next.catalog = queue
     }
 
     func updateCatalogIntent(_ intent: CatalogIntent, binding: CatalogBinding) throws {
-        guard state.catalog?.binding == binding, let index = state.catalog?.entries.firstIndex(where: { $0.id == intent.id }) else { throw DeviceError.message("The backup connection changed.") }
+        guard catalogWorkAllowed(binding: binding), state.catalog?.binding == binding, let index = state.catalog?.entries.firstIndex(where: { $0.id == intent.id }) else { throw DeviceError.message("The backup connection changed.") }
         var next = state; next.catalog?.entries[index] = intent; try commit(next)
     }
     func acknowledgeCatalogIntent(id: String, binding: CatalogBinding) throws {
-        guard state.catalog?.binding == binding, state.catalog?.entries.first?.id == id else { throw DeviceError.message("The backup connection changed.") }
+        guard catalogWorkAllowed(binding: binding), state.catalog?.binding == binding, state.catalog?.entries.first?.id == id else { throw DeviceError.message("The backup connection changed.") }
         var next = state
         let intent = next.catalog!.entries.removeFirst()
         if intent.counter > (next.catalog?.copies[intent.screenID]?.acknowledgedCounter ?? 0) {
@@ -766,13 +1131,14 @@ extension ScreenLibrary {
 
 extension ScreenLibrary {
     func exportCatalogIntent(_ intent: CatalogIntent, binding: CatalogBinding) throws -> CatalogPackageExporter.Export {
-        guard state.catalog?.binding == binding, state.catalog?.entries.contains(where: { $0.id == intent.id && $0.revision == intent.revision }) == true else { throw DeviceError.message("The backup connection changed.") }
+        guard catalogCaptureAllowed(binding: binding), state.catalog?.entries.contains(where: { $0.id == intent.id && $0.revision == intent.revision }) == true else { throw DeviceError.message("The backup connection changed.") }
         let exported = try CatalogPackageExporter.export(directory: root.appendingPathComponent(intent.revision), title: intent.title, entry: intent.entry, paths: intent.paths)
         guard intent.packageDigest == nil || intent.packageDigest == exported.declaration.digest else { throw DeviceError.message("The immutable backup package changed. Backups are paused for review.") }
         return exported
     }
     func catalogBegin(_ intent: CatalogIntent, declaration: CatalogObjectDeclaration, binding: CatalogBinding) throws -> CatalogBeginBackup {
-        guard let queue = state.catalog, queue.binding == binding, let copy = queue.copies[intent.screenID], copy.id == intent.copyID else { throw DeviceError.message("The backup connection changed.") }
+        guard catalogCaptureAllowed(binding: binding), let queue = state.catalog,
+              let copy = queue.copies[intent.screenID], copy.id == intent.copyID else { throw DeviceError.message("The backup connection changed.") }
         let begin = CatalogBeginBackup(operationID: intent.operationID, libraryID: queue.libraryID, localScreenID: copy.localScreenID,
             sourceRevisionID: intent.revision, parentRevisionIDs: intent.parentIDs, predecessorRevisionID: intent.parentIDs.first,
             commitCounter: intent.counter, origin: intent.origin == "apply" ? "applied" : "seed",
@@ -783,13 +1149,16 @@ extension ScreenLibrary {
     /// Explicit user acknowledgement excludes the recorded intermediate edits.
     /// Existing pins must drain first; a copy without a server checkpoint cannot reset.
     func resumeCatalog(binding: CatalogBinding) throws {
-        guard let queue = state.catalog, queue.binding == binding, queue.captureAllowed, queue.paused, queue.entries.isEmpty else { throw DeviceError.message("Wait for queued backups to finish before resuming.") }
+        guard catalogCaptureAllowed(binding: binding), let queue = state.catalog, queue.paused,
+              queue.entries.isEmpty else { throw DeviceError.message("Wait for queued backups to finish before resuming.") }
         var next = state
         for saved in state.screens {
             guard var copy = next.catalog?.copies[saved.id], let from = copy.gapFrom, let through = copy.gapThrough else { continue }
             guard copy.acknowledgedCounter >= 1, let checkpoint = copy.acknowledgedRevision,
                   from == copy.acknowledgedCounter + 1 else { throw DeviceError.message("This screen has no verified backup checkpoint. Backups remain paused; contact support to reconcile this screen without losing its history.") }
-            guard saved.revision != checkpoint else { throw DeviceError.message("The current screen is an earlier backed-up revision. Make a new screen edit before resuming; saved revisions cannot be renumbered.") }
+            guard saved.revision != checkpoint, next.catalog?.knownSavedRevisions?.contains(saved.revision) != true else {
+                throw DeviceError.message("The current screen is an earlier backed-up revision. Make a new screen edit before resuming; saved revisions cannot be renumbered.")
+            }
             let gap = CatalogGapDeclaration(checkpointCounter: copy.acknowledgedCounter, checkpointRevisionID: checkpoint, skippedFromCounter: from, skippedThroughCounter: through)
             copy.head = checkpoint; copy.counter = through
             copy.gapFrom = nil; copy.gapThrough = nil
@@ -808,7 +1177,9 @@ extension ScreenLibrary {
 
 extension ScreenLibrary {
     func setCatalogEntitlement(_ enabled: Bool, binding: CatalogBinding) throws {
-        guard state.catalog?.binding == binding, state.catalog?.captureAllowed != enabled else { return }
+        guard catalogWorkAllowed(binding: binding), state.catalog?.binding == binding else { return }
+        if !enabled { catalogCapabilityChecked = true }
+        guard state.catalog?.captureAllowed != enabled else { return }
         var next = state; next.catalog?.captureAllowed = enabled; try commit(next)
     }
 }
@@ -816,7 +1187,7 @@ extension ScreenLibrary {
 
 extension ScreenLibrary {
     func restartExpiredCatalogOperation(intentID: String, operationID: String, binding: CatalogBinding) throws {
-        guard state.catalog?.binding == binding,
+        guard catalogWorkAllowed(binding: binding), state.catalog?.binding == binding,
               let index = state.catalog?.entries.firstIndex(where: { $0.id == intentID && $0.operationID == operationID }) else { throw DeviceError.message("The backup connection changed.") }
         var next = state
         next.catalog?.entries[index].operationID = UUID().uuidString
@@ -832,13 +1203,14 @@ extension ScreenLibrary {
 
 extension ScreenLibrary {
     func pauseCatalogAuthentication(binding: CatalogBinding) throws {
-        guard state.catalog?.binding == binding, state.catalog?.authPaused != true else { return }
+        guard catalogWorkAllowed(binding: binding), state.catalog?.binding == binding, state.catalog?.authPaused != true else { return }
         var next = state; next.catalog?.authPaused = true; try commit(next)
     }
     /// Only explicit successful sign-in of the identical account/enrollment clears
     /// this durable pause. Restart or selecting a different library does not.
     func resumeCatalogAuthentication(binding: CatalogBinding) throws {
-        guard state.catalog?.binding == binding, state.catalog?.authPaused == true else { return }
+        guard binding.libraryID == libraryOwner, catalogBackupScope == nil || catalogBackupScope == binding,
+              state.catalog?.binding == binding, state.catalog?.authPaused == true else { return }
         var next = state; next.catalog?.authPaused = false
         for index in next.catalog!.entries.indices { next.catalog?.entries[index].retryAt = 0 }
         try commit(next)
@@ -848,7 +1220,7 @@ extension ScreenLibrary {
 
 extension ScreenLibrary {
     func catalogPackage(revision: String, digest: String, binding: CatalogBinding) throws -> CatalogPackageExporter.Export {
-        guard state.catalog?.binding == binding else { throw DeviceError.message("The preview account changed.") }
+        guard catalogCaptureAllowed(binding: binding) else { throw DeviceError.message("The preview account changed.") }
         if let intent = state.catalog?.entries.first(where: { $0.revision == revision }) {
             let exported = try exportCatalogIntent(intent, binding: binding)
             guard exported.declaration.digest == digest else { throw DeviceError.message("The preview source changed.") }; return exported
@@ -858,7 +1230,7 @@ extension ScreenLibrary {
         guard exported.declaration.digest == digest else { throw DeviceError.message("The preview source changed.") }; return exported
     }
     func captureCatalogPreview(bytes: Data, declaration: CatalogPNGPreviewDeclaration, revision: String, packageDigest: String, capturedAt: String, binding: CatalogBinding, candidate: CatalogPreviewCandidate? = nil) throws {
-        guard var queue = state.catalog, queue.binding == binding,
+        guard catalogCaptureAllowed(binding: binding), var queue = state.catalog,
               declaration.mediaType == "image/png", bytes.count > 0, bytes.count <= CatalogContract.previewBytes,
               declaration.byteLength == bytes.count, declaration.digest == CatalogContract.digest(bytes),
               (1...2048).contains(declaration.width), (1...2048).contains(declaration.height),
@@ -883,7 +1255,7 @@ extension ScreenLibrary {
         try commit(next, stagedDirectory: "catalog-previews", captureCatalog: false)
     }
     func readCatalogPreview(_ preview: CatalogCapturedPreview, binding: CatalogBinding) throws -> Data {
-        guard state.catalog?.binding == binding, state.catalog?.previews?.contains(where: { $0.id == preview.id }) == true,
+        guard catalogCaptureAllowed(binding: binding), state.catalog?.previews?.contains(where: { $0.id == preview.id }) == true,
               UUID(uuidString: preview.id) != nil else { throw DeviceError.message("The preview account changed.") }
         let url = root.appendingPathComponent("catalog-previews").appendingPathComponent(preview.id + ".png")
         let values = try url.resourceValues(forKeys: [.fileSizeKey, .isSymbolicLinkKey, .isRegularFileKey])
@@ -903,13 +1275,14 @@ extension ScreenLibrary {
         return data
     }
     func updateCatalogPreview(_ preview: CatalogCapturedPreview, binding: CatalogBinding) throws {
-        guard state.catalog?.binding == binding, let index = state.catalog?.previews?.firstIndex(where: { $0.id == preview.id }) else { throw DeviceError.message("The preview account changed.") }
+        guard catalogCaptureAllowed(binding: binding), let index = state.catalog?.previews?.firstIndex(where: { $0.id == preview.id }) else { throw DeviceError.message("The preview account changed.") }
         let original = state.catalog!.previews![index]
         guard original.revision == preview.revision, original.packageDigest == preview.packageDigest, original.capturedAt == preview.capturedAt, original.declaration == preview.declaration else { throw DeviceError.message("The immutable screenshot source changed.") }
         var next = state; next.catalog?.previews?[index] = preview; try commit(next)
     }
     func acknowledgeCatalogPreview(_ preview: CatalogCapturedPreview, binding: CatalogBinding) throws {
-        guard state.catalog?.binding == binding, state.catalog?.previews?.contains(where: { $0.id == preview.id && $0.operationID == preview.operationID }) == true else { throw DeviceError.message("The preview account changed.") }
+        guard catalogWorkAllowed(binding: binding), state.catalog?.binding == binding,
+              state.catalog?.previews?.contains(where: { $0.id == preview.id && $0.operationID == preview.operationID }) == true else { throw DeviceError.message("The preview account changed.") }
         var next = state; next.catalog?.previews?.removeAll { $0.id == preview.id }
         var finished = next.catalog?.previewFinishedSources ?? []
         let source = preview.revision + ":" + preview.packageDigest
@@ -923,9 +1296,14 @@ extension ScreenLibrary {
 
 extension ScreenLibrary {
     func bindCatalogPreview(_ candidate: CatalogPreviewCandidate, binding: CatalogBinding) throws {
-        guard state.catalog?.binding == binding, state.catalog?.libraryID == candidate.libraryID,
+        guard catalogCaptureAllowed(binding: binding), state.catalog?.libraryID == candidate.libraryID,
               state.catalog?.copies.values.contains(where: { $0.localScreenID == candidate.localScreenID }) == true else { throw DeviceError.message("The preview copy changed.") }
         guard let index = state.catalog?.previews?.firstIndex(where: { $0.revision == candidate.sourceRevisionID && $0.packageDigest == candidate.packageDigest }) else { return }
         var next = state; next.catalog?.previews?[index].candidate = candidate; try commit(next)
+    }
+
+    func catalogCaptureAllowed(binding: CatalogBinding) -> Bool {
+        catalogCapabilityChecked && catalogWorkAllowed(binding: binding) && state.catalog?.binding == binding &&
+            state.catalog?.captureAllowed == true && state.catalog?.authPaused == false
     }
 }

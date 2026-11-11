@@ -13,6 +13,7 @@ struct DeviceAccountSettings: View {
     var body: some View {
         Form {
             DeviceCloudAccountSection(device: device, showListenerSetup: showCloudSetup)
+            DeviceBillingSection(device: device)
             Section("Local agent") {
                 if let config = model.configuration {
                     Label(config.name, systemImage: "desktopcomputer")
@@ -53,7 +54,6 @@ struct DeviceAccountSettings: View {
                 }.disabled(device.routeChangeBlocked || model.testing)
                 Text(device.routeChangeBlocked ? "Finish or cancel the current request before changing agents." : "Automatic checks the paired computer first. If it is unavailable, a new request may go to your configured Cloud agent. A request keeps its chosen agent after delivery is prepared.").font(.caption).foregroundStyle(.secondary)
             }
-            DeviceSavedLibrariesSection(device: device)
         }
         .sheet(item: $setup) { sheet in
             switch sheet {
@@ -73,7 +73,8 @@ struct DeviceAccountSettings: View {
 /// Cloud identity and listener state are independent of the preferred request route.
 struct DeviceCloudAccountSection: View {
     @ObservedObject var device: DeviceModel
-    @State private var confirmCatalogResume = false
+    @State private var confirmSignOut = false
+    @State private var signOutAccountID: String?
     let showListenerSetup: () -> Void
     private var accountActionsDisabled: Bool { device.routeChangeBlocked || device.accountOperationInProgress }
     var body: some View {
@@ -89,19 +90,6 @@ struct DeviceCloudAccountSection: View {
                         Text(email).textSelection(.enabled)
                         HStack { Spacer(); signOut }
                     }
-                }
-                if let backupStatus = device.catalogBackupStatus {
-                    Label(backupStatus, systemImage: "icloud")
-                        .font(.footnote).foregroundStyle(.secondary)
-                    Text("When enabled, backups start with current screens; earlier edits are unavailable. Live data and connection settings are not included.")
-                        .font(.footnote).foregroundStyle(.secondary)
-                }
-                if let previewStatus = device.catalogPreviewStatus {
-                    Text(previewStatus).font(.footnote).foregroundStyle(.secondary)
-                }
-                if device.catalogCanResume {
-                    Button("Resume backups with current screens") { confirmCatalogResume = true }
-                        .disabled(accountActionsDisabled)
                 }
                 Label(device.cloudListenerStatus.label, systemImage: device.cloudListenerStatus == .connected ? "checkmark.circle" : "clock")
                     .foregroundStyle(.secondary)
@@ -120,11 +108,12 @@ struct DeviceCloudAccountSection: View {
                 }
             }
         }
-        .alert("Resume current-screen backups?", isPresented: $confirmCatalogResume) {
-            Button("Cancel", role: .cancel) { }
-            Button("Resume backups") { device.resumeCatalogBackups() }
-        } message: {
-            Text("Edits made while backups were paused are not saved as history. Resume queues each current screen after the verified backup checkpoint.")
+        .alert("Sign out of Screenpunk Cloud?", isPresented: $confirmSignOut, presenting: signOutAccountID) { accountID in
+            Button("Keep on This iPad") { Task { await device.signOut(accountID: accountID, deleteScreens: false) } }
+            Button("Delete from This iPad", role: .destructive) { Task { await device.signOut(accountID: accountID, deleteScreens: true) } }
+            Button("Cancel", role: .cancel) {}
+        } message: { _ in
+            Text("Keep your screens here to see them when you sign in to this account again. Deleting them here leaves your Cloud backups available.")
         }
     }
     private var listenerSetup: some View {
@@ -135,29 +124,11 @@ struct DeviceCloudAccountSection: View {
             .buttonStyle(.borderless).disabled(accountActionsDisabled)
     }
     private var signOut: some View {
-        Button("Sign out", role: .destructive) { Task { await device.signOut() } }
-            .buttonStyle(.borderless).disabled(accountActionsDisabled)
-    }
-}
-
-struct DeviceSavedLibrariesSection: View {
-    @ObservedObject var device: DeviceModel
-    var body: some View {
-        if device.availableProfiles.count > 1 {
-            Section("Saved libraries") {
-                ForEach(device.availableProfiles) { profile in
-                    Button { device.selectProfile(profile.id) } label: {
-                        HStack {
-                            Text(device.profileLabel(profile))
-                            Spacer()
-                            if profile.id == device.activeProfile?.id { Image(systemName: "checkmark") }
-                        }
-                    }.disabled(device.accountOperationInProgress || device.routeChangeBlocked)
-                }
-                Text("Signing in opens that Cloud account’s library. Earlier libraries stay on this device. Selecting a previous Cloud library uses your local agent; its screens and permissions stay separate from the current Cloud account.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
+        Button("Sign out", role: .destructive) {
+            signOutAccountID = device.cloud.localAccountID
+            confirmSignOut = signOutAccountID != nil
         }
+        .buttonStyle(.borderless).disabled(accountActionsDisabled)
     }
 }
 

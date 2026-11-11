@@ -15,6 +15,7 @@ struct DeviceSession: Codable {
 enum CloudSignOutError: Error { case secureCredentialsNotCleared }
 struct AgentStatus: Decodable {
     let agentReady: Bool
+    let pluginConnected: Bool?
     let profileID: String?
     let authoringCapabilities: CloudAuthoringCapabilities?
     let latestRequest: Summary?
@@ -127,7 +128,30 @@ struct AgentStatus: Decodable {
         guard var value = session, value.profileID != profileID else { return }
         value.profileID = profileID; try SessionKeychain.save(value); session = value
     }
-    func call<T: Decodable>(_ path: String, method: String = "GET", body: Any? = nil, authenticated: Bool = true, authorizationToken: String? = nil, authoringVersion: Int = 1) async throws -> T {
+    func call<T: Decodable>(_ path: String, method: String = "GET", body: Any? = nil, authenticated: Bool = true, authorizationToken: String? = nil, authoringVersion: Int = 1, idempotencyKey: String? = nil, timelineRequestID: String? = nil) async throws -> T {
+#if DEBUG
+        let timeline: (start: RequestTimeline.Event, end: RequestTimeline.Event, id: String?, operation: RequestTimeline.Operation)?
+        if path == "api/device/status" && method == "GET" {
+            timeline = (.httpStatusStart, .httpStatusEnd, nil, .status)
+        } else if path == "api/device/requests", method == "POST", let timelineRequestID {
+            timeline = (.submitStart, .submitEnd, timelineRequestID, .submit)
+        } else {
+            let parts = path.split(separator: "/", omittingEmptySubsequences: false)
+            if parts.count == 4, parts.prefix(3).elementsEqual(["api", "device", "requests"]), method == "GET" {
+                timeline = (.reconcileStart, .reconcileEnd, String(parts[3]), .reconcile)
+            } else if parts.count == 5, parts.prefix(3).elementsEqual(["api", "device", "requests"]),
+                      parts[4] == "application-receipt", method == "POST" {
+                timeline = (.acknowledgementStart, .acknowledgementEnd, String(parts[3]), .acknowledgement)
+            } else {
+                timeline = nil
+            }
+        }
+        var timelineHTTPStatus: Int?
+        if let timeline { RequestTimeline.record(timeline.start, requestID: timeline.id) }
+        defer {
+            if let timeline { RequestTimeline.record(timeline.end, requestID: timeline.id, httpStatus: timelineHTTPStatus) }
+        }
+#endif
         var request = URLRequest(url: Self.origin.appendingPathComponent(path))
         request.httpMethod = method
         request.timeoutInterval = 25
@@ -136,6 +160,7 @@ struct AgentStatus: Decodable {
             guard let token = authorizationToken ?? session?.accessToken else { throw DeviceError.message("Sign in to Screenpunk to continue.") }
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
+        if let idempotencyKey { request.setValue(idempotencyKey, forHTTPHeaderField: "Idempotency-Key") }
         if let body {
             let bytes = try JSONSerialization.data(withJSONObject: body)
             guard bytes.count <= 768 * 1024 else { throw DeviceError.message("Request exceeded the device limit.") }
@@ -144,7 +169,23 @@ struct AgentStatus: Decodable {
         }
         let transport = URLSession(configuration: .ephemeral, delegate: NoRedirects(), delegateQueue: nil)
         defer { transport.finishTasksAndInvalidate() }
-        let (data, response) = try await transport.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do {
+#if DEBUG
+            if let timeline { RequestTimeline.record(.httpTransportStart, requestID: timeline.id, operation: timeline.operation) }
+            defer {
+                if let timeline {
+                    RequestTimeline.record(.httpTransportEnd, requestID: timeline.id, httpStatus: timelineHTTPStatus,
+                                           operation: timeline.operation)
+                }
+            }
+#endif
+            (data, response) = try await transport.data(for: request)
+#if DEBUG
+            timelineHTTPStatus = (response as? HTTPURLResponse)?.statusCode
+#endif
+        }
         guard data.count <= 768 * 1024 else { throw DeviceError.message("Cloud response exceeded the device limit.") }
         guard let http = response as? HTTPURLResponse else { throw DeviceError.message("Cloud did not respond.") }
         if http.statusCode == 401 { throw DeviceError.http(401, "Your connection has expired. Sign in again from Settings.") }
@@ -173,6 +214,7 @@ struct AgentStatus: Decodable {
         return try CatalogContract.verifyPackage(bytes, declaration: declaration)
     }
     private func catalogBytes(_ path: String, method: String, bytes: Data?, token: String, requestLimit: Int, responseLimit: Int, contentType: String) async throws -> Data {
+        try Task.checkCancellation()
         guard path.hasPrefix("/api/catalog"), let relative = URLComponents(string: path), relative.scheme == nil, relative.host == nil, relative.fragment == nil,
               bytes?.count ?? 0 <= requestLimit, var target = URLComponents(url: Self.origin, resolvingAgainstBaseURL: false) else { throw DeviceError.message("Backup request exceeded its limit.") }
         target.path = relative.path; target.queryItems = relative.queryItems
@@ -252,10 +294,11 @@ struct PreferenceSyncResponse: Decodable {
         let response: AgentRequest = try await cloud.call("api/device/requests", method: "POST", body: [
             "text": snapshot.context.userRequest, "idempotencyKey": snapshot.requestID,
             "snapshot": try Self.object(snapshot)
-        ])
+        ], timelineRequestID: snapshot.requestID)
         guard response.id == request.requestID, let accepted = response.snapshot else {
             throw DeviceError.message("Cloud did not confirm the authoring snapshot. Your screen is unchanged.")
         }
+        RequestTimeline.record(.submitAccepted, requestID: request.requestID)
         return accepted
     }
     func progress(requestID: String) async throws -> AuthoringProgress {
@@ -295,11 +338,12 @@ struct PreferenceSyncResponse: Decodable {
         let response: AgentRequestV2 = try await cloud.call("api/device/requests", method: "POST", body: [
             "text": snapshot.context.userRequest, "idempotencyKey": snapshot.requestID,
             "snapshot": try CloudAuthoringTransport.object(snapshot)
-        ], authoringVersion: 2)
+        ], authoringVersion: 2, timelineRequestID: snapshot.requestID)
         guard response.id == request.requestID, let accepted = response.snapshot,
               accepted == snapshot else {
             throw DeviceError.message("Cloud did not confirm the authoring snapshot. Your screen is unchanged.")
         }
+        RequestTimeline.record(.submitAccepted, requestID: request.requestID)
         return accepted
     }
     func progress(requestID: String) async throws -> AuthoringProgress {
@@ -395,7 +439,8 @@ private final class NoRedirects: NSObject, URLSessionTaskDelegate {
     private var transport: URLSession?
 
     func start(token: String, received: @escaping @MainActor (DeviceCloudNotice, Bool) -> Void,
-               disconnected: @escaping @MainActor (_ authorizationRejected: Bool) -> Void) {
+               disconnected: @escaping @MainActor (_ authorizationRejected: Bool) -> Void,
+               billingUpdated: @escaping @MainActor (DeviceBillingUpdateNotice) -> Void = { _ in }) {
         stop()
         runner = Task { [weak self] in
             var failures = 0
@@ -435,6 +480,7 @@ private final class NoRedirects: NSObject, URLSessionTaskDelegate {
                         case .string(let value): data = Data(value.utf8)
                         @unknown default: continue
                         }
+                        if let update = DeviceBillingUpdateNotice.decode(data) { billingUpdated(update); continue }
                         guard let notice = DeviceCloudNotice.decode(data) else { continue }
                         // A recognized server frame proves authentication and the
                         // upgrade. The initial status frame doubles as catch-up.

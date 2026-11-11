@@ -1,10 +1,10 @@
 # Screenpunk device
 
-Universal iOS 16+ app, using the existing Screenpunk bundle identity (`xyz.screenpunk.ios`) and Screenpunk development team. Installing replaces the previous app on the selected device; it does not update other devices. Open `ScreenpunkOne.xcodeproj`, select the ScreenpunkOne scheme, choose your development team and a connected iPad, and Run. Signing keys and provisioning profiles remain local; only the public team identifier is stored in source.
+Universal iOS 16+ app, using the existing Screenpunk bundle identity (`xyz.screenpunk.ios`) and Screenpunk development team. Installing replaces the previous app on the selected device; it does not update other devices. Open `ScreenpunkOne.xcodeproj`, select the ScreenpunkOne scheme, choose your development team and a connected iPad, and Run. Signing keys and provisioning profiles remain local; only the public team identifier is stored in source. Debug builds default to the staging Cloud origin and Release builds default to production.
 
 ## First device slice
 
-- System-browser Google sign-in through Screenpunk's native PKCE exchange; an opaque device token is stored in this app's Keychain namespace.
+- System-browser Apple and Google sign-in through Screenpunk's native PKCE exchange; an opaque device token is stored in this app's Keychain namespace.
 - A ready-agent gate backed by the Cloud event subscription, not merely an OAuth account grant.
 - Three-finger hold while talking, release to send. The native overlay shows microphone state and transcription. Microphone and speech permissions are requested on use; releasing during a permission dialog cancels that recording attempt. Apple Speech uses on-device recognition when available and otherwise may use Apple's service. Backgrounding or audio interruption cancels capture.
 - Complete UTF-8 screen packages are validated and committed locally with one atomic library write. The previous revision remains available in Settings. Existing screens continue running after Cloud disconnects. Source is retained for agent edits.
@@ -19,7 +19,9 @@ Home Assistant, Google TV and Google Calendar settings providers are retained. H
 
 ## Known boundaries to validate on a physical iPad
 
-Real Google sign-in, speech permissions, three-finger gesture behavior (including accessibility conflicts), Cloud request delivery, screen rendering, disconnect persistence, and signing need an end-to-end device run. Foreground device updates use an authenticated hibernating WebSocket for change notifications, followed by coalesced HTTP state reads. Routine three-second polling is removed. The client reconnects with bounded backoff and reauthenticates periodically. Account changes isolate local libraries. Expired sessions can be reauthorized from Settings; sign-out clears the Cloud session even if server revocation is unavailable; it keeps the active saved screens, native service credentials, and local authoring configuration available on this device.
+Real Apple and Google sign-in, speech permissions, three-finger gesture behavior (including accessibility conflicts), Cloud request delivery, screen rendering, disconnect persistence, and signing need an end-to-end device run. Signed-in foreground devices use an authenticated WebSocket for change notifications and coalesce the resulting HTTP state reads. The client reconnects with bounded backoff. Account changes isolate local libraries. Expired sessions can be reauthorized from Settings; sign-out lets you keep or delete that account’s screens on the iPad. It switches to the standalone local library and clears the Cloud session even if server revocation is unavailable. Signing in again opens the account’s library.
+
+Billing reflects the signed-in account on the selected Cloud origin. Purchases require sales to be enabled for that origin and the product to be available from the App Store. Cloud backups require an eligible account and user opt-in.
 
 Do not check in provisioning profiles, signing keys, bearer tokens, or generated build output.
 
@@ -29,7 +31,7 @@ Cloud submissions use the bundled contract in `packages/contracts`: immutable gu
 
 Screen installation, preference mutations, synchronization intent and application receipts commit through one durable library journal. Duplicate operations replay their original receipt; stale revisions conflict. Saved preferences and sync conflicts remain available to authoring; the manual Preferences editor is hidden. A local commit remains usable during sync failure. Settings > Account shows Screenpunk Cloud, Local agent, and Use for new requests (Automatic, Local, or Cloud). A prepared request keeps its original route.
 
-When a matching Cloud account is connected, preference synchronization runs independently of that route. Local commits wake synchronization before agent acknowledgement, while a foreground one-minute cadence also pulls remote changes. Offline failures retain the outbox and retry with bounded backoff; Local authoring does not await Cloud. Account, profile, device and session changes fence stale responses. Local-only profiles perform no Cloud synchronization, and Local application receipts stay on the Local route.
+When a matching Cloud account is connected, preference synchronization runs independently of that route. Local commits, Cloud notifications, and foreground connection recovery wake synchronization. Offline failures retain the outbox and retry with bounded backoff; Local authoring does not await Cloud. Account, profile, device and session changes fence stale responses. Local-only profiles perform no Cloud synchronization, and Local application receipts stay on the Local route.
 
 Account-owned screen directories and native credential ownership remain unchanged. A separate Keychain installation secret enrolls an existing authenticated device and preserves its account-scoped device identity across subsequent sign-ins. It is sent only to authenticated registration or native token exchange, never to screen source or an authoring snapshot. Account switching opens the selected account's library; inaccessible old-device delivery records are retained and quarantined. An old request without a verifiable native screen revision receives an explicit resend outcome instead of installing into a guessed target.
 

@@ -3,19 +3,64 @@ import XCTest
 import ScreenpunkCore
 @testable import DeviceAuthoring
 
+@MainActor enum CatalogFixture {
+    static func defaults(_ root: URL) -> UserDefaults {
+        UserDefaults(suiteName: root.lastPathComponent)!
+    }
+
+    static func open(_ root: URL, binding: ScreenLibrary.CatalogBinding, journalFault: AuthoringJournal.Fault? = nil) throws -> ScreenLibrary {
+        let library = try ScreenLibrary(accountID: binding.libraryID, rootDirectory: root, catalogDefaults: defaults(root), journalFault: journalFault)
+        library.setCatalogBackupScope(binding, validUntil: .distantFuture)
+        return library
+    }
+
+    static func enable(_ library: ScreenLibrary, binding: ScreenLibrary.CatalogBinding, maxRevisions: Int = 100) throws {
+        try library.setCatalogBackupsEnabled(true, binding: binding)
+        try library.activateCatalog(binding: binding, maxRevisions: maxRevisions)
+    }
+
+    static func cleanup(_ root: URL) {
+        defaults(root).removePersistentDomain(forName: root.lastPathComponent)
+        try? FileManager.default.removeItem(at: root)
+    }
+}
+
 final class ScreenLibraryCatalogTests: XCTestCase {
     private func directory() -> URL { FileManager.default.temporaryDirectory.appendingPathComponent("screenpunk-catalog-" + UUID().uuidString) }
     private func artifact(_ title: String) -> ScreenArtifact { .init(title: title, files: [.init(path: "index.html", content: "<html><body>\(title)</body></html>")]) }
     private var binding: ScreenLibrary.CatalogBinding { .init(origin: "https://example.test", accountID: "account", userID: "user", deviceID: "device", libraryID: "library") }
 
-    @MainActor func testWakeRequiresDurableQueuedRevision() throws {
-        let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
-        let library = try ScreenLibrary(accountID: "library", rootDirectory: root)
+    @MainActor func testBackupGrantDeadlineBlocksCaptureAndUploadWithoutDeletingQueueOrConsent() throws {
+        let root = directory(); defer { CatalogFixture.cleanup(root) }
+        let library = try CatalogFixture.open(root, binding: binding)
+        try CatalogFixture.enable(library, binding: binding)
+        try library.install(artifact("Queued"), requestID: "queued", replacing: "screen")
+        let pending = try XCTUnwrap(library.catalogQueue?.entries.first)
+
+        library.setCatalogBackupScope(binding, validUntil: .distantPast)
+        XCTAssertNil(library.catalogAuthorization(binding: binding))
+        XCTAssertTrue(library.catalogBackupsPreference(binding: binding))
+        XCTAssertThrowsError(try library.activateCatalog(binding: binding))
+        XCTAssertThrowsError(try library.exportCatalogIntent(pending, binding: binding))
+        try library.install(artifact("After expiry"), requestID: "expired", replacing: "screen")
+        XCTAssertEqual(library.catalogQueue?.entries.map(\.id), [pending.id])
+
+        library.setCatalogBackupScope(nil)
+        library.disableCatalogBackups(binding: binding)
+        XCTAssertFalse(library.catalogBackupsPreference(binding: binding))
+        library.setCatalogBackupScope(binding, validUntil: .distantFuture)
+        XCTAssertNil(library.catalogAuthorization(binding: binding), "An upgrade must not turn backups on again.")
+        XCTAssertEqual(library.catalogQueue?.entries.map(\.id), [pending.id])
+    }
+
+    @MainActor func testWakeRequiresConsentAndDurableQueuedRevision() throws {
+        let root = directory(); defer { CatalogFixture.cleanup(root) }
+        let library = try CatalogFixture.open(root, binding: binding)
         var wakes = 0
         library.onCatalogRevisionCommitted = { wakes += 1 }
         try library.install(artifact("Local only"), requestID: "offline", replacing: "screen")
         XCTAssertEqual(wakes, 0)
-        try library.activateCatalog(binding: binding)
+        try CatalogFixture.enable(library, binding: binding)
         XCTAssertEqual(wakes, 0)
         try library.install(artifact("New edit"), requestID: "edit", replacing: "screen")
         XCTAssertEqual(wakes, 1)
@@ -24,19 +69,154 @@ final class ScreenLibraryCatalogTests: XCTestCase {
         let head = try XCTUnwrap(library.catalogQueue?.entries.first)
         try library.updateCatalogIntent(head, binding: binding)
         try library.acknowledgeCatalogIntent(id: head.id, binding: binding)
+        try library.setCatalogBackupsEnabled(false, binding: binding)
+        try library.install(artifact("Off again"), requestID: "offline-again", replacing: "screen")
         XCTAssertEqual(wakes, 1)
     }
 
-    @MainActor func testLegacyInstallPinsEveryQueuedRevisionAcrossPruningAndRestart() throws {
-        let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
-        var library = try ScreenLibrary(accountID: "library", rootDirectory: root)
+    @MainActor func testDefaultOffRequiresOptInAndCapabilityBeforeSeedingCurrentScreens() throws {
+        let root = directory(); defer { CatalogFixture.cleanup(root) }
+        let library = try CatalogFixture.open(root, binding: binding)
+        XCTAssertNil(library.catalogAuthorization(binding: binding))
+        try library.install(artifact("Earlier"), requestID: "earlier", replacing: "screen")
+        XCTAssertThrowsError(try library.activateCatalog(binding: binding))
+        XCTAssertNil(library.catalogQueue)
+        try library.setCatalogBackupsEnabled(true, binding: binding)
+        try library.install(artifact("Current"), requestID: "current", replacing: "screen")
+        XCTAssertNil(library.catalogQueue)
         try library.activateCatalog(binding: binding)
+        try library.activateCatalog(binding: binding)
+        XCTAssertEqual(library.catalogQueue?.entries.map(\.title), ["Current"])
+        XCTAssertEqual(library.catalogQueue?.entries.map(\.origin), ["seed"])
+        try library.install(artifact("Future"), requestID: "future", replacing: "screen")
+        XCTAssertEqual(library.catalogQueue?.entries.map(\.origin), ["seed", "apply"])
+    }
+
+    @MainActor func testOffFreezesPendingRetryAndReenableSeedsOnlyCurrentOffEdit() throws {
+        let root = directory(); defer { CatalogFixture.cleanup(root) }
+        let library = try CatalogFixture.open(root, binding: binding)
+        try CatalogFixture.enable(library, binding: binding)
+        let authorized = try XCTUnwrap(library.catalogAuthorization(binding: binding))
+        try library.install(artifact("Pending"), requestID: "pending", replacing: "screen")
+        var pending = try XCTUnwrap(library.catalogQueue?.entries.first)
+        pending.retryAt = 100
+        try library.updateCatalogIntent(pending, binding: binding)
+        try library.setCatalogBackupsEnabled(false, binding: binding)
+        XCTAssertNil(library.catalogAuthorization(binding: binding))
+        XCTAssertThrowsError(try library.exportCatalogIntent(pending, binding: binding))
+        XCTAssertThrowsError(try library.restartExpiredCatalogOperation(intentID: pending.id, operationID: pending.operationID, binding: binding))
+        XCTAssertThrowsError(try library.acknowledgeCatalogIntent(id: pending.id, binding: binding))
+        try library.setCatalogBackupsEnabled(true, binding: binding)
+        XCTAssertNotEqual(library.catalogAuthorization(binding: binding), authorized, "The previous flight must fail its post-await check after off/on.")
+        try library.setCatalogBackupsEnabled(false, binding: binding)
+        let restart = try CatalogFixture.open(root, binding: binding)
+        XCTAssertNil(restart.catalogAuthorization(binding: binding))
+        try restart.install(artifact("Skip"), requestID: "skip", replacing: "screen")
+        try restart.install(artifact("Current"), requestID: "current", replacing: "screen")
+        XCTAssertEqual(restart.catalogQueue?.entries.map(\.id), [pending.id])
+        XCTAssertEqual(restart.catalogQueue?.copies["screen"]?.counter, 1)
+        XCTAssertNil(restart.catalogQueue?.copies["screen"]?.gapFrom)
+        try restart.setCatalogBackupsEnabled(true, binding: binding)
+        XCTAssertThrowsError(try restart.exportCatalogIntent(pending, binding: binding), "Consent alone cannot restore the stale capability.")
+        try restart.activateCatalog(binding: binding)
+        let entries = try XCTUnwrap(restart.catalogQueue?.entries)
+        XCTAssertEqual(entries.map(\.title), ["Pending", "Current"])
+        XCTAssertEqual(entries.map(\.counter), [1, 2])
+        XCTAssertEqual(entries[0].operationID, pending.operationID)
+        XCTAssertEqual(entries[0].retryAt, pending.retryAt)
+        XCTAssertEqual(entries[1].parentIDs, [pending.revision])
+        XCTAssertNil(entries[1].gap)
+    }
+
+    @MainActor func testLegacyQueueWithoutConsentDefaultsOffAndKeepsRollbackIdentity() throws {
+        for rolledBack in [false, true] {
+            let root = directory(); defer { CatalogFixture.cleanup(root) }
+            let library = try CatalogFixture.open(root, binding: binding)
+            try CatalogFixture.enable(library, binding: binding)
+            for title in ["First", "Latest"] {
+                try library.install(artifact(title), requestID: title, replacing: "screen")
+                let intent = try XCTUnwrap(library.catalogQueue?.entries.first)
+                try library.acknowledgeCatalogIntent(id: intent.id, binding: binding)
+            }
+            if rolledBack { try library.rollback() }
+            let metadata = root.appendingPathComponent("library.json")
+            var legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: metadata)) as? [String: Any])
+            var catalog = try XCTUnwrap(legacy["catalog"] as? [String: Any])
+            catalog.removeValue(forKey: "knownSavedRevisions")
+            legacy["catalog"] = catalog
+            try JSONSerialization.data(withJSONObject: legacy).write(to: metadata)
+            CatalogFixture.defaults(root).removeObject(forKey: binding.preferenceKey)
+
+            let restart = try CatalogFixture.open(root, binding: binding)
+            XCTAssertNil(restart.catalogAuthorization(binding: binding))
+            if !rolledBack { try restart.install(artifact("New while off"), requestID: "new", replacing: "screen") }
+            XCTAssertTrue(restart.catalogQueue?.entries.isEmpty == true)
+            try CatalogFixture.enable(restart, binding: binding)
+            XCTAssertEqual(restart.catalogQueue?.entries.map(\.title), rolledBack ? [] : ["New while off"])
+            XCTAssertEqual(restart.catalogQueue?.copies["screen"]?.counter, rolledBack ? 2 : 3)
+        }
+    }
+
+    @MainActor func testReenableDoesNotRenumberBackedUpRevisionRestoredAfterBranching() throws {
+        let root = directory(); defer { CatalogFixture.cleanup(root) }
+        let library = try CatalogFixture.open(root, binding: binding)
+        try CatalogFixture.enable(library, binding: binding)
+        for title in ["A", "B", "C"] {
+            try library.install(artifact(title), requestID: title, replacing: "screen")
+            try library.acknowledgeCatalogIntent(id: XCTUnwrap(library.catalogQueue?.entries.first?.id), binding: binding)
+        }
+        try library.rollback()
+        XCTAssertEqual(library.selected?.artifact.title, "B")
+        try library.setCatalogBackupsEnabled(false, binding: binding)
+        try library.install(artifact("D"), requestID: "D", replacing: "screen")
+        try CatalogFixture.enable(library, binding: binding)
+        let edit = try XCTUnwrap(library.catalogQueue?.entries.first)
+        XCTAssertEqual(edit.title, "D")
+        XCTAssertEqual(edit.revision, library.selected?.revision)
+        try library.acknowledgeCatalogIntent(id: edit.id, binding: binding)
+        try library.setCatalogBackupsEnabled(false, binding: binding)
+        try library.rollback()
+        let restart = try CatalogFixture.open(root, binding: binding)
+        XCTAssertEqual(restart.selected?.artifact.title, "B")
+        try CatalogFixture.enable(restart, binding: binding)
+        XCTAssertEqual(restart.catalogQueue?.entries.count, 0)
+        XCTAssertEqual(restart.catalogQueue?.copies["screen"]?.counter, 4)
+    }
+
+    @MainActor func testAccountEnvironmentAndEnrollmentChangesFencePreviousAuthorization() throws {
+        let root = directory(); defer { CatalogFixture.cleanup(root) }
+        let library = try CatalogFixture.open(root, binding: binding)
+        try CatalogFixture.enable(library, binding: binding)
+        try library.install(artifact("Private"), requestID: "private", replacing: "screen")
+        let pending = try XCTUnwrap(library.catalogQueue?.entries.first)
+        let prior = try XCTUnwrap(library.catalogAuthorization(binding: binding))
+        let fields: [WritableKeyPath<ScreenLibrary.CatalogBinding, String>] = [\.origin, \.accountID, \.userID, \.deviceID, \.libraryID]
+        for field in fields {
+            var other = binding
+            other[keyPath: field] += "-different"
+            library.setCatalogBackupScope(other, validUntil: .distantFuture)
+            XCTAssertNil(library.catalogAuthorization(binding: binding))
+            XCTAssertNil(library.catalogAuthorization(binding: other))
+            XCTAssertThrowsError(try library.activateCatalog(binding: other))
+            XCTAssertThrowsError(try library.exportCatalogIntent(pending, binding: binding))
+        }
+        library.setCatalogBackupScope(binding, validUntil: .distantFuture)
+        XCTAssertNotNil(library.catalogAuthorization(binding: binding))
+        XCTAssertNotEqual(library.catalogAuthorization(binding: binding), prior)
+        XCTAssertEqual(library.catalogQueue?.entries.first?.operationID, pending.operationID)
+    }
+
+    @MainActor func testLegacyInstallPinsEveryQueuedRevisionAcrossPruningAndRestart() throws {
+        let root = directory(); defer { CatalogFixture.cleanup(root) }
+        var library = try CatalogFixture.open(root, binding: binding)
+        try CatalogFixture.enable(library, binding: binding)
         for index in 0..<4 { try library.install(artifact("Edit \(index)"), requestID: "edit-\(index)", replacing: "screen") }
         let queue = try XCTUnwrap(library.catalogQueue)
         XCTAssertEqual(queue.entries.map(\.counter), [1, 2, 3, 4])
         XCTAssertEqual(Set(queue.entries.map(\.copyID)).count, 1)
         for item in queue.entries { XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(item.revision).path)) }
-        library = try ScreenLibrary(accountID: "library", rootDirectory: root)
+        library = try CatalogFixture.open(root, binding: binding)
+        try library.activateCatalog(binding: binding)
         XCTAssertEqual(library.catalogQueue?.entries.map(\.id), queue.entries.map(\.id))
         XCTAssertEqual(library.catalogQueue?.entries.last?.parentIDs, [queue.entries[2].revision])
         try library.acknowledgeCatalogIntent(id: queue.entries[0].id, binding: binding)
@@ -47,13 +227,13 @@ final class ScreenLibraryCatalogTests: XCTestCase {
     @MainActor func testCatalogIntentAndInstalledScreenRecoverAtEveryJournalCut() throws {
         enum PowerLoss: Error { case interrupted }
         for cut in AuthoringJournal.Cut.allCases {
-            let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
+            let root = directory(); defer { CatalogFixture.cleanup(root) }
             var armed = false
-            let library = try ScreenLibrary(accountID: "library", rootDirectory: root, journalFault: { if armed && $0 == cut { throw PowerLoss.interrupted } })
-            try library.activateCatalog(binding: binding)
+            let library = try CatalogFixture.open(root, binding: binding, journalFault: { if armed && $0 == cut { throw PowerLoss.interrupted } })
+            try CatalogFixture.enable(library, binding: binding)
             armed = true
             XCTAssertThrowsError(try library.install(artifact("Committed"), requestID: "edit", replacing: "screen"))
-            let restart = try ScreenLibrary(accountID: "library", rootDirectory: root)
+            let restart = try CatalogFixture.open(root, binding: binding)
             if cut == .assetsDurable {
                 XCTAssertNil(restart.selected)
                 XCTAssertTrue(restart.catalogQueue?.entries.isEmpty == true)
@@ -67,12 +247,12 @@ final class ScreenLibraryCatalogTests: XCTestCase {
     }
 
     @MainActor func testFullQueuePreservesPinsAndMakesDurableGapWhileEditingContinues() throws {
-        let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
-        let library = try ScreenLibrary(accountID: "library", rootDirectory: root)
-        try library.activateCatalog(binding: binding, maxRevisions: 2)
+        let root = directory(); defer { CatalogFixture.cleanup(root) }
+        let library = try CatalogFixture.open(root, binding: binding)
+        try CatalogFixture.enable(library, binding: binding, maxRevisions: 2)
         for index in 0..<5 { try library.install(artifact("Edit \(index)"), requestID: "edit-\(index)", replacing: "screen") }
         XCTAssertEqual(library.selected?.artifact.title, "Edit 4")
-        let restarted = try ScreenLibrary(accountID: "library", rootDirectory: root)
+        let restarted = try CatalogFixture.open(root, binding: binding)
         let queue = try XCTUnwrap(restarted.catalogQueue)
         XCTAssertEqual(queue.entries.count, 2)
         XCTAssertTrue(queue.paused)
@@ -84,9 +264,9 @@ final class ScreenLibraryCatalogTests: XCTestCase {
     }
 
     @MainActor func testAccountOrEnrollmentChangeCannotAdoptOrAcknowledgeOldQueue() throws {
-        let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
-        let library = try ScreenLibrary(accountID: "library", rootDirectory: root)
-        try library.activateCatalog(binding: binding)
+        let root = directory(); defer { CatalogFixture.cleanup(root) }
+        let library = try CatalogFixture.open(root, binding: binding)
+        try CatalogFixture.enable(library, binding: binding)
         try library.install(artifact("Private"), requestID: "edit", replacing: "screen")
         let id = try XCTUnwrap(library.catalogQueue?.entries.first?.id)
         var other = binding; other.userID = "other-user"
@@ -98,25 +278,25 @@ final class ScreenLibraryCatalogTests: XCTestCase {
     }
 
     @MainActor func testSeedIsCurrentOnlyAndDoesNotChangeOnSelectionOrInstruction() throws {
-        let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
-        let library = try ScreenLibrary(accountID: "library", rootDirectory: root)
+        let root = directory(); defer { CatalogFixture.cleanup(root) }
+        let library = try CatalogFixture.open(root, binding: binding)
         try library.install(artifact("Past"), requestID: "past", replacing: "screen")
         try library.install(artifact("Current"), requestID: "current", replacing: "screen")
-        try library.activateCatalog(binding: binding)
+        try CatalogFixture.enable(library, binding: binding)
         XCTAssertEqual(library.catalogQueue?.entries.count, 1)
         XCTAssertEqual(library.catalogQueue?.entries.first?.origin, "seed")
         XCTAssertEqual(library.catalogQueue?.entries.first?.title, "Current")
         try library.saveInstruction("No screen mutation")
         try library.newScreen()
-        try library.activateCatalog(binding: binding)
+        try CatalogFixture.enable(library, binding: binding)
         XCTAssertEqual(library.catalogQueue?.entries.count, 1)
     }
     @MainActor func testV1V2LocalAndCloudCommitsCaptureOnceAndReceiptAckIsIndependent() throws {
         for route in ["local", "cloud"] {
             for version in [1, 2] {
-                let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
-                let library = try ScreenLibrary(accountID: "library", rootDirectory: root)
-                try library.activateCatalog(binding: binding)
+                let root = directory(); defer { CatalogFixture.cleanup(root) }
+                let library = try CatalogFixture.open(root, binding: binding)
+                try CatalogFixture.enable(library, binding: binding)
                 let request = try AuthoringContract.seal(AuthoringRequestV1(requestID: "edit", createdAt: 1000, deadlineAt: 600000,
                     designGuidance: AuthoringContract.designGuidance, runtime: AuthoringContract.runtime, services: [], preferences: [],
                     context: .init(profileID: "profile", deviceID: "device", screenID: "screen", userRequest: "Create a screen", viewport: .init(width: 1024, height: 768, orientation: "landscape")),
@@ -147,9 +327,9 @@ final class ScreenLibraryCatalogTests: XCTestCase {
     }
 
     @MainActor func testExporterReadsFinalRetainedBytesAndStableCanonicalManifest() throws {
-        let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
-        let library = try ScreenLibrary(accountID: "library", rootDirectory: root)
-        try library.activateCatalog(binding: binding)
+        let root = directory(); defer { CatalogFixture.cleanup(root) }
+        let library = try CatalogFixture.open(root, binding: binding)
+        try CatalogFixture.enable(library, binding: binding)
         let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\"><text>Exact café bytes</text></svg>"
         let source = ScreenArtifact(title: "Assets", files: [.init(path: "index.html", content: "<html><body><img src=\"art.svg\"></body></html>"), .init(path: "art.svg", content: svg)])
         try library.install(source, requestID: "initial", replacing: "screen")
@@ -159,7 +339,8 @@ final class ScreenLibraryCatalogTests: XCTestCase {
         XCTAssertEqual(Data(base64Encoded: try XCTUnwrap(exported.package.files.first(where: { $0.path == "art.svg" })?.contentBase64)), Data(svg.utf8))
         let begin = try library.catalogBegin(first, declaration: exported.declaration, binding: binding)
         try CatalogContract.validateBegin(begin)
-        let restart = try ScreenLibrary(accountID: "library", rootDirectory: root)
+        let restart = try CatalogFixture.open(root, binding: binding)
+        try restart.activateCatalog(binding: binding)
         XCTAssertEqual(try restart.exportCatalogIntent(first, binding: binding).bytes, exported.bytes)
         XCTAssertEqual(first.packageDigest, exported.declaration.digest)
         XCTAssertEqual(first.packageBytes, exported.bytes.count)
@@ -178,9 +359,9 @@ final class ScreenLibraryCatalogTests: XCTestCase {
     }
 
     @MainActor func testExporterRejectsUnlistedFilesSymlinksAndCredentialsWithoutFailingScreenCommit() throws {
-        let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
-        let library = try ScreenLibrary(accountID: "library", rootDirectory: root)
-        try library.activateCatalog(binding: binding)
+        let root = directory(); defer { CatalogFixture.cleanup(root) }
+        let library = try CatalogFixture.open(root, binding: binding)
+        try CatalogFixture.enable(library, binding: binding)
         try library.install(artifact("Ordinary"), requestID: "initial", replacing: "screen")
         let intent = try XCTUnwrap(library.catalogQueue?.entries.first)
         let revision = root.appendingPathComponent(intent.revision)
@@ -199,9 +380,9 @@ final class ScreenLibraryCatalogTests: XCTestCase {
     }
 
     @MainActor func testExplicitResumeDeclaresGapAfterVerifiedPredecessorsAndSurvivesRestart() throws {
-        let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
-        let library = try ScreenLibrary(accountID: "library", rootDirectory: root)
-        try library.activateCatalog(binding: binding, maxRevisions: 1)
+        let root = directory(); defer { CatalogFixture.cleanup(root) }
+        let library = try CatalogFixture.open(root, binding: binding)
+        try CatalogFixture.enable(library, binding: binding, maxRevisions: 1)
         try library.install(artifact("First"), requestID: "first", replacing: "screen")
         let first = try XCTUnwrap(library.catalogQueue?.entries.first)
         try library.install(artifact("Skipped"), requestID: "skipped", replacing: "screen")
@@ -209,7 +390,8 @@ final class ScreenLibraryCatalogTests: XCTestCase {
         try library.acknowledgeCatalogIntent(id: first.id, binding: binding)
         XCTAssertTrue(library.catalogQueue?.paused == true)
         try library.resumeCatalog(binding: binding)
-        let restart = try ScreenLibrary(accountID: "library", rootDirectory: root)
+        let restart = try CatalogFixture.open(root, binding: binding)
+        try restart.activateCatalog(binding: binding)
         let resumed = try XCTUnwrap(restart.catalogQueue?.entries.first)
         XCTAssertEqual(resumed.counter, 3)
         XCTAssertEqual(resumed.gap?.checkpointCounter, 1)
@@ -223,13 +405,14 @@ final class ScreenLibraryCatalogTests: XCTestCase {
     }
 
     @MainActor func testExpiredLeaseRotatesOnlyOperationAndKeepsImmutableRevisionPinned() throws {
-        let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
-        let library = try ScreenLibrary(accountID: "library", rootDirectory: root)
-        try library.activateCatalog(binding: binding)
+        let root = directory(); defer { CatalogFixture.cleanup(root) }
+        let library = try CatalogFixture.open(root, binding: binding)
+        try CatalogFixture.enable(library, binding: binding)
         try library.install(artifact("Pinned"), requestID: "first", replacing: "screen")
         let before = try XCTUnwrap(library.catalogQueue?.entries.first)
         try library.restartExpiredCatalogOperation(intentID: before.id, operationID: before.operationID, binding: binding)
-        let restart = try ScreenLibrary(accountID: "library", rootDirectory: root)
+        let restart = try CatalogFixture.open(root, binding: binding)
+        try restart.activateCatalog(binding: binding)
         let after = try XCTUnwrap(restart.catalogQueue?.entries.first)
         XCTAssertEqual(after.id, before.id)
         XCTAssertNotEqual(after.operationID, before.operationID)
@@ -242,9 +425,9 @@ final class ScreenLibraryCatalogTests: XCTestCase {
     }
 
     @MainActor func testEntitlementPauseTracksGapAndCannotResetUnpublishedCopy() throws {
-        let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
-        let library = try ScreenLibrary(accountID: "library", rootDirectory: root)
-        try library.activateCatalog(binding: binding)
+        let root = directory(); defer { CatalogFixture.cleanup(root) }
+        let library = try CatalogFixture.open(root, binding: binding)
+        try CatalogFixture.enable(library, binding: binding)
         try library.setCatalogEntitlement(false, binding: binding)
         try library.install(artifact("First while paused"), requestID: "first", replacing: "screen")
         XCTAssertTrue(library.catalogQueue?.entries.isEmpty == true)
@@ -257,12 +440,12 @@ final class ScreenLibraryCatalogTests: XCTestCase {
     }
 
     @MainActor func testAuthenticationPauseSurvivesRestartAndOnlyMatchingSignInClearsIt() throws {
-        let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
-        let library = try ScreenLibrary(accountID: "library", rootDirectory: root)
-        try library.activateCatalog(binding: binding)
+        let root = directory(); defer { CatalogFixture.cleanup(root) }
+        let library = try CatalogFixture.open(root, binding: binding)
+        try CatalogFixture.enable(library, binding: binding)
         try library.install(artifact("Offline"), requestID: "first", replacing: "screen")
         try library.pauseCatalogAuthentication(binding: binding)
-        let restart = try ScreenLibrary(accountID: "library", rootDirectory: root)
+        let restart = try CatalogFixture.open(root, binding: binding)
         XCTAssertTrue(restart.catalogQueue?.authPaused == true)
         var other = binding; other.userID = "other"
         try restart.resumeCatalogAuthentication(binding: other)
@@ -273,9 +456,9 @@ final class ScreenLibraryCatalogTests: XCTestCase {
     }
 
     @MainActor func testAuthoritativeCollectorExportsQuotedAttributesPresentationReferencesAndEmptyAssets() throws {
-        let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
-        let library = try ScreenLibrary(accountID: "library", rootDirectory: root)
-        try library.activateCatalog(binding: binding)
+        let root = directory(); defer { CatalogFixture.cleanup(root) }
+        let library = try CatalogFixture.open(root, binding: binding)
+        try CatalogFixture.enable(library, binding: binding)
         let html = """
         <html><head><link title=">" rel="stylesheet" href="empty.css"><script src="empty.js"></script></head><body><img title=">" src="art.svg"><object data="object.svg"></object><a href="empty.txt">Read</a><svg><rect fill="url(paint.svg#x)" filter="url(filter.svg#f)" mask="url(mask.svg#m)" clip-path="url(clip.svg#c)" stroke="url(stroke.svg#s)" marker-start="url(marker.svg#i)" /></svg></body></html>
         """

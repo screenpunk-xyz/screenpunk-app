@@ -2,8 +2,8 @@ import XCTest
 @testable import DeviceAuthoring
 
 final class CloudListenerObservationTests: XCTestCase {
-    private func observation(ready: Bool? = true, account: String = "account-a", device: String = "ipad", profile: String? = "profile-a") -> CloudListenerObservation {
-        .init(accountID: account, deviceID: device, profileID: profile, ready: ready)
+    private func observation(ready: Bool? = true, account: String = "account-a", device: String = "ipad", profile: String? = "profile-a", pluginConnected: Bool? = nil) -> CloudListenerObservation {
+        .init(accountID: account, deviceID: device, profileID: profile, ready: ready, pluginConnected: pluginConnected)
     }
     private func status(_ observation: CloudListenerObservation?, account: String? = "account-a", device: String? = "ipad", profile: String? = "profile-a") -> CloudListenerObservation.Status {
         CloudListenerObservation.status(observation, accountID: account, deviceID: device, profileID: profile)
@@ -24,6 +24,54 @@ final class CloudListenerObservationTests: XCTestCase {
         XCTAssertEqual(status(observation(ready: nil)), .unavailable)
         XCTAssertEqual(status(nil), .unchecked)
     }
+    func testSettingsReadSurvivesSocketFailureAndDisconnect() {
+        var reads = CloudListenerObservations()
+        reads.publish(observation(ready: false), source: .direct, read: 1)
+        reads.publish(observation(ready: nil), source: .socket, read: 2)
+        reads.clearSocket()
+        XCTAssertEqual(status(reads.observation), .waiting)
+        reads.clear()
+        XCTAssertEqual(status(reads.observation), .unchecked)
+    }
+
+    func testNewerSocketStatusFencesDelayedSettingsReadEvenAfterDisconnect() {
+        var reads = CloudListenerObservations()
+        reads.publish(observation(), source: .socket, read: 2)
+        reads.publish(observation(ready: false), source: .direct, read: 1)
+        XCTAssertEqual(status(reads.observation), .connected)
+        reads.clearSocket()
+        reads.publish(observation(), source: .direct, read: 1)
+        XCTAssertEqual(status(reads.observation), .unchecked)
+        reads.publish(observation(ready: false), source: .direct, read: 3)
+        XCTAssertEqual(status(reads.observation), .waiting)
+    }
+
+    func testGrantCanBePresentBeforeListenerAndRequiresMatchingScope() {
+        let granted = observation(ready: false, pluginConnected: true)
+        XCTAssertEqual(status(granted), .waiting)
+        XCTAssertFalse(granted.canCompleteCloudSetup)
+        XCTAssertEqual(granted.pluginConnection(accountID: "account-a", deviceID: "ipad", profileID: "profile-a"), true)
+        XCTAssertNil(granted.pluginConnection(accountID: "account-b", deviceID: "ipad", profileID: "profile-a"))
+        XCTAssertNil(granted.pluginConnection(accountID: "account-a", deviceID: "other-ipad", profileID: "profile-a"))
+        XCTAssertNil(granted.pluginConnection(accountID: "account-a", deviceID: "ipad", profileID: "profile-b"))
+    }
+
+    func testRevocationAndUnavailabilityReplaceGrantWithoutInferringFromListener() {
+        var reads = CloudListenerObservations()
+        reads.publish(observation(pluginConnected: true), source: .direct, read: 1)
+        reads.publish(observation(pluginConnected: false), source: .direct, read: 2)
+        reads.publish(observation(pluginConnected: true), source: .direct, read: 1)
+        XCTAssertEqual(reads.observation?.pluginConnected, false)
+        XCTAssertEqual(status(reads.observation), .connected)
+        XCTAssertEqual(reads.observation?.canCompleteCloudSetup, false)
+        XCTAssertTrue(observation().canCompleteCloudSetup)
+        XCTAssertTrue(observation(pluginConnected: true).canCompleteCloudSetup)
+
+        reads.publish(observation(ready: nil), source: .direct, read: 3)
+        XCTAssertNil(reads.observation?.pluginConnected)
+        XCTAssertEqual(status(reads.observation), .unavailable)
+    }
+
     func testMissingServerProfileCannotEstablishReadiness() {
         XCTAssertEqual(status(observation(profile: nil)), .unavailable)
         XCTAssertEqual(status(observation(profile: "")), .unavailable)

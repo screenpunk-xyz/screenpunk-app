@@ -7,12 +7,9 @@ import ScreenpunkApple
 @MainActor
 final class DeviceDisplayPreferences: ObservableObject {
     @Published private(set) var settings: DeviceBrightnessSettings
-    @Published private(set) var error: String?
     private let defaults: UserDefaults
     private let key = "screenpunk.device.brightness.v1"
     private let controller = DeviceBrightnessController()
-    private var settingsBrightness: CGFloat?
-    private var readabilityBrightness: CGFloat?
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -24,52 +21,36 @@ final class DeviceDisplayPreferences: ObservableObject {
         controller.update(settings: settings)
     }
 
-    @discardableResult func save(_ value: DeviceBrightnessSettings) -> Bool {
-        do {
-            try value.validate()
-            defaults.set(try JSONEncoder().encode(value), forKey: key)
-            settings = value
-            controller.update(settings: value)
-            error = nil
-            return true
-        } catch {
-            self.error = "Use unique schedule times and add at least one time."
-            return false
-        }
+    func preview(_ value: DeviceBrightnessSettings) {
+        guard (try? value.validate()) != nil else { return }
+        controller.update(settings: value)
     }
 
-    func setActive(_ active: Bool, settingsPresented: Bool) {
-        // Release the screen override before making settings readable. Capture only
-        // our temporary readability adjustment, never change system Auto-Brightness.
-        if active && settingsPresented {
-            controller.setActive(false)
-            if settingsBrightness == nil {
-                settingsBrightness = UIScreen.main.brightness
-                let readable = max(UIScreen.main.brightness, 0.35)
-                readabilityBrightness = readable
-                UIScreen.main.brightness = readable
-            }
-        } else {
-            if let previous = settingsBrightness {
-                // Keep a manual Control Center change made while settings were open.
-                if let requested = readabilityBrightness, abs(UIScreen.main.brightness - requested) < 0.005 {
-                    UIScreen.main.brightness = previous
-                }
-                settingsBrightness = nil
-                readabilityBrightness = nil
-            }
-            controller.setActive(active)
+    func save(_ value: DeviceBrightnessSettings) {
+        guard (try? value.validate()) != nil else {
+            controller.update(settings: settings)
+            return
         }
+        if value != settings, let data = try? JSONEncoder().encode(value) {
+            defaults.set(data, forKey: key)
+            settings = value
+        }
+        controller.update(settings: settings)
     }
+
+    func setActive(_ active: Bool) { controller.setActive(active) }
 }
 
 struct DeviceDisplaySettings: View {
     @ObservedObject var preferences: DeviceDisplayPreferences
     @ObservedObject var device: DeviceModel
+    @Environment(\.scenePhase) private var scenePhase
+    @FocusState private var nameFocused: Bool
     @State private var deviceName = ""
-    @State private var nameSaved = false
+    @State private var nameAccountID: String?
     @State private var draft = DeviceBrightnessSettings()
-    @State private var saved = false
+    @State private var editingLevel = false
+    @State private var duplicateTime = false
 
     var body: some View {
         Form {
@@ -77,21 +58,21 @@ struct DeviceDisplaySettings: View {
                 TextField("Device name", text: $deviceName)
                     .textInputAutocapitalization(.words)
                     .submitLabel(.done)
-                    .onSubmit(saveDeviceName)
+                    .focused($nameFocused)
+                    .onSubmit(finishNameEditing)
+                    .disabled(device.accountOperationInProgress)
                     .accessibilityIdentifier("deviceName")
-                Button("Save device name", action: saveDeviceName)
-                    .disabled(!canSaveDeviceName)
-                if nameSaved { Text("Saved").foregroundStyle(.secondary) }
+                if deviceName != device.displayName, (try? DeviceNameStore.normalized(deviceName)) == nil {
+                    Text("Enter a valid device name.").foregroundStyle(.secondary)
+                }
             } header: {
                 Text("Device Name")
-            } footer: {
-                Text("Choose a name for this device in Screenpunk.")
             }
             Section("Brightness") {
-                Picker("Control", selection: $draft.mode) {
+                Picker("Control", selection: Binding(get: { draft.mode }, set: changeMode)) {
                     Text("System").tag(DeviceBrightnessMode.system)
-                    Text("Fixed level").tag(DeviceBrightnessMode.fixed)
-                    Text("Time of day").tag(DeviceBrightnessMode.schedule)
+                    Text("Fixed Level").tag(DeviceBrightnessMode.fixed)
+                    Text("Time of Day").tag(DeviceBrightnessMode.schedule)
                 }
                 if draft.mode == .fixed { levelSlider($draft.fixedLevel) }
                 if draft.mode == .schedule {
@@ -99,9 +80,17 @@ struct DeviceDisplaySettings: View {
                         VStack(alignment: .leading, spacing: 12) {
                             HStack {
                                 DatePicker("From", selection: timeBinding(index), displayedComponents: .hourAndMinute)
-                                Button(role: .destructive) { draft.schedule.remove(at: index) } label: {
+                                Button(role: .destructive) {
+                                    guard draft.schedule.indices.contains(index), draft.schedule.count > 1 else { return }
+                                    draft.schedule.remove(at: index)
+                                    duplicateTime = false
+                                    preferences.save(draft)
+                                } label: {
                                     Image(systemName: "minus.circle")
-                                }.accessibilityLabel("Remove brightness time")
+                                }
+                                .buttonStyle(.borderless)
+                                .disabled(draft.schedule.count <= 1)
+                                .accessibilityLabel("Remove brightness time")
                             }
                             levelSlider(levelBinding(index))
                         }.padding(.vertical, 4)
@@ -110,52 +99,79 @@ struct DeviceDisplaySettings: View {
                         let used = Set(draft.schedule.map(\.minuteOfDay))
                         if let minute = stride(from: 0, to: 1440, by: 30).first(where: { !used.contains($0) }) {
                             draft.schedule.append(.init(minuteOfDay: minute, level: 0.5))
+                            duplicateTime = false
+                            preferences.save(draft)
                         }
                     } label: { Label("Add time", systemImage: "plus") }
                     .disabled(draft.schedule.count >= 48)
-                    Text("The most recent time stays in effect overnight. Times follow this device’s local time zone.")
-                        .font(.footnote).foregroundStyle(.secondary)
-                }
-            }
-            Section {
-                Text(draft.mode == .system
-                     ? "Uses the device’s brightness and Auto-Brightness settings, including manual changes in Control Center."
-                     : "Applies while Screenpunk is active and restores your previous brightness when you leave. Scheduling cannot wake, lock, or turn off the iPad.")
-                Text("Settings remain readable while you edit. Saved brightness takes effect when you close settings.")
-            }.font(.footnote).foregroundStyle(.secondary)
-            Section {
-                Button("Save display settings") { saved = preferences.save(draft) }
-                    .disabled((try? draft.validate()) == nil)
-                if saved { Text("Saved").foregroundStyle(.secondary) }
-                if let error = preferences.error { Text(error).foregroundStyle(.red) }
-                if draft.mode == .schedule && (try? draft.validate()) == nil {
-                    Text("Add at least one time and keep each time unique.").foregroundStyle(.secondary)
+                    if duplicateTime {
+                        Text("Choose a different time for each brightness level.").foregroundStyle(.secondary)
+                    }
                 }
             }
         }
         .navigationTitle("General")
-        .onAppear { draft = preferences.settings; deviceName = device.displayName }
-        .onChange(of: deviceName) { _ in nameSaved = false }
-        .onChange(of: device.displayName) { deviceName = $0 }
-        .onChange(of: draft) { _ in saved = false }
+        .onAppear {
+            draft = preferences.settings
+            resetNameEditing()
+        }
+        .onChange(of: nameFocused) { if !$0 { saveDeviceName() } }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardDidHideNotification)) { _ in
+            if nameFocused { finishNameEditing() }
+        }
+        .onChange(of: device.displayName) { if !nameFocused { deviceName = $0 } }
+        .onChange(of: device.cloud.localAccountID) { _ in resetNameEditing() }
+        .onChange(of: device.accountOperationInProgress) { if $0 { resetNameEditing() } }
+        .onChange(of: scenePhase) { if $0 != .active { finishLevelEditing() } }
+        .onDisappear {
+            saveDeviceName()
+            finishLevelEditing()
+        }
     }
 
-    private var canSaveDeviceName: Bool {
-        guard let normalized = try? DeviceNameStore.normalized(deviceName) else { return false }
-        return normalized != device.displayName
+    private func finishNameEditing() {
+        saveDeviceName()
+        nameFocused = false
+    }
+
+    private func resetNameEditing() {
+        nameAccountID = device.cloud.localAccountID
+        deviceName = device.displayName
+        nameFocused = false
     }
 
     private func saveDeviceName() {
-        guard canSaveDeviceName else { return }
-        let requested = try? DeviceNameStore.normalized(deviceName)
-        device.updateDeviceName(deviceName)
+        guard !device.accountOperationInProgress, nameAccountID == device.cloud.localAccountID,
+              let normalized = try? DeviceNameStore.normalized(deviceName) else { return }
+        if normalized != device.displayName { device.updateDeviceName(normalized) }
         deviceName = device.displayName
-        nameSaved = requested == device.displayName
+    }
+
+    private func changeMode(_ mode: DeviceBrightnessMode) {
+        duplicateTime = false
+        draft.mode = mode
+        if mode == .schedule, draft.schedule.isEmpty {
+            draft.schedule = [.init(minuteOfDay: 0, level: draft.fixedLevel)]
+        }
+        preferences.save(draft)
+    }
+
+    private func finishLevelEditing() {
+        guard editingLevel else { return }
+        editingLevel = false
+        preferences.save(draft)
     }
 
     private func levelSlider(_ value: Binding<Double>) -> some View {
         HStack {
-            Slider(value: value, in: 0...1) { Text("Brightness") }
+            Slider(value: Binding(get: { value.wrappedValue }, set: { level in
+                value.wrappedValue = level
+                if editingLevel { preferences.preview(draft) }
+                else { preferences.save(draft) }
+            }), in: 0...1) { Text("Brightness") } onEditingChanged: { editing in
+                if editing { editingLevel = true }
+                else { finishLevelEditing() }
+            }
             Text("\(Int((value.wrappedValue * 100).rounded()))%")
                 .monospacedDigit().frame(minWidth: 44, alignment: .trailing)
         }
@@ -167,7 +183,14 @@ struct DeviceDisplaySettings: View {
         }, set: { date in
             guard draft.schedule.indices.contains(index) else { return }
             let time = Calendar.current.dateComponents([.hour, .minute], from: date)
-            draft.schedule[index].minuteOfDay = (time.hour ?? 0) * 60 + (time.minute ?? 0)
+            let minute = (time.hour ?? 0) * 60 + (time.minute ?? 0)
+            if draft.schedule.indices.contains(where: { $0 != index && draft.schedule[$0].minuteOfDay == minute }) {
+                duplicateTime = true
+                return
+            }
+            duplicateTime = false
+            draft.schedule[index].minuteOfDay = minute
+            preferences.save(draft)
         })
     }
     private func levelBinding(_ index: Int) -> Binding<Double> {

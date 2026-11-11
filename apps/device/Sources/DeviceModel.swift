@@ -28,6 +28,11 @@ import ScreenpunkLocalTransport
     @Published var canCancelRequest = false
     @Published var progressCaption = "Your agent is working…"
     @Published var takingLonger = false
+    @Published private var agentWorkingRequestID: String?
+    var showsAgentWorking: Bool {
+        guard let id = agentWorkingRequestID else { return false }
+        return id == pendingID && requestPending && busy && !canRetry && !accountOperationInProgress
+    }
     @Published var canRetry = false
     @Published var preferenceRecords: [PreferenceRecordV1] = []
     @Published var inactiveDevicePreferences: [PreferenceRecordV1] = []
@@ -50,14 +55,61 @@ import ScreenpunkLocalTransport
     private var previewByteLimit = CatalogContract.previewBytes
     private var previewDimensionLimit = CatalogContract.previewDimension
     @Published private(set) var activeProfile: LocalProfileDescriptor?
-    @Published private(set) var availableProfiles: [LocalProfileDescriptor] = []
     @Published private(set) var selectedRoute: AuthoringRoute = .local
     @Published private(set) var routePreference: AuthoringRoutePreference = .automatic
     @Published private(set) var cloudAgentReady = false
-    @Published private var cloudListenerObservation: CloudListenerObservation?
+    @Published private var cloudListenerObservations = CloudListenerObservations()
+    private var cloudListenerObservation: CloudListenerObservation? { cloudListenerObservations.observation }
+    private var listenerStatusRead: UInt64 = 0
+    private func nextListenerStatusRead() -> UInt64 {
+        listenerStatusRead += 1
+        return listenerStatusRead
+    }
     var cloudListenerStatus: CloudListenerObservation.Status {
-        CloudListenerObservation.status(cloudListenerObservation, accountID: cloud.localAccountID,
+        if cloudAuthorizationRejected, cloud.session != nil { return .unavailable }
+        return CloudListenerObservation.status(cloudListenerObservation, accountID: cloud.localAccountID,
             deviceID: cloud.session?.deviceId, profileID: cloud.session?.profileID)
+    }
+    /// Read Cloud status when Settings opens, even before the socket connects.
+    func checkListenerStatusOnSettingsEntry() {
+        refreshCloudSetupStatus(reconcileProfile: shouldCheckCloudSetup)
+    }
+    private func refreshCloudSetupStatus(reconcileProfile: Bool) {
+        cloudSetupStatusTask?.cancel()
+        cloudSetupStatusTask = nil
+        guard !accountOperationInProgress, !cloudAuthorizationRejected, let session = cloud.session,
+              let accountID = cloud.localAccountID else { return }
+        let profileID = activeProfile?.id
+        let binding = activeProfile?.cloudBinding
+        let read = nextListenerStatusRead()
+
+        cloudSetupStatusTask = Task { [weak self, cloud] in
+            guard !Task.isCancelled else { return }
+            let observation: CloudListenerObservation
+            do {
+                let status: AgentStatus = try await cloud.call("api/device/status", authorizationToken: session.accessToken)
+                observation = .init(accountID: accountID, deviceID: session.deviceId,
+                    profileID: status.profileID, ready: status.agentReady, pluginConnected: status.pluginConnected)
+            } catch {
+                observation = .init(accountID: accountID, deviceID: session.deviceId,
+                    profileID: session.profileID, ready: nil)
+            }
+
+            guard !Task.isCancelled, let self else { return }
+            self.cloudSetupStatusTask = nil
+            guard !self.accountOperationInProgress, !self.cloudAuthorizationRejected,
+                  self.activeProfile?.id == profileID, self.activeProfile?.cloudBinding == binding,
+                  cloud.localAccountID == accountID,
+                  cloud.session?.accessToken == session.accessToken,
+                  cloud.session?.deviceId == session.deviceId,
+                  cloud.session?.profileID == session.profileID else { return }
+            let published = self.cloudListenerObservations.publish(observation, source: .direct, read: read)
+            if published, reconcileProfile, observation.ready != nil, !self.routeChangeBlocked,
+               observation.matches(accountID: accountID, deviceID: session.deviceId,
+                                   profileID: session.profileID ?? binding?.profileID) {
+                try? self.reconcileCloudProfile(observation.profileID)
+            }
+        }
     }
     /// A status invalidation while Local is selected only reads listener state.
     /// It never discovers Cloud authoring requests or consumes Cloud commands.
@@ -66,11 +118,12 @@ import ScreenpunkLocalTransport
         listenerStatusPump.wake { [weak self] in
             guard let self, self.cloudSocketEpoch == epoch,
                   self.cloud.session?.accessToken == session.accessToken else { return true }
+            let read = self.nextListenerStatusRead()
             do {
                 let status: AgentStatus = try await self.cloud.call("api/device/status", authorizationToken: session.accessToken)
                 guard !Task.isCancelled, self.cloudSocketEpoch == epoch,
                       self.cloud.session?.accessToken == session.accessToken else { return true }
-                self.observeCloudListener(status)
+                self.observeCloudListener(status, read: read)
                 if !self.routeChangeBlocked { try self.reconcileCloudProfile(status.profileID) }
                 return true
             } catch {
@@ -81,18 +134,73 @@ import ScreenpunkLocalTransport
                     return true
                 }
                 if let accountID = self.cloud.localAccountID {
-                    self.cloudListenerObservation = .init(accountID: accountID, deviceID: session.deviceId,
-                        profileID: session.profileID, ready: nil)
+                    self.cloudListenerObservations.publish(.init(accountID: accountID, deviceID: session.deviceId,
+                        profileID: session.profileID, ready: nil), source: .socket, read: read)
                 }
                 return false
             }
         }
     }
-    private func observeCloudListener(_ status: AgentStatus) {
+    private func observeCloudListener(_ status: AgentStatus, read: UInt64) {
         guard cloudSocketEpoch != nil, let session = cloud.session, let accountID = cloud.localAccountID else { return }
-        cloudListenerObservation = .init(accountID: accountID, deviceID: session.deviceId,
-            profileID: status.profileID, ready: status.agentReady)
+        cloudListenerObservations.publish(.init(accountID: accountID, deviceID: session.deviceId,
+            profileID: status.profileID, ready: status.agentReady, pluginConnected: status.pluginConnected), source: .socket, read: read)
     }
+    #if DEBUG
+    private var shouldRestartGuideForTesting = ProcessInfo.processInfo.arguments.contains("--screenpunk-test-restart-guide")
+    #endif
+    @Published private(set) var onboarding: ScreenLibrary.Onboarding?
+    var needsAgentSetup: Bool { onboarding == .connectAgent }
+    private var onboardingCloudListenerReady: Bool {
+        cloudBindingMatches && cloudListenerStatus == .connected &&
+            cloudListenerObservation?.canCompleteCloudSetup == true &&
+            cloudListenerObservation?.profileID == activeProfile?.cloudBinding?.profileID
+    }
+    private var shouldCheckCloudSetup: Bool {
+        needsAgentSetup && cloudAccountMatches &&
+            (routePreference == .cloud || (routePreference == .automatic && localAgent?.lastSuccessfulConnectionAt == nil))
+    }
+    var onboardingCloudPluginConnected: Bool? {
+        guard shouldCheckCloudSetup, !accountOperationInProgress, !cloudAuthorizationRejected,
+              activeProfile?.cloudBinding == nil || cloudBindingMatches,
+              let session = cloud.session else { return nil }
+        return cloudListenerObservation?.pluginConnection(accountID: cloud.localAccountID, deviceID: session.deviceId,
+            profileID: session.profileID ?? activeProfile?.cloudBinding?.profileID)
+    }
+    var showsCloudPluginConnection: Bool {
+        shouldCheckCloudSetup && !onboardingCloudListenerReady && onboardingCloudPluginConnected != true
+    }
+    var showsCloudListenerSetup: Bool {
+        shouldCheckCloudSetup && !onboardingCloudListenerReady && onboardingCloudPluginConnected == true
+    }
+    var canFinishAgentSetup: Bool {
+        guard needsAgentSetup, !accountOperationInProgress, library?.hasTemporaryScreen == false else { return false }
+        return ScreenLibrary.Onboarding.agentIsReady(
+            route: routePreference,
+            verifiedLocal: localAgent?.lastSuccessfulConnectionAt != nil,
+            cloudListenerConnected: onboardingCloudListenerReady
+        )
+    }
+    var galleryIntroOwner: String? {
+        guard onboarding == .gallery, !accountOperationInProgress, library?.hasTemporaryScreen == false else { return nil }
+        return activeProfile?.libraryOwner
+    }
+    var canHideInstructions: Bool {
+        !needsAgentSetup && installedScreens.contains { !hiddenScreenIDs.contains($0.id) }
+    }
+    func finishAgentSetup() {
+        guard !settingsOpen, canFinishAgentSetup, let library else { return }
+        do { try library.finishAgentSetup() }
+        catch { message = error.localizedDescription }
+        onboarding = library.state.onboarding
+    }
+    func dismissGalleryIntro(owner: String) {
+        guard !accountOperationInProgress, activeProfile?.libraryOwner == owner, let library else { return }
+        do { try library.dismissGalleryIntro() }
+        catch { message = error.localizedDescription }
+        onboarding = library.state.onboarding
+    }
+
     @Published private(set) var resolvedAgentName: String?
     private var cloudSupportsV2 = false
     @Published private(set) var localAgent: LocalAgentConfiguration?
@@ -132,8 +240,7 @@ import ScreenpunkLocalTransport
         guard let binding = activeProfile?.cloudBinding, let session = cloud.session else { return false }
         return binding.accountID == cloud.localAccountID && binding.deviceID == session.deviceId && (session.profileID == nil || binding.profileID == session.profileID)
     }
-    private var lastProgressAt = Date()
-    private var warningDismissedAt = Date.distantPast
+    private var progressTiming = RequestProgressTiming()
     private var cancelledLocally = Set<String>()
     @Published var assets: PackageAssetStore?
     @Published var settingsOpen = false {
@@ -143,16 +250,18 @@ import ScreenpunkLocalTransport
             enqueuePreviewCaptures(previewCandidates)
         }
     }
-    @Published var settingsPage: DeviceSettingsPage = .overview
+    @Published var settingsPage: DeviceSettingsPage = .account
     @Published var canRollback = false
     @Published var manifestIssues: [String: String] = [:]
     @Published var installedManifests: [DashboardManifest] = []
     @Published var installedScreens: [ScreenLibrary.Saved] = []
+    @Published private(set) var hiddenScreenIDs: Set<String> = []
     @Published var manifest: DashboardManifest?
     @Published var homeAssistant: HomeAssistantDeviceRuntime?
     @Published var publicReads: PublicReadSession?
     @Published var publicReadSessionKey = ""
     let cloud = CloudClient()
+    let billing = DeviceBillingStore(backend: DeviceBillingBackend())
     private var library: ScreenLibrary?
     private var pendingID: String?
     private var pendingScreenID: String?
@@ -163,11 +272,12 @@ import ScreenpunkLocalTransport
     private var cloudAuthorizationRejected = false
     private var cloudSocketEpoch: UUID?
     private let listenerStatusPump = PreferenceSyncPump()
+    private var cloudSetupStatusTask: Task<Void, Never>?
     private var foreground = false
     private var connectionActive = false
     private var connectionGeneration = UUID()
-    private var refreshTask: Task<Void, Never>?
-    private var refreshNeeded = false
+    private let refreshPump = CatalogWorkPump()
+    private var refreshFailures = 0
     private struct PreferenceSyncBinding: Equatable {
         let generation: UUID
         let library: ObjectIdentifier
@@ -188,7 +298,9 @@ import ScreenpunkLocalTransport
         return .init(generation: connectionGeneration, library: ObjectIdentifier(library), profileID: profile.id, libraryOwner: profile.libraryOwner, cloud: binding, credential: session.accessToken, sessionProfileID: session.profileID)
     }
     init() {
+        RequestTimeline.record(.launch)
         email = cloud.session?.user.email
+        billing.observeAccount(self)
         do {
             profileRepository = try LocalProfileRepository()
             configurationRepository = try LocalAgentConfigurationRepository()
@@ -200,12 +312,20 @@ import ScreenpunkLocalTransport
             try openLibrary()
         } catch { message = "Could not open saved screens: \(error.localizedDescription)" }
     }
-    func signIn() async {
+    func signIn(fromCloudOnboarding: Bool = false) async {
         guard !accountOperationInProgress else { return }
         guard !routeChangeBlocked else { message = "Finish or cancel the current request before changing accounts."; return }
         accountOperationInProgress = true; defer { accountOperationInProgress = false; startConnection() }
         stopConnection()
-        busy = true; defer { busy = pendingID != nil }
+        library?.setCatalogBackupScope(nil)
+        var signedIn = false
+        busy = true
+        defer {
+            busy = pendingID != nil
+            if signedIn, fromCloudOnboarding, needsAgentSetup, routePreference == .local {
+                selectRoutePreference(.cloud)
+            }
+        }
         do {
             let authenticated = try await cloud.signIn()
             detachAccountLibrary()
@@ -215,29 +335,56 @@ import ScreenpunkLocalTransport
             if let profile = activeProfile, let account = cloud.localAccountID {
                 try library?.resumeCatalogAuthentication(binding: .init(origin: CloudClient.origin.absoluteString, accountID: account, userID: authenticated.user.id, deviceID: authenticated.deviceId, libraryID: profile.libraryOwner))
             }
+            signedIn = true
         }
         catch is CancellationError { message = nil }
         catch { message = error.localizedDescription }
     }
-    func signOut() async {
-        guard !accountOperationInProgress else { return }
+    func signOut(accountID: String, deleteScreens: Bool) async {
+        guard !accountOperationInProgress, cloud.localAccountID == accountID else { return }
         guard !routeChangeBlocked else { message = "Finish or cancel the current request before changing accounts."; return }
+        var deletionProfile: LocalProfileDescriptor?
+        if deleteScreens {
+            do {
+                guard let profileRepository else { throw DeviceError.message("Local identity storage is unavailable.") }
+                deletionProfile = try profileRepository.accountProfile(accountID: accountID)
+            } catch {
+                message = "Couldn’t check this account’s saved screens. Try signing out again."
+                return
+            }
+        }
         accountOperationInProgress = true; defer { accountOperationInProgress = false; startConnection() }
         stopConnection()
-        do { try await cloud.signOut(); message = nil }
+        library?.setCatalogBackupScope(nil)
+        detachAccountLibrary()
+        var notices: [String] = []
+        do { try await cloud.signOut() }
         catch CloudSignOutError.secureCredentialsNotCleared {
-            message = "Disconnected for now. This device could not clear its saved sign-in, so it may return after restarting the app. Unlock and restart the app, then sign out again."
+            notices.append("This iPad couldn’t clear its saved sign-in. Unlock and restart the app, then sign out again.")
         }
-        catch { message = "Signed out on this device. Cloud revocation could not be confirmed; disconnect it from your account when online." }
+        catch { notices.append("Cloud sign-out couldn’t be confirmed. You can disconnect this iPad from your account when online.") }
         email = nil
-        do { try profileRepository?.signOut(); try openLibrary() }
-        catch { message = error.localizedDescription }
+        if deleteScreens {
+            do {
+                if let deletionProfile {
+                    guard let localLedger else { throw DeviceError.message("Local delivery storage is unavailable.") }
+                    try localLedger.discardScreenResults(profileID: deletionProfile.id)
+                }
+                try ScreenLibrary.deleteAccountScreens(accountID: accountID, profile: deletionProfile)
+                notices.append("Account screens deleted from this iPad.")
+            } catch { notices.append("Couldn’t finish deleting the saved screens. Sign in again to retry.") }
+        } else {
+            notices.append("Your screens are still saved on this iPad. Sign in to this account again to see them.")
+        }
+        do { try openLibrary() }
+        catch { notices.append("Couldn’t open the local library: \(error.localizedDescription)") }
+        message = notices.joined(separator: "\n")
         settingsOpen = false
     }
     /// Runs independently of Cloud I/O, including when outbound requests are stalled.
     func reconcileTemporary() {
         let settled = settleAcknowledgedPending()
-        takingLonger = requestPending && Date().timeIntervalSince(max(lastProgressAt, warningDismissedAt)) >= 60
+        takingLonger = requestPending && progressTiming.isTakingLonger(at: Date())
         if !settled, requestPending, currentRequestRoute == .local, let id = pendingID, let library {
             if let snapshot = library.authoringRequestV2(id: id) {
                 if recoveryAction(snapshot, library: library) == .cancelExpired { cancelKnownRequest(id, timedOut: true) }
@@ -264,6 +411,7 @@ import ScreenpunkLocalTransport
             activeProfile = try profileRepository?.activateCloudProfile(accountID: accountID, profileID: profileID, deviceID: session.deviceId)
         }
         try cloud.rememberProfile(profileID)
+        refreshCatalogScope()
         refreshPreferences()
         requestPreferenceSync()
         requestCatalogCatchUp()
@@ -282,9 +430,10 @@ import ScreenpunkLocalTransport
             try await syncInventory()
             guard cloud.session?.accessToken == token, foreground, generation == connectionGeneration, !Task.isCancelled else { return true }
             let socketEpoch = cloudSocketEpoch
+            let read = nextListenerStatusRead()
             let status: AgentStatus = try await cloud.call("api/device/status")
             guard cloud.session?.accessToken == token, foreground, generation == connectionGeneration, !Task.isCancelled else { return true }
-            if cloudSocketEpoch == socketEpoch { observeCloudListener(status) }
+            if cloudSocketEpoch == socketEpoch { observeCloudListener(status, read: read) }
             try reconcileCloudProfile(status.profileID)
             if cloudBindingMatches {
                 try await syncInventory()
@@ -334,12 +483,13 @@ import ScreenpunkLocalTransport
                 if cancelledLocally.contains(id) { cancelKnownRequest(id); return false }
                 switch delivery {
                 case .completed(let result):
+                    agentWorkingRequestID = nil
                     let receipt: ApplicationReceiptV1
                     if library?.authoringRequest(id: id)?.context.screenID == "legacy" {
                         guard let library else { throw DeviceError.message("Local authoring storage is unavailable.") }
                         receipt = try library.rejectAuthoringResult(result, reason: "This request started before verified screen revisions were available. Please send your instructions again to edit the current screen.")
                     } else {
-                        receipt = try authoring.apply(result)
+                        receipt = try measureRequestApply(id) { try authoring.apply(result) }
                     }
                     requestPreferenceSync() // Native commit precedes any transport acknowledgement.
                     refreshScreen(); refreshPreferences()
@@ -349,22 +499,25 @@ import ScreenpunkLocalTransport
                     try await syncInventory()
                     guard cloud.session?.accessToken == token, foreground, generation == connectionGeneration, !Task.isCancelled else { return true }
                 case .deliveryUncertain(let failure), .needsAttention(let failure):
+                    agentWorkingRequestID = nil
                     busy = true; requestPending = true; canCancelRequest = true; canRetry = false; progressCaption = failure
                 case .ended(let status, let failure):
                     try finishRequest(id, status: status, failure: failure)
                 case .pending(let progress):
+                    agentWorkingRequestID = id
                     if let deadline = progress.deadlineAt {
                         try library?.submissionAccepted(deadline: deadline)
                         if Date().timeIntervalSince1970 * 1000 >= deadline { cancelKnownRequest(id, timedOut: true); return false }
                     }
                     busy = true; requestPending = true; canCancelRequest = true; canRetry = false
                     progressCaption = progress.caption ?? "Your agent is working…"
-                    lastProgressAt = Date(timeIntervalSince1970: (progress.updatedAt ?? Date().timeIntervalSince1970 * 1000) / 1000)
+                    progressTiming.lastProgressAt = Date(timeIntervalSince1970: (progress.updatedAt ?? Date().timeIntervalSince1970 * 1000) / 1000)
                 }
             }
             return true
         } catch {
             guard cloud.session?.accessToken == token, foreground, generation == connectionGeneration, !Task.isCancelled else { return true }
+            agentWorkingRequestID = nil
             if (error as? DeviceError)?.authorizationRejected == true { rejectCloudAuthorization() }
             agentReady = routePreference == .automatic && localAgent != nil
             if pendingID != nil { busy = true }
@@ -381,7 +534,8 @@ import ScreenpunkLocalTransport
         // native descriptor. Rebind idle adapters before capturing any new request.
         if !busy, pendingID == nil, library?.state.submissionKey == nil, localAgent != nil,
            localTransportAuthoringProfileID != activeProfile?.authoringProfileID { reloadLocalAgent() }
-        guard !busy, let library, let profile = activeProfile else { return }
+        guard !busy, let library, let profile = activeProfile,
+              !needsAgentSetup || library.state.submissionKey != nil else { return }
         if let key = library.state.submissionKey {
             guard !cancelledLocally.contains(key) else { message = "This saved request was cancelled. Wait for cancellation confirmation before sending again."; requestRefresh(); return }
             guard library.state.submissionText == text else { message = "Your previous delivery is unresolved. Retry or cancel it first."; return }
@@ -396,6 +550,11 @@ import ScreenpunkLocalTransport
         let endpoint = try? configurationRepository?.load()
         let token = cloud.session?.accessToken
         let selectedScreen = screen?.revision
+        agentWorkingRequestID = nil
+        // Preflight is already visible pending work. Reset the prior request's warning
+        // before publishing that state or awaiting either agent's readiness.
+        progressTiming.begin(at: Date())
+        takingLonger = false; canRetry = false
         busy = true; requestPending = true; canCancelRequest = false; message = nil; progressCaption = "Checking available agents…"
         do {
             try library.saveInstruction(text)
@@ -425,13 +584,22 @@ import ScreenpunkLocalTransport
             await submitPreparedV2(snapshot, library: library)
         } catch {
             guard self.library === library, activeProfile?.id == profile.id else { return }
+            agentWorkingRequestID = nil
             busy = false; requestPending = false
-            canRetry = true; canCancelRequest = library.state.submissionKey != nil
+            // No delivery exists when listener preflight fails. Keep the saved
+            // instruction, but let the existing Dismiss action close this notice.
+            canRetry = !(error is CloudListenerSetupRequired)
+            canCancelRequest = library.state.submissionKey != nil
             message = error is CancellationError ? "The connection changed while checking agents. Your instructions are saved here; send them again when ready." : "Your instructions are saved here. " + error.localizedDescription
         }
     }
+    private struct CloudListenerSetupRequired: LocalizedError {
+        var errorDescription: String? { "Ask your Cloud agent to listen for requests." }
+    }
     private struct ResolvedRoute { let route: AuthoringRoute; let version: Int }
     private func resolveNewRequest(requiresV2: Bool) async throws -> ResolvedRoute {
+        RequestTimeline.record(.preflightStart)
+        defer { RequestTimeline.record(.preflightEnd) }
         if routePreference != .cloud {
             let generation = connectionGeneration
             await localConnectionLifecycle.wait()
@@ -456,7 +624,7 @@ import ScreenpunkLocalTransport
             case .needsComputer: throw DeviceError.message("Your computer is unavailable. " + LocalAgentSettingsModel.unavailableGuidance(for: localAgent))
             case .repairComputer: throw DeviceError.message(repairMessage)
             case .connectCloud: throw DeviceError.message(routePreference == .cloud ? "Connect your Cloud agent in Account." : "The computer is unavailable and no matching Cloud agent is configured. Reconnect the computer in Account, or sign in to use Cloud.")
-            case .listenCloud: throw DeviceError.message("Ask your Cloud agent to listen for requests, then retry.")
+            case .listenCloud: throw CloudListenerSetupRequired()
             case .updateCloud: throw DeviceError.message("Your Cloud agent needs the asset-preserving update before it can edit this screen. Refresh its Screenpunk tools or reconnect your computer.")
             case .checkCloud: throw DeviceError.message("Cloud readiness could not be checked. Retry shortly.")
             }
@@ -519,8 +687,9 @@ import ScreenpunkLocalTransport
         }
         let generation = connectionGeneration
         selectedRoute = route; resolvedAgentName = route == .local ? (localAgent?.name ?? "Local agent") : "Cloud agent"
+        agentWorkingRequestID = nil
         busy = true; requestPending = true; canCancelRequest = true; canRetry = false; takingLonger = false
-        lastProgressAt = Date(); warningDismissedAt = .distantPast
+        progressTiming.begin(at: Date())
         pendingID = snapshot.requestID; pendingScreenID = snapshot.context.screenID
         progressCaption = "Sending to \(resolvedAgentName ?? "your agent")…"
         do {
@@ -529,9 +698,11 @@ import ScreenpunkLocalTransport
             guard self.library === library, generation == connectionGeneration else { return }
             if cancelledLocally.contains(accepted.requestID) { cancelKnownRequest(accepted.requestID); return }
             try library.submissionAccepted(deadline: Double(accepted.deadlineAt))
+            agentWorkingRequestID = accepted.requestID
             progressCaption = "\(resolvedAgentName ?? "Your agent") is working on this screen…"
         } catch {
             guard self.library === library, generation == connectionGeneration else { return }
+            agentWorkingRequestID = nil
             // Once prepared, even failures before/after acceptance stay on this route.
             progressCaption = error.localizedDescription
             if route == .cloud, library.state.submissionKey == snapshot.requestID {
@@ -557,6 +728,7 @@ import ScreenpunkLocalTransport
         do {
             // A receipt can precede network acknowledgement at any crash boundary.
             if let receipt = library.state.authoring?.receipts.values.first(where: { $0.requestID == id }) {
+                agentWorkingRequestID = nil
                 try await coordinator.acknowledge(receipt)
                 guard self.library === library, generation == connectionGeneration else { return true }
                 consumedID = id; pendingID = nil; busy = false; requestPending = false; canCancelRequest = false; canRetry = false; takingLonger = false
@@ -568,19 +740,22 @@ import ScreenpunkLocalTransport
             if cancelledLocally.contains(id) { return true }
             switch delivery {
             case .completed(let result):
-                let receipt = try coordinator.apply(result)
+                agentWorkingRequestID = nil
+                let receipt = try measureRequestApply(id) { try coordinator.apply(result) }
                 if snapshot.delivery.route == "cloud" || (receipt.status == "applied" && result.preferenceMutations?.isEmpty == false) {
                     requestPreferenceSync() // A stalled acknowledgement must not delay a committed preference.
                 }
                 refreshScreen(); refreshPreferences()
                 message = receipt.status == "applied" ? (result.preferenceMutations?.isEmpty == false ? "Preference saved" : result.answer) : (receipt.message ?? "Your screen is unchanged.")
                 // Keep pending identity until acknowledgement; restart can finish the exact receipt.
+                agentWorkingRequestID = nil
                 try await coordinator.acknowledge(receipt)
                 guard self.library === library, generation == connectionGeneration else { return true }
                 consumedID = id; pendingID = nil; busy = false; requestPending = false; canCancelRequest = false; canRetry = false; takingLonger = false
                 try persistPending()
             case .ended(let status, let failure): try finishRequest(id, status: status, failure: failure)
             case .pending(let progress):
+                agentWorkingRequestID = id
                 if let deadline = progress.deadlineAt {
                     try library.submissionAccepted(deadline: deadline)
                     // This response is authoritative pending work, not an expired local snapshot.
@@ -588,13 +763,15 @@ import ScreenpunkLocalTransport
                 }
                 busy = true; requestPending = true; canCancelRequest = true; canRetry = false
                 progressCaption = progress.caption ?? "\(resolvedAgentName ?? "Your agent") is working…"
-                if let updated = progress.updatedAt { lastProgressAt = Date(timeIntervalSince1970: updated / 1000) }
+                if let updated = progress.updatedAt { progressTiming.lastProgressAt = Date(timeIntervalSince1970: updated / 1000) }
             case .deliveryUncertain(let failure), .needsAttention(let failure):
+                agentWorkingRequestID = nil
                 busy = true; requestPending = true; canCancelRequest = true; canRetry = false; progressCaption = failure
             }
-            return pendingID == nil
+            return AuthoringRefreshPolicy.reconciliationSucceeded(delivery, route: snapshot.delivery.route)
         } catch {
             guard self.library === library, generation == connectionGeneration else { return true }
+            agentWorkingRequestID = nil
             progressCaption = error.localizedDescription; canCancelRequest = true
             if snapshot.delivery.route == "cloud", library.state.submissionKey == id {
                 busy = false; requestPending = false; canRetry = true
@@ -612,7 +789,6 @@ import ScreenpunkLocalTransport
             if preference == .local { selectedRoute = .local }
             else if preference == .cloud { selectedRoute = .cloud }
             else { selectedRoute = localAgent == nil && cloudBindingMatches ? .cloud : .local }
-            availableProfiles = try profileRepository?.snapshot().profiles ?? []
             refreshAuthoringRoute()
         } catch { message = error.localizedDescription }
     }
@@ -624,8 +800,9 @@ import ScreenpunkLocalTransport
             canRetry = true; requestRefresh(); return
         }
         let generation = connectionGeneration
+        agentWorkingRequestID = nil
         busy = true; requestPending = true; canCancelRequest = false; takingLonger = false; canRetry = false
-        lastProgressAt = Date(); warningDismissedAt = .distantPast
+        progressTiming.begin(at: Date())
         progressCaption = "Sending your instructions…"; message = nil
         do {
             let snapshot: AuthoringRequestV1
@@ -644,10 +821,12 @@ import ScreenpunkLocalTransport
             guard cloud.session?.accessToken == session.accessToken, self.library === library, generation == connectionGeneration else { return }
             if cancelledLocally.contains(accepted.requestID) { cancelKnownRequest(accepted.requestID); return }
             try library.submissionAccepted(deadline: Double(accepted.deadlineAt))
+            agentWorkingRequestID = accepted.requestID
             pendingID = accepted.requestID; try persistPending()
             canCancelRequest = true; progressCaption = "Your agent is working on this screen…"; requestRefresh()
         } catch {
             guard cloud.session?.accessToken == session.accessToken, self.library === library, generation == connectionGeneration else { return }
+            agentWorkingRequestID = nil
             busy = false; requestPending = false; canRetry = true; canCancelRequest = library.state.submissionKey != nil; message = error.localizedDescription; requestRefresh()
         }
     }
@@ -690,8 +869,14 @@ import ScreenpunkLocalTransport
         let source = screen.map { AuthoringScreen(title: $0.artifact.title, entry: $0.artifact.entry, files: $0.artifact.files.map { .init(path: $0.path, content: $0.content) }) }
         return try AuthoringContract.seal(AuthoringRequestV1(requestID: UUID().uuidString, createdAt: now, deadlineAt: now + 10 * 60 * 1000, designGuidance: AuthoringContract.designGuidance, runtime: AuthoringContract.runtime, services: services, preferences: library.preferences(profileID: profileID, deviceID: deviceID, screenID: screenID), context: .init(profileID: profileID, deviceID: deviceID, screenID: screenID, baseRevision: screen?.revision, userRequest: text, currentScreen: source, viewport: .init(width: size.width, height: size.height, scale: scale, orientation: size.width > size.height ? "landscape" : "portrait")), delivery: .init(route: route.rawValue)))
     }
-    func keepWaiting() { warningDismissedAt = Date(); takingLonger = false }
+    private func measureRequestApply(_ requestID: String, _ apply: () throws -> ApplicationReceiptV1) rethrows -> ApplicationReceiptV1 {
+        RequestTimeline.record(.applyStart, requestID: requestID)
+        defer { RequestTimeline.record(.applyEnd, requestID: requestID) }
+        return try apply()
+    }
+    func keepWaiting() { progressTiming.warningDismissedAt = Date(); takingLonger = false }
     private func finishRequest(_ id: String, status: String, failure: String?) throws {
+        if agentWorkingRequestID == id { agentWorkingRequestID = nil }
         try library?.retireAuthoringRequest(id: id)
         let alreadyApplied = status == CloudRequestRecovery.alreadyAppliedStatus
         message = alreadyApplied ? nil : (status == "timed_out" ? "This request timed out. Your screen is unchanged." : (failure ?? "Request ended. Your screen is unchanged."))
@@ -714,6 +899,7 @@ import ScreenpunkLocalTransport
         cancelKnownRequest(id)
     }
     private func cancelKnownRequest(_ id: String, timedOut: Bool = false) {
+        if agentWorkingRequestID == id { agentWorkingRequestID = nil }
         cancelledLocally.insert(id)
         let route = currentRequestRoute
         // Cancellation retires the native source snapshot. Capture its adapter
@@ -900,10 +1086,26 @@ import ScreenpunkLocalTransport
             refreshPreferences(); requestRefresh()
         } catch { message = error.localizedDescription }
     }
+    var allInstalledScreensHidden: Bool {
+        onboarding != .connectAgent && onboarding != .gallery &&
+            hiddenScreenIDs.contains(ScreenLibrary.instructionsID) && installedScreens.allSatisfy { hiddenScreenIDs.contains($0.id) }
+    }
+
+    func setScreenShown(_ shown: Bool, id: String, owner: String) {
+        guard !needsAgentSetup, !accountOperationInProgress, !owner.isEmpty, permissionOwner == owner, let library,
+              shown || id != ScreenLibrary.instructionsID || canHideInstructions else { return }
+        do {
+            let oldSelection = library.state.selectedID
+            try library.setScreenShown(shown, id: id)
+            if oldSelection != library.state.selectedID { refreshScreen() }
+            else { hiddenScreenIDs = library.state.hiddenScreenIDs ?? [] }
+        } catch { message = error.localizedDescription }
+    }
+
     func selectScreen(_ id: String) {
-        guard let library, let target = library.state.screens.firstIndex(where: { $0.id == id }) else { return }
-        let current = library.state.screens.firstIndex(where: { $0.id == library.state.selectedID }) ?? 0
-        do { try library.select(offset: target - current); refreshScreen(); settingsOpen = false }
+        guard !needsAgentSetup, !accountOperationInProgress, let library, library.isScreenShown(id),
+              library.containsRotationScreen(id) else { return }
+        do { try library.selectVisible(id); refreshScreen(); settingsOpen = false }
         catch { message = error.localizedDescription }
     }
     func removeScreen(_ id: String) {
@@ -946,16 +1148,45 @@ import ScreenpunkLocalTransport
         guard canAllowCurrentPublicData, let manifest else { return }
         setPublicDataAllowed(true, for: manifest)
     }
+    func openSettings() {
+        settingsPage = .account
+        settingsOpen = true
+    }
     func openConnectionSettings() {
         settingsPage = missingConnections.first?.page ?? .screens
         settingsOpen = true
     }
+    private func weatherOfferKey(_ screenID: String) -> String {
+        "screenpunk.weatherLocationOffer.\(permissionOwner).\(screenID)"
+    }
+    var weatherLocationOfferScreen: ScreenLibrary.Saved? {
+        guard !accountOperationInProgress, !needsAgentSetup, !busy, !requestPending,
+              !permissionOwner.isEmpty, let screen, screen.id == "starter-weather",
+              StarterWeather.location(in: screen.artifact) == .annArbor,
+              !UserDefaults.standard.bool(forKey: weatherOfferKey(screen.id)) else { return nil }
+        return screen
+    }
+    func acknowledgeWeatherLocationOffer(screenID: String, owner: String) {
+        guard !owner.isEmpty, owner == permissionOwner else { return }
+        objectWillChange.send()
+        UserDefaults.standard.set(true, forKey: weatherOfferKey(screenID))
+    }
+
+    func applyWeatherLocation(_ location: WeatherLocation, screenID: String, revision: String, owner: String) throws {
+        guard !owner.isEmpty, owner == permissionOwner, !accountOperationInProgress,
+              !busy, !requestPending, !routeChangeBlocked, let library,
+              let saved = library.state.screens.first(where: { $0.id == screenID && $0.revision == revision }) else {
+            throw DeviceError.message("This screen or account changed. Reopen Weather settings and try again.")
+        }
+        let artifact = try StarterWeather.configuredArtifact(saved.artifact, location: location)
+        try library.install(artifact, requestID: "weather-location-" + UUID().uuidString, replacing: screenID, selectInstalled: false, preserveRequestHistory: true)
+        acknowledgeWeatherLocationOffer(screenID: screenID, owner: owner)
+        refreshScreen()
+    }
+
     private func publicApprovalKey(_ manifest: DashboardManifest) -> String? {
         guard let owner = activeProfile?.permissionOwner else { return nil }
-        let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
-        guard let data = try? encoder.encode(manifest.connections.filter { $0.publicHTTP != nil }) else { return nil }
-        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-        return "screenpunk.publicReads.\(owner).\(manifest.dashboardId).\(digest)"
+        return PublicDataApprovalStore.key(owner: owner, dashboardID: manifest.dashboardId, connections: manifest.connections)
     }
     func publicDataAllowed(_ manifest: DashboardManifest) -> Bool {
         publicApprovalKey(manifest).map { UserDefaults.standard.bool(forKey: $0) } ?? false
@@ -978,13 +1209,19 @@ import ScreenpunkLocalTransport
     func manifests(requiring aliases: Set<String>) -> [DashboardManifest] {
         installedManifests.filter { $0.connections.contains { aliases.contains($0.alias) } }
     }
-    func swipe(_ offset: Int) { do { try library?.select(offset: offset); refreshScreen() } catch { message = error.localizedDescription } }
-    func newScreen() { do { try library?.newScreen(); refreshScreen(); settingsOpen = false } catch { message = error.localizedDescription } }
-    func rollback() { do { try library?.rollback(); refreshScreen(); settingsOpen = false } catch { message = error.localizedDescription } }
+    var temporaryActivationID: String? { library?.temporaryActivationID }
+    var canSwipeScreens: Bool {
+        guard let library else { return false }
+        let visible = library.rotationIDs.filter(library.isScreenShown)
+        return visible.count > 1 || (!visible.isEmpty && (library.state.selectedID != visible.first || library.hasTemporaryScreen))
+    }
+    func swipe(_ offset: Int) { guard !needsAgentSetup else { return }; do { try library?.select(offset: offset); refreshScreen() } catch { message = error.localizedDescription } }
+    func newScreen() { guard !needsAgentSetup else { return }; do { try library?.newScreen(); refreshScreen(); settingsOpen = false } catch { message = error.localizedDescription } }
+    func rollback() { guard !needsAgentSetup else { return }; do { try library?.rollback(); refreshScreen(); settingsOpen = false } catch { message = error.localizedDescription } }
     private func syncInventory() async throws {
         guard cloudBindingMatches, let library else { return }
         var body: [String: Any] = ["screens": library.state.screens.map { ["id": $0.id, "title": $0.artifact.title] }]
-        if let id = library.state.selectedID { body["selectedID"] = id }
+        if let id = library.selected?.id { body["selectedID"] = id }
         let signature = String(data: try JSONSerialization.data(withJSONObject: body, options: .sortedKeys), encoding: .utf8)!
         guard signature != inventorySignature else { return }
         let _: EmptyResponse = try await cloud.call("api/device/screens", method: "POST", body: body)
@@ -1015,8 +1252,16 @@ import ScreenpunkLocalTransport
     private func startConnection() {
         guard foreground, !connectionActive, !accountOperationInProgress else { return }
         connectionActive = true
+        refreshCatalogScope()
+        if let token = cloud.session?.accessToken {
+            Task { [weak self] in
+                guard let self, self.foreground, self.cloud.session?.accessToken == token else { return }
+                await self.billing.refreshBackupAccess(cloud: self.cloud)
+            }
+        }
         if pollsLocalAuthoring { agentReady = localAgent != nil; requestRefresh() }
         guard let session = cloud.session else { return }
+        if shouldCheckCloudSetup { refreshCloudSetupStatus(reconcileProfile: true) }
         if cloudSocketToken == session.accessToken {
             // A Local adapter rebuild retained this socket; the new library
             // scope still needs catch-up, even without a new handshake.
@@ -1030,6 +1275,8 @@ import ScreenpunkLocalTransport
             guard let self, self.foreground, self.cloudSocketToken == session.accessToken,
                   self.cloud.session?.accessToken == session.accessToken else { return }
             if initial {
+                // These notices carry no request ID. Pending identity is local context only.
+                RequestTimeline.record(.socketInitial, requestID: self.pendingID)
                 self.cloudSocketEpoch = UUID()
                 self.requestPreferenceSync()
                 self.requestCatalogCatchUp()
@@ -1037,7 +1284,10 @@ import ScreenpunkLocalTransport
             }
             switch notice {
             case .statusChanged:
-                if !initial { self.requestCloudStatusReconciliation() }
+                if !initial {
+                    RequestTimeline.record(.socketStatusChanged, requestID: self.pendingID)
+                    self.requestCloudStatusReconciliation()
+                }
             case .preferenceUpdated(let profileID):
                 if self.preferenceSyncBinding?.cloud.profileID == profileID, !initial { self.requestPreferenceSync() }
             case .catalogUpdated:
@@ -1046,16 +1296,26 @@ import ScreenpunkLocalTransport
         }, disconnected: { [weak self] authorizationRejected in
             guard let self, self.foreground, self.cloudSocketToken == session.accessToken,
                   self.cloud.session?.accessToken == session.accessToken else { return }
+            RequestTimeline.record(.socketDisconnected, requestID: self.pendingID)
             if authorizationRejected { self.rejectCloudAuthorization() }
             else { self.clearCloudSocketObservation() }
+        }, billingUpdated: { [weak self] notice in
+            guard let self, self.foreground, self.cloudSocketToken == session.accessToken,
+                  self.cloud.session?.accessToken == session.accessToken else { return }
+            Task { [weak self] in
+                guard let self, self.cloud.session?.accessToken == session.accessToken else { return }
+                await self.billing.billingUpdated(operationID: notice.operation_id, eventID: notice.event_id, cloud: self.cloud)
+            }
         })
     }
     private func rejectCloudAuthorization() {
+        if currentRequestRoute == .cloud { agentWorkingRequestID = nil }
         cloudAuthorizationRejected = true
+        clearCloudStatusReads()
         connection.stop()
         clearCloudSocketObservation()
         if !pollsLocalAuthoring {
-            refreshTask?.cancel(); refreshTask = nil; refreshNeeded = false
+            refreshPump.cancel(); refreshFailures = 0
         }
         preferenceSyncPump.cancel()
         preferenceSyncFlight.cancel()
@@ -1063,22 +1323,29 @@ import ScreenpunkLocalTransport
         preferenceSyncStatus = "Sign in again to synchronize with Cloud. Preferences saved on this iPad are still available."
     }
     private func requestCloudStatusReconciliation() {
-        if pollsLocalAuthoring || !cloudAccountMatches || library == nil {
+        if shouldCheckCloudSetup {
+            refreshCloudSetupStatus(reconcileProfile: true)
+        } else if pollsLocalAuthoring || !cloudAccountMatches || library == nil {
             requestCloudListenerStatus()
         } else {
             requestRefresh()
         }
     }
+    private func clearCloudStatusReads() {
+        cloudSetupStatusTask?.cancel()
+        cloudSetupStatusTask = nil
+        cloudListenerObservations.clear()
+    }
     private func clearCloudSocketObservation() {
         cloudSocketEpoch = nil
         listenerStatusPump.cancel()
-        cloudListenerObservation = nil
+        cloudListenerObservations.clearSocket()
         cloudAgentReady = false; cloudSupportsV2 = false
         if !pollsLocalAuthoring { agentReady = routePreference == .automatic && localAgent != nil }
     }
     private func refreshAuthoringRoute() {
         // Discard old route work without changing Cloud account or socket identity.
-        refreshTask?.cancel(); refreshTask = nil; refreshNeeded = false
+        refreshPump.cancel(); refreshFailures = 0
         listenerStatusPump.cancel()
         if pollsLocalAuthoring {
             agentReady = localAgent != nil
@@ -1087,9 +1354,11 @@ import ScreenpunkLocalTransport
         requestRefresh()
     }
     private func stopConnection(releaseCloudSocket: Bool = true) {
+        agentWorkingRequestID = nil
         connectionActive = false
         connectionGeneration = UUID()
         if releaseCloudSocket {
+            clearCloudStatusReads()
             cloudSocketToken = nil
             cloudAuthorizationRejected = false
             connection.stop()
@@ -1104,55 +1373,53 @@ import ScreenpunkLocalTransport
                 await previousV1?.disconnect()
             }
         }
-        refreshTask?.cancel(); refreshTask = nil; refreshNeeded = false
+        refreshPump.cancel(); refreshFailures = 0
         preferenceSyncPump.cancel()
         preferenceSyncFlight.cancel()
         cancelCatalogWork()
     }
     /// One in-flight reconciliation plus one trailing refresh, regardless of notice volume.
-    /// Transient HTTP failures retry with bounded backoff even when the socket stays open.
+    /// A new notice cancels only a retry timer, never an in-flight reconciliation.
     private func requestRefresh() {
         guard foreground, connectionActive else { return }
-        refreshNeeded = true
-        guard refreshTask == nil else { return }
         let generation = connectionGeneration
-        refreshTask = Task { [weak self] in
-            var failures = 0
-            while !Task.isCancelled {
-                do { try await Task.sleep(nanoseconds: 250_000_000) } catch { return }
-                guard !Task.isCancelled, let self, self.foreground, self.connectionGeneration == generation else { return }
-                self.refreshNeeded = false
-                let success = await self.poll(generation: generation)
-                guard !Task.isCancelled, self.connectionGeneration == generation else { return }
-                if !success {
-                    failures = min(failures + 1, 6)
-                    do { try await Task.sleep(nanoseconds: UInt64(min(60, pow(2, Double(failures)) * Double.random(in: 0.75...1.25)) * 1_000_000_000)) }
-                    catch { return }
-                    self.refreshNeeded = true
-                } else { failures = 0 }
-                if !self.refreshNeeded { self.refreshTask = nil; return }
-            }
+        refreshPump.request { [weak self] in
+            do { try await Task.sleep(nanoseconds: 250_000_000) } catch { return .idle }
+            guard let self, self.foreground, self.connectionActive,
+                  self.connectionGeneration == generation, !Task.isCancelled else { return .idle }
+            let success = await self.poll(generation: generation)
+            guard self.connectionGeneration == generation, !Task.isCancelled else { return .idle }
+            if success { self.refreshFailures = 0; return .idle }
+            self.refreshFailures = min(self.refreshFailures + 1, 6)
+            let delay = min(60, pow(2, Double(self.refreshFailures)) * Double.random(in: 0.75...1.25))
+            return .retry(Date().addingTimeInterval(delay))
         }
     }
     private func openLibrary() throws {
         guard let profileRepository else { throw DeviceError.message("Local identity storage is unavailable.") }
         var profile: LocalProfileDescriptor
         let selected = try profileRepository.snapshot().activeProfile
-        if let session = cloud.session,
-           CloudClient.originScope.shouldRestoreAccountProfile(activeProfile: selected, serverUserID: session.user.id) {
-            profile = try profileRepository.activateAccountProfile(accountID: CloudClient.originScope.localAccountID(serverUserID: session.user.id), deviceID: session.deviceId)
+        if let session = cloud.session {
+            if let selected, !CloudClient.originScope.shouldRestoreAccountProfile(activeProfile: selected, serverUserID: session.user.id) {
+                profile = selected
+            } else {
+                profile = try profileRepository.activateAccountProfile(accountID: CloudClient.originScope.localAccountID(serverUserID: session.user.id), deviceID: session.deviceId)
+            }
+        } else {
+            profile = try profileRepository.activateLocalProfile()
         }
-        else if let selected { profile = selected }
-        else { profile = try profileRepository.createLocalProfile() }
-        let opened = try ScreenLibrary(profile: profile)
-        if var linked = opened.linkedProfile {
+        var opened = try ScreenLibrary(profile: profile, onboardNewLibrary: true)
+        while var linked = opened.linkedProfile {
             guard linked.id == profile.id, linked.libraryOwner == profile.libraryOwner, linked.permissionOwner == profile.permissionOwner else { throw DeviceError.message("This saved library belongs to another profile.") }
             // Recover an interrupted binding commit, preserving a newer route choice or device enrollment.
-            if profile.cloudBinding == nil {
-                linked.preferredRoute = profile.preferredRoute
-                linked.routePreference = profile.routePreference
-                try profileRepository.adoptLinkedProfile(linked); profile = linked
-            }
+            guard profile.cloudBinding == nil else { break }
+            if cloud.session != nil, linked.cloudAccountID != cloud.localAccountID { throw DeviceError.message("This saved library belongs to another account.") }
+            linked.preferredRoute = profile.preferredRoute
+            linked.routePreference = profile.routePreference
+            try profileRepository.adoptLinkedProfile(linked); profile = linked
+            guard cloud.session == nil else { break }
+            profile = try profileRepository.activateLocalProfile()
+            opened = try ScreenLibrary(profile: profile, onboardNewLibrary: true)
         }
         if let session = cloud.session, let profileID = session.profileID,
            profile.libraryOwner == cloud.localAccountID || profile.cloudBinding?.accountID == cloud.localAccountID {
@@ -1168,18 +1435,26 @@ import ScreenpunkLocalTransport
         activeProfile = profile
         refreshDeviceName()
         selectedRoute = profile.preferredRoute; routePreference = profile.routePreference
-        availableProfiles = try profileRepository.snapshot().profiles
         let previousPending = opened.state.pendingID ?? opened.state.submissionKey
         try opened.activateAuthoringDevice(deviceID: profile.authoringDeviceID)
         if previousPending != nil, opened.state.pendingID == nil, opened.state.submissionKey == nil {
             message = "An earlier request belongs to a previous device connection. Your screens are unchanged. Send your instructions again to continue."
         }
+        #if DEBUG
+        if shouldRestartGuideForTesting {
+            shouldRestartGuideForTesting = false
+            let documents = try FileManager.default.url(for: .documentDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+            try opened.restartGuideForTesting(receiptURL: documents.appendingPathComponent("ScreenpunkOnboardingTestReceipt.json"))
+        }
+        #endif
         try opened.installStarterScreensIfNeeded(StarterScreens.templates())
+        try opened.migratePristineWeatherIfNeeded()
         library = opened
         opened.onCatalogRevisionCommitted = { [weak self, weak opened] in
             guard let self, let opened, self.library === opened else { return }
             self.requestCatalogSync()
         }
+        refreshCatalogScope()
         CatalogPreviewCaptureRegistry.shared.onReady = { [weak self] revision in self?.captureExactCatalogPreview(revision: revision) }
         func coordinator(_ transport: any AuthoringTransport) -> AuthoringCoordinator {
             let requireCurrent: () throws -> Void = { [weak self] in
@@ -1233,37 +1508,17 @@ import ScreenpunkLocalTransport
         if canRetry, message == nil { message = "Your previous instructions are saved. Retry to confirm delivery." }
         refreshScreen()
     }
-    func profileLabel(_ profile: LocalProfileDescriptor) -> String {
-        let accountID = profile.cloudBinding?.accountID ?? profile.libraryOwner
-        let kind = profile.libraryOwner.hasPrefix("local:") ? (profile.cloudBinding == nil ? "Local library" : "Linked local library") : (accountID == cloud.localAccountID ? "Current Cloud library" : "Previous Cloud library")
-        return kind + " · " + String(profile.id.prefix(6))
-    }
-    func selectProfile(_ id: String) {
-        guard !routeChangeBlocked, id != activeProfile?.id else { return }
-        do {
-            guard let repository = profileRepository else { throw DeviceError.message("Local identity storage is unavailable.") }
-            guard let selected = try repository.snapshot().profiles.first(where: { $0.id == id }) else { throw DeviceError.message("This saved library is missing.") }
-            let accountID = selected.cloudBinding?.accountID ?? selected.libraryOwner
-            let isCloudLibrary = selected.cloudBinding != nil || !selected.libraryOwner.hasPrefix("local:")
-            if isCloudLibrary, accountID != cloud.localAccountID {
-                try repository.setRoutePreference(.local, profileID: id)
-            }
-            try repository.activateProfile(id: id)
-            stopConnection(); detachAccountLibrary()
-            try openLibrary(); message = nil; startConnection()
-        } catch { message = error.localizedDescription }
-    }
     func selectAuthoringRoute(_ route: AuthoringRoute) {
         guard !routeChangeBlocked, let profile = activeProfile else { return }
         do {
             if route == .cloud, !cloudAccountMatches { throw DeviceError.message("Sign in to this profile’s Cloud account first.") }
             try profileRepository?.setPreferredRoute(route, profileID: profile.id)
             activeProfile?.preferredRoute = route; activeProfile?.routePreference = route == .local ? .local : .cloud; routePreference = route == .local ? .local : .cloud; selectedRoute = route; agentReady = false
-            availableProfiles = try profileRepository?.snapshot().profiles ?? []
             refreshAuthoringRoute()
         } catch { message = error.localizedDescription }
     }
     private func reloadLocalAgent() {
+        guard !accountOperationInProgress else { return }
         stopConnection(releaseCloudSocket: false)
         do { try openLibrary(); startConnection() } catch { message = error.localizedDescription }
     }
@@ -1273,10 +1528,11 @@ import ScreenpunkLocalTransport
         guard foreground, generation == connectionGeneration, !Task.isCancelled,
               agentReady, !busy, let library, let authoring = localAuthoring else { return }
         do {
-            if try localLedger?.unresolvedRecord() != nil { message = "An earlier local delivery is unresolved. Return to its profile and finish or cancel it before sending another request."; return }
+            if try localLedger?.unresolvedRecord() != nil { message = "An earlier local request is still pending. Sign in to its account to finish or cancel it."; return }
         } catch { message = error.localizedDescription; return }
+        agentWorkingRequestID = nil
         busy = true; requestPending = true; canCancelRequest = false; canRetry = false; takingLonger = false
-        lastProgressAt = Date(); warningDismissedAt = .distantPast; message = nil; progressCaption = "Sending to your Mac…"
+        progressTiming.begin(at: Date()); message = nil; progressCaption = "Sending to your Mac…"
         do {
             let snapshot = try makeAuthoringRequest(text: text, library: library)
             pendingID = snapshot.requestID; pendingScreenID = snapshot.context.screenID
@@ -1287,9 +1543,11 @@ import ScreenpunkLocalTransport
             guard self.library === library, generation == connectionGeneration else { return }
             if cancelledLocally.contains(accepted.requestID) { cancelKnownRequest(accepted.requestID); return }
             try library.submissionAccepted(deadline: Double(accepted.deadlineAt))
+            agentWorkingRequestID = accepted.requestID
             progressCaption = "Your Mac is working on this screen…"; requestRefresh()
         } catch {
             guard self.library === library, generation == connectionGeneration else { return }
+            agentWorkingRequestID = nil
             let submissionError = error
             // The adapter commits its ledger before network submission. A successful absent read proves no turn was sent.
             do {
@@ -1331,6 +1589,7 @@ import ScreenpunkLocalTransport
             }
         } catch {
             guard self.library === library, generation == connectionGeneration, !Task.isCancelled else { return true }
+            agentWorkingRequestID = nil
             message = "Your result is saved here. Local receipt confirmation will retry."
             return false
         }
@@ -1339,6 +1598,7 @@ import ScreenpunkLocalTransport
             // Repair a crash between the native journal commit and local ledger acknowledgement.
             if let record = try localLedger?.record(requestID: id), let result = record.finalResult,
                let receipt = library.state.authoring?.receipts[result.operationID] {
+                agentWorkingRequestID = nil
                 try await authoring.acknowledge(receipt)
                 guard self.library === library, generation == connectionGeneration, !Task.isCancelled else { return true }
                 consumedID = id; pendingID = nil; busy = false; requestPending = false; canCancelRequest = false; takingLonger = false; canRetry = false
@@ -1351,11 +1611,13 @@ import ScreenpunkLocalTransport
             if cancelledLocally.contains(id) { return true }
             switch delivery {
             case .completed(let result):
-                let receipt = try authoring.apply(result)
+                agentWorkingRequestID = nil
+                let receipt = try measureRequestApply(id) { try authoring.apply(result) }
                 if receipt.status == "applied", result.preferenceMutations?.isEmpty == false {
                     requestPreferenceSync() // A stalled Mac acknowledgement must not stall preferences.
                 }
                 // The application receipt is committed before the Mac delivery is acknowledged.
+                agentWorkingRequestID = nil
                 try await authoring.acknowledge(receipt)
                 guard self.library === library, generation == connectionGeneration else { return true }
                 refreshScreen(); refreshPreferences()
@@ -1364,16 +1626,19 @@ import ScreenpunkLocalTransport
                 try persistPending()
             case .ended(let status, let failure): try finishRequest(id, status: status, failure: failure)
             case .pending(let progress):
+                agentWorkingRequestID = id
                 if let deadline = progress.deadlineAt { try library.submissionAccepted(deadline: deadline) }
                 busy = true; requestPending = true; canCancelRequest = true; canRetry = false
                 progressCaption = progress.caption ?? "Your Mac is working…"
-                if let updated = progress.updatedAt { lastProgressAt = Date(timeIntervalSince1970: updated / 1000) }
+                if let updated = progress.updatedAt { progressTiming.lastProgressAt = Date(timeIntervalSince1970: updated / 1000) }
             case .deliveryUncertain(let message), .needsAttention(let message):
+                agentWorkingRequestID = nil
                 busy = true; requestPending = true; canCancelRequest = true; canRetry = false; progressCaption = message
             }
             return pendingID == nil
         } catch {
             guard self.library === library, generation == connectionGeneration, !Task.isCancelled else { return true }
+            agentWorkingRequestID = nil
             progressCaption = error.localizedDescription; busy = true; requestPending = true; canCancelRequest = true
             return false
         }
@@ -1383,10 +1648,10 @@ import ScreenpunkLocalTransport
     private func detachAccountLibrary() {
         publicReads?.cancel(); publicReads = nil; publicReadSessionKey = ""
         if let previous = homeAssistant { Task { await previous.cancelPending() } }
-        homeAssistant = nil; manifest = nil; assets = nil; screen = nil
+        homeAssistant = nil; manifest = nil; assets = nil; screen = nil; activeProfile = nil
         library = nil; cloudAuthoring = nil; localAuthoring = nil; localTransport = nil; cloudAuthoringV2 = nil; localAuthoringV2 = nil; localTransportV2 = nil; localTransportAuthoringProfileID = nil; cloudAgentReady = false; cloudSupportsV2 = false; pendingID = nil; pendingScreenID = nil; consumedID = nil
         cancelledLocally = []; inventorySignature = nil
-        installedManifests = []; installedScreens = []; manifestIssues = [:]
+        installedManifests = []; installedScreens = []; hiddenScreenIDs = []; manifestIssues = [:]; onboarding = nil
         preferenceRecords = []; inactiveDevicePreferences = []; preferenceConflicts = []; preferenceSyncStatus = nil
         catalogBackupStatus = nil; catalogCanResume = false; catalogPreviewStatus = nil
         agentReady = false; requestPending = false; canCancelRequest = false; canRetry = false; takingLonger = false
@@ -1397,7 +1662,9 @@ import ScreenpunkLocalTransport
         defer { refreshPublicReads(); requestRefresh() }
         if let previous = homeAssistant { Task { await previous.cancelPending() } }
         homeAssistant = nil; manifest = nil
+        onboarding = library?.state.onboarding
         installedScreens = library?.state.screens ?? []
+        hiddenScreenIDs = library?.state.hiddenScreenIDs ?? []
         manifestIssues = [:]
         installedManifests = installedScreens.compactMap { saved in
             guard let file = saved.artifact.files.first(where: { $0.path == "manifest.json" }) else { return nil }
@@ -1434,16 +1701,68 @@ import ScreenpunkLocalTransport
 extension DeviceModel {
     private struct CatalogFlight: Equatable {
         var generation: UUID
+        var authorization: UUID
         var library: ObjectIdentifier
+        var profileID: String
         var binding: ScreenLibrary.CatalogBinding
         var token: String // Memory only; never persisted or logged.
     }
-    private var catalogFlight: CatalogFlight? {
-        guard foreground, connectionActive, !cloudAuthorizationRejected, cloudBindingMatches, let library, let profile = activeProfile,
+    private var catalogBinding: ScreenLibrary.CatalogBinding? {
+        guard cloudBindingMatches, let profile = activeProfile,
               let session = cloud.session, let account = cloud.localAccountID else { return nil }
-        return CatalogFlight(generation: connectionGeneration, library: ObjectIdentifier(library),
-            binding: .init(origin: CloudClient.origin.absoluteString, accountID: account, userID: session.user.id,
-                deviceID: session.deviceId, libraryID: profile.libraryOwner), token: session.accessToken)
+        return .init(origin: CloudClient.origin.absoluteString, accountID: account, userID: session.user.id,
+            deviceID: session.deviceId, libraryID: profile.libraryOwner)
+    }
+    var catalogBackupAccess: DeviceBackupAccess { billing.backupAccess(for: cloud) }
+
+    var catalogBackupsEnabled: Bool {
+        guard catalogBackupAccess != .inactive, let binding = catalogBinding else { return false }
+        return library?.catalogBackupsPreference(binding: binding) == true
+    }
+    var catalogBackupsCanConfigure: Bool { !accountOperationInProgress && library != nil && catalogBinding != nil }
+
+    func setCatalogBackupsEnabled(_ enabled: Bool) {
+        guard catalogBackupsCanConfigure, let binding = catalogBinding, let library, enabled != catalogBackupsEnabled else { return }
+        if enabled, !catalogBackupAccess.allowsBackups {
+            if catalogBackupAccess == .unknown {
+                Task { await billing.refreshBackupAccess(cloud: cloud) }
+            }
+            return
+        }
+        do {
+            objectWillChange.send()
+            if enabled {
+                try library.setCatalogBackupsEnabled(true, binding: binding)
+                billing.backupsWereEnabled()
+            } else {
+                library.disableCatalogBackups(binding: binding)
+            }
+            cancelCatalogWork()
+            catalogCanResume = false
+            catalogBackupStatus = enabled ? "Checking backup availability…" : nil
+            catalogPreviewStatus = nil
+            if enabled { requestCatalogCatchUp() }
+        } catch { catalogBackupStatus = error.localizedDescription }
+    }
+
+    func billingBackupAccessChanged() {
+        objectWillChange.send()
+        refreshCatalogScope()
+        if catalogBackupAccess.allowsBackups { requestCatalogSync() }
+    }
+
+    private func refreshCatalogScope() {
+        let access = catalogBackupAccess
+        let binding = catalogBinding
+        let deadline: Date?
+        if case .active(let until) = access { deadline = until } else { deadline = nil }
+        if library?.setCatalogBackupScope(binding, validUntil: deadline) == true {
+            cancelCatalogWork()
+            catalogCanResume = false
+            catalogBackupStatus = nil
+            catalogPreviewStatus = nil
+        }
+        if access == .inactive, let binding { library?.disableCatalogBackups(binding: binding) }
     }
     private func cancelCatalogWork() {
         catalogPump.cancel()
@@ -1459,6 +1778,13 @@ extension DeviceModel {
         previewCandidates = []
         previewCursor = nil
     }
+    private var catalogFlight: CatalogFlight? {
+        guard foreground, connectionActive, !cloudAuthorizationRejected, catalogBackupAccess.allowsBackups, let binding = catalogBinding, let library,
+              let authorization = library.catalogAuthorization(binding: binding),
+              let profile = activeProfile, let session = cloud.session else { return nil }
+        return CatalogFlight(generation: connectionGeneration, authorization: authorization, library: ObjectIdentifier(library),
+            profileID: profile.id, binding: binding, token: session.accessToken)
+    }
     private func requestCatalogCatchUp() {
         guard catalogFlight != nil else { return }
         catalogCatchUpNeeded = true
@@ -1472,7 +1798,7 @@ extension DeviceModel {
         }
     }
     func resumeCatalogBackups() {
-        guard let flight = catalogFlight, let library else { return }
+        guard catalogCanResume, let flight = catalogFlight, let library else { return }
         do {
             try library.resumeCatalog(binding: flight.binding)
             catalogBackupStatus = library.catalogQueue?.status
@@ -1517,10 +1843,15 @@ extension DeviceModel {
             try current()
             guard let capability = try await cloud.catalogCapability(token: flight.token) else {
                 try current()
-                previewCaptureFlight = nil
+                try library.setCatalogEntitlement(false, binding: flight.binding)
+                previewCaptureFlight = nil; catalogCanResume = false
                 catalogBackupStatus = "Cloud backups are unavailable on this server."; return .idle
             }
             try current()
+            if DeviceBackupAccess.isVerifiedDenial(enabled: capability.entitlement.backupEnabled, reason: capability.entitlement.reason) {
+                billing.recordBackupDenial(cloud: cloud)
+                return .idle
+            }
             if capability.entitlement.backupEnabled {
                 try library.activateCatalog(binding: flight.binding)
                 if capability.previewBackfillVersion == "1", capability.previewMediaTypes.contains("image/png") {
@@ -1594,6 +1925,10 @@ extension DeviceModel {
         }
         catch {
             guard catalogFlight == flight, !Task.isCancelled else { return .idle }
+            if let detail = error as? CloudClient.CatalogHTTPError, DeviceBackupAccess.isVerifiedDenial(status: detail.status, code: detail.code) {
+                billing.recordBackupDenial(cloud: cloud)
+                return .idle
+            }
             if let detail = error as? CloudClient.CatalogHTTPError, detail.status == 401 || detail.code == "unauthorized" {
                 try? library.pauseCatalogAuthentication(binding: flight.binding)
                 catalogBackupStatus = "Backups paused. Sign in again to the original account to continue."
@@ -1669,7 +2004,7 @@ extension DeviceModel {
 
 extension DeviceModel {
     var catalogPreviewContext: CatalogPreviewContext? {
-        guard cloudBindingMatches, let profile = activeProfile, let binding = profile.cloudBinding else { return nil }
+        guard catalogBackupsEnabled, catalogBackupAccess.allowsBackups, let profile = activeProfile, let binding = profile.cloudBinding else { return nil }
         return .init(origin: CloudClient.origin.absoluteString, accountID: binding.accountID, profileID: profile.id, libraryID: profile.libraryOwner, deviceID: binding.deviceID)
     }
     private func requestCatalogPreviewSync(discoverCandidates: Bool = false) {
@@ -1701,8 +2036,7 @@ extension DeviceModel {
     }
     private func captureExactCatalogPreview(revision: String) {
         guard let flight = catalogFlight, previewCaptureFlight == flight, !settingsOpen,
-              let context = catalogPreviewContext, let library, library.catalogQueue?.binding == flight.binding,
-              library.catalogQueue?.authPaused != true,
+              let context = catalogPreviewContext, let library, library.catalogCaptureAllowed(binding: flight.binding),
               previewCaptureTasks[revision] == nil, previewCaptureTasks.count < 2 else { return }
         let candidate = previewCandidates.first { $0.sourceRevisionID == revision }
         let digest = library.catalogQueue?.entries.first(where: { $0.revision == revision })?.packageDigest ?? candidate?.packageDigest
@@ -1711,18 +2045,17 @@ extension DeviceModel {
         previewCaptureTasks[revision] = Task { [weak self] in
             guard let self else { return }
             defer {
-                if self.catalogFlight == flight, !Task.isCancelled {
+                if self.connectionGeneration == flight.generation, library.catalogAuthorization(binding: flight.binding) == flight.authorization {
                     self.previewCaptureTasks[revision] = nil
                     self.drainPreviewCaptures()
                 }
             }
-            @MainActor func isCurrent() -> Bool {
-                self.catalogFlight == flight && self.previewCaptureFlight == flight &&
-                    library.catalogQueue?.authPaused != true && self.catalogPreviewContext == context &&
-                    !self.settingsOpen && !Task.isCancelled
+            @MainActor func captureAllowed() -> Bool {
+                self.catalogFlight == flight && self.previewCaptureFlight == flight && library.catalogCaptureAllowed(binding: flight.binding) &&
+                    self.catalogPreviewContext == context && !self.settingsOpen && !Task.isCancelled
             }
+            guard captureAllowed() else { return }
             do {
-                guard isCurrent() else { return }
                 let package: CatalogPackage
                 if let recovered = try? library.catalogPackage(revision: revision, digest: digest, binding: flight.binding) { package = recovered.package }
                 else if let candidate {
@@ -1730,14 +2063,14 @@ extension DeviceModel {
                     path.queryItems = [.init(name: "sourceRevisionID", value: revision), .init(name: "packageDigest", value: digest)]
                     package = try await self.cloud.catalogPackage(path.string!, token: flight.token, declaration: .init(byteLength: candidate.packageBytes, digest: digest))
                 } else { return }
-                guard isCurrent() else { return }
+                guard captureAllowed() else { return }
                 let snapshot: CatalogPreviewRenderer.Snapshot
                 do { snapshot = try await CatalogPreviewCaptureRegistry.shared.capture(context: context, revision: revision, package: package, packageDigest: digest, byteLimit: self.previewByteLimit, dimensionLimit: self.previewDimensionLimit) }
                 catch {
-                    guard isCurrent() else { return }
+                    guard captureAllowed() else { return }
                     snapshot = try await CatalogPreviewRenderer().capture(package: package, packageDigest: digest, byteLimit: self.previewByteLimit, dimensionLimit: self.previewDimensionLimit)
                 }
-                guard isCurrent(), snapshot.packageDigest == digest else { return }
+                guard captureAllowed(), snapshot.packageDigest == digest else { return }
                 let d = snapshot.declaration
                 try library.captureCatalogPreview(bytes: snapshot.bytes, declaration: .init(byteLength: d.byteLength, digest: d.digest, width: d.width, height: d.height), revision: revision, packageDigest: digest, capturedAt: CatalogContract.timestamp(Date()), binding: flight.binding, candidate: candidate)
                 if let candidate { try library.bindCatalogPreview(candidate, binding: flight.binding) }
@@ -1750,9 +2083,9 @@ extension DeviceModel {
         }
     }
     private func syncCatalogPreviews(flight: CatalogFlight) async -> CatalogWorkPump.Next {
-        guard catalogFlight == flight, let library, library.catalogQueue?.binding == flight.binding, library.catalogQueue?.authPaused != true else { return .idle }
+        guard catalogFlight == flight, let library, library.catalogCaptureAllowed(binding: flight.binding) else { return .idle }
         func current() throws {
-            guard self.catalogFlight == flight, library.catalogQueue?.authPaused != true,
+            guard self.catalogFlight == flight, library.catalogCaptureAllowed(binding: flight.binding),
                   !Task.isCancelled else { throw CancellationError() }
         }
         var attempted: ScreenLibrary.CatalogCapturedPreview?
@@ -1769,6 +2102,10 @@ extension DeviceModel {
                     return .idle
                 }
                 try current()
+                if DeviceBackupAccess.isVerifiedDenial(enabled: capability.entitlement.backupEnabled, reason: capability.entitlement.reason) {
+                    billing.recordBackupDenial(cloud: cloud)
+                    return .idle
+                }
                 guard capability.previewBackfillVersion == "1", capability.previewMediaTypes.contains("image/png"), capability.entitlement.backupEnabled else {
                     previewCaptureFlight = nil; previewCursor = nil
                     return .idle
@@ -1838,6 +2175,11 @@ extension DeviceModel {
         } catch is CancellationError { return .idle }
         catch {
             guard catalogFlight == flight, !Task.isCancelled else { return .idle }
+            if let detail = error as? CloudClient.CatalogHTTPError,
+               DeviceBackupAccess.isVerifiedDenial(status: detail.status, code: detail.code) {
+                billing.recordBackupDenial(cloud: cloud)
+                return .idle
+            }
             if let detail = error as? CloudClient.CatalogHTTPError, detail.status == 401 || detail.code == "unauthorized" {
                 try? library.pauseCatalogAuthentication(binding: flight.binding)
                 previewCaptureFlight = nil
@@ -1870,7 +2212,7 @@ extension DeviceModel {
             try library.updateCatalogPreview(next, binding: binding); return true
         }
         if ["completed", "duplicate", "deleted"].contains(status.state) { try library.acknowledgeCatalogPreview(preview, binding: binding); return true }
-        if status.state == "failed", let error = status.error { throw CloudClient.CatalogHTTPError(status: error.code == "unauthorized" ? 401 : 400, code: error.code, retryAfterSeconds: error.retryAfterSeconds) }
+        if status.state == "failed", let error = status.error { throw CloudClient.CatalogHTTPError(status: error.code == "unauthorized" ? 401 : error.code == "not_entitled" ? 403 : 400, code: error.code, retryAfterSeconds: error.retryAfterSeconds) }
         return false
     }
 }

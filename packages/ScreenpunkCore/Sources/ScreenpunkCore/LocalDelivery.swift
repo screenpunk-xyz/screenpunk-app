@@ -143,6 +143,23 @@ public final class LocalDeliveryLedger: @unchecked Sendable {
             try file.save(state)
         }
     }
+    /// Drop cached screen results while retaining request bindings that fence late replies.
+    public func discardScreenResults(profileID: String) throws {
+        try lock.locallyLocked {
+            var state = try file.load() ?? .init()
+            let records = state.records.values.filter { $0.profileID == profileID }
+            guard !records.isEmpty else { return }
+            for var record in records {
+                if !record.status.isTerminal { record.status = .cancelled }
+                record.finalResult = nil
+                record.finalResultV2 = nil
+                record.receipt = nil
+                record.failure = nil
+                state.records[record.requestID] = record
+            }
+            try file.save(state)
+        }
+    }
     private func sameBinding(_ a: LocalDeliveryRecord, _ b: LocalDeliveryRecord) -> Bool {
         a.contractVersion == b.contractVersion && a.requestID == b.requestID && a.inputDigest == b.inputDigest && a.connectionID == b.connectionID && a.profileID == b.profileID && a.hostKeySHA256 == b.hostKeySHA256 && a.baseRevision == b.baseRevision && a.deadlineAt == b.deadlineAt
     }

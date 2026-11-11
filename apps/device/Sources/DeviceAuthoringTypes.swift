@@ -37,13 +37,66 @@ struct CloudListenerObservation {
     let deviceID: String
     let profileID: String?
     let ready: Bool?
+    let pluginConnected: Bool?
+
+    init(accountID: String, deviceID: String, profileID: String?, ready: Bool?, pluginConnected: Bool? = nil) {
+        self.accountID = accountID
+        self.deviceID = deviceID
+        self.profileID = profileID
+        self.ready = ready
+        self.pluginConnected = pluginConnected
+    }
+
+    var canCompleteCloudSetup: Bool {
+        ready == true && pluginConnected != false
+    }
+
+    func matches(accountID: String?, deviceID: String?, profileID: String?) -> Bool {
+        guard self.accountID == accountID, self.deviceID == deviceID,
+              let observedProfile = self.profileID, !observedProfile.isEmpty else { return false }
+        return profileID == nil || profileID == observedProfile
+    }
+
+    func pluginConnection(accountID: String?, deviceID: String?, profileID: String?) -> Bool? {
+        guard matches(accountID: accountID, deviceID: deviceID, profileID: profileID) else { return nil }
+        return pluginConnected
+    }
+
     static func status(_ observation: Self?, accountID: String?, deviceID: String?, profileID: String?) -> Status {
         guard let accountID, let deviceID else { return .notSignedIn }
         guard let observation, observation.accountID == accountID, observation.deviceID == deviceID else { return .unchecked }
-        guard let observedProfile = observation.profileID, !observedProfile.isEmpty,
-              profileID == nil || profileID == observedProfile,
+        guard observation.matches(accountID: accountID, deviceID: deviceID, profileID: profileID),
               let ready = observation.ready else { return .unavailable }
         return ready ? .connected : .waiting
+    }
+}
+
+/// Status reads can overlap. The newest published read wins even if an older
+/// request returns later, and only socket-owned observations expire on disconnect.
+struct CloudListenerObservations {
+    enum Source { case direct, socket }
+
+    private(set) var observation: CloudListenerObservation?
+    private var source: Source?
+    private var publishedRead: UInt64 = 0
+
+    @discardableResult
+    mutating func publish(_ observation: CloudListenerObservation, source: Source, read: UInt64) -> Bool {
+        guard read >= publishedRead else { return false }
+        if source == .socket, observation.ready == nil, self.source == .direct { return false }
+        self.observation = observation
+        self.source = source
+        publishedRead = read
+        return true
+    }
+
+    mutating func clearSocket() {
+        if source == .socket { clear() }
+    }
+
+    mutating func clear() {
+        observation = nil
+        source = nil
     }
 }
 
@@ -292,5 +345,32 @@ final class CatalogWorkPump {
         timer?.cancel()
         timer = nil
         pending = false
+    }
+}
+
+/// Request-local silence timer, reset before a new preflight becomes visible.
+struct RequestProgressTiming {
+    var lastProgressAt: Date = Date()
+    var warningDismissedAt: Date = .distantPast
+
+    mutating func begin(at now: Date) {
+        lastProgressAt = now
+        warningDismissedAt = .distantPast
+    }
+    func isTakingLonger(at now: Date) -> Bool {
+        now.timeIntervalSince(max(lastProgressAt, warningDismissedAt)) >= 60
+    }
+}
+
+/// A valid pending Cloud response is a successful read: await the next push.
+/// The existing Local adapter has no device wake callback and still needs its
+/// bounded reconciliation fallback until that separate transport gains one.
+enum AuthoringRefreshPolicy {
+    static func reconciliationSucceeded(_ delivery: AuthoringDeliveryStateV2, route: String) -> Bool {
+        switch delivery {
+        case .pending: return route == "cloud"
+        case .completed, .ended: return true
+        case .deliveryUncertain, .needsAttention: return false
+        }
     }
 }

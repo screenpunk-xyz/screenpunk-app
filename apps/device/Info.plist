@@ -10,5 +10,5 @@
 <key>NSBonjourServices</key><array><string>_ssh._tcp</string></array>
 <key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string><string>UIInterfaceOrientationPortraitUpsideDown</string></array>
 <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
-<key>NSLocationWhenInUseUsageDescription</key><string>Show your location when you request it in a screen’s map.</string>
+<key>NSLocationWhenInUseUsageDescription</key><string>Use your location once when you choose it for Weather or request it in a screen’s map.</string>
 </dict></plist>

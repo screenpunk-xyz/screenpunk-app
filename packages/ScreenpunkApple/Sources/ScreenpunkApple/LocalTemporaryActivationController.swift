@@ -13,7 +13,11 @@ public final class LocalTemporaryActivationController {
     }
     private let url: URL
     private var checkpoint: Checkpoint
+    public var activeActivationID: String? { checkpoint.navigation.dismissed ? nil : checkpoint.navigation.alertId }
     public var expiresAt: Date? { checkpoint.navigation.dismissed ? nil : checkpoint.navigation.expiresAt }
+    public func isActiveTarget(_ id: String) -> Bool {
+        expiresAt != nil && checkpoint.navigation.targetScreen == id
+    }
 
     public init(root: URL, owner: String) throws {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -30,23 +34,23 @@ public final class LocalTemporaryActivationController {
                          startedAt: Date = Date(), now: Date = Date()) throws -> String? {
         try apply { $0.activate(id: id, target: target, selected: selected, startedAt: startedAt, expiresAt: expiresAt, now: now) }
     }
-    public func end(id: String, selected: String) throws -> String? {
+    public func end(id: String, selected: String, fallbackSelection: String? = nil) throws -> String? {
         guard checkpoint.navigation.alertId == id else { return nil }
         if checkpoint.navigation.dismissed { return checkpoint.pendingSelection }
         var next = checkpoint
-        next.pendingSelection = next.navigation.end(id: id, selected: selected)
+        next.pendingSelection = next.navigation.end(id: id, selected: selected) ?? fallbackSelection
         try save(next)
         return next.pendingSelection
     }
-    public func reconcile(selected: String, now: Date = Date()) throws -> String? {
+    public func reconcile(selected: String, now: Date = Date(), fallbackSelection: String? = nil) throws -> String? {
         // Expiration wins over a not-yet-applied activation after an offline relaunch.
         if !checkpoint.navigation.dismissed, let deadline = checkpoint.navigation.expiresAt, now >= deadline {
             var next = checkpoint
             next.pendingSelection = nil
             let proposal = next.navigation.expire(selected: selected, now: now)
-            next.pendingSelection = proposal
+            next.pendingSelection = proposal ?? fallbackSelection
             try save(next)
-            return proposal
+            return next.pendingSelection
         }
         return checkpoint.pendingSelection
     }

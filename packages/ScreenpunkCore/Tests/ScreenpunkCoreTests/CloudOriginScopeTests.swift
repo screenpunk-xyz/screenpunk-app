@@ -128,7 +128,7 @@ final class CloudOriginScopeTests: XCTestCase {
         XCTAssertEqual(try repository.snapshot().profiles.count, 2)
     }
 
-    func testPreviousCloudLibraryRemainsSelectableForLocalUseAcrossLaunches() throws {
+    func testRestoredSessionReplacesPreviousCloudSelectionEvenWhenItUsedLocalAgent() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("CloudOriginPreviousLibraryTests-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let repository = try LocalProfileRepository(rootDirectory: root)
@@ -144,18 +144,19 @@ final class CloudOriginScopeTests: XCTestCase {
         XCTAssertEqual(selected.libraryOwner, previous.libraryOwner)
         XCTAssertEqual(selected.permissionOwner, previous.permissionOwner)
         XCTAssertEqual(selected.routePreference, .local)
-        XCTAssertFalse(production.shouldRestoreAccountProfile(activeProfile: selected, serverUserID: "same-google-sub"))
+        XCTAssertTrue(production.shouldRestoreAccountProfile(activeProfile: selected, serverUserID: "same-google-sub"))
+        XCTAssertFalse(staging.shouldRestoreAccountProfile(activeProfile: selected, serverUserID: "same-google-sub"))
         XCTAssertNotEqual(selected.cloudBinding?.accountID, current.cloudBinding?.accountID)
         XCTAssertEqual(restarted.profiles.count, 2)
     }
 
-    func testRestoredSessionPreservesIntentionalLocalOnlySelectionButReselectsForeignLinkedProfiles() throws {
+    func testRestoredSessionSelectsTheCloudLibraryEvenWithAStandaloneSelection() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("CloudOriginLocalSelectionTests-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let repository = try LocalProfileRepository(rootDirectory: root)
         let local = try repository.createLocalProfile()
         for scope in [staging, production] {
-            XCTAssertFalse(scope.shouldRestoreAccountProfile(activeProfile: local, serverUserID: "same-google-sub"))
+            XCTAssertTrue(scope.shouldRestoreAccountProfile(activeProfile: local, serverUserID: "same-google-sub"))
             XCTAssertTrue(scope.shouldRestoreAccountProfile(activeProfile: nil, serverUserID: "same-google-sub"))
         }
         var linked = local
