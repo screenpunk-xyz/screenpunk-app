@@ -101,22 +101,23 @@ final class AuthoringStoreTests: XCTestCase {
         var state = AuthoringStoreState(); let input = try request()
         try AuthoringStore.saveRequest(input, in: &state)
         let output = result(for: input)
-        let receipt = try AuthoringStore.apply(output, to: &state, currentScreenRevision: nil, now: 2_000)
+        let late = input.deadlineAt + 86_400_000
+        let receipt = try AuthoringStore.apply(output, to: &state, currentScreenRevision: nil, now: late)
+        XCTAssertEqual(receipt.status, "applied")
+        XCTAssertEqual(receipt.appliedAt, late)
         state = try JSONDecoder().decode(AuthoringStoreState.self, from: JSONEncoder().encode(state))
-        XCTAssertEqual(try AuthoringStore.apply(output, to: &state, currentScreenRevision: "different", cancelled: true, now: 20_000), receipt)
+        XCTAssertEqual(try AuthoringStore.apply(output, to: &state, currentScreenRevision: "different", cancelled: true, now: late + 1), receipt)
         var reused = output; reused.answer = "Different content"
         XCTAssertThrowsError(try AuthoringStore.apply(reused, to: &state, currentScreenRevision: nil, now: 2_000))
         var changed = input; changed.context.userRequest = "Different request"
         changed = try AuthoringContract.seal(changed)
         XCTAssertThrowsError(try AuthoringStore.saveRequest(changed, in: &state))
     }
-    func testStaleScreenPreferenceDeadlineAndBindingCannotApply() throws {
+    func testStaleScreenPreferenceCancellationAndBindingCannotApply() throws {
         let input = try request()
         var initial = AuthoringStoreState(); try AuthoringStore.saveRequest(input, in: &initial)
         var state = initial
         XCTAssertEqual(try AuthoringStore.apply(result(for: input), to: &state, currentScreenRevision: "newer", now: 2_000).status, "conflict")
-        state = initial
-        XCTAssertEqual(try AuthoringStore.apply(result(for: input), to: &state, currentScreenRevision: nil, now: 10_000).status, "rejected")
         state = initial
         XCTAssertEqual(try AuthoringStore.apply(result(for: input), to: &state, currentScreenRevision: nil, cancelled: true, now: 2_000).status, "rejected")
         state = initial; var altered = result(for: input); altered.inputDigest = String(repeating: "0", count: 64)
@@ -125,6 +126,22 @@ final class AuthoringStoreTests: XCTestCase {
         let snapshot = try request(preferences: [preference()]); try AuthoringStore.saveRequest(snapshot, in: &withPreference)
         try AuthoringStore.mutate(.init(kind: "delete", id: "theme", expectedRevision: 1), originRequestID: "settings-delete", in: &withPreference)
         XCTAssertEqual(try AuthoringStore.apply(result(for: snapshot), to: &withPreference, currentScreenRevision: nil, now: 2_000).status, "conflict")
+    }
+    func testV2LateResultAppliesAfterRestartAndExplicitCancellationStillWins() throws {
+        let input = try AuthoringV2Contract.makeRequest(from: request(), libraryID: "library-a")
+        let output = AuthoringResultV2(requestID: input.requestID, inputDigest: input.delivery.snapshotDigest,
+                                       preferenceRevisions: [:], operationID: "operation-v2", answer: "Done")
+        var state = AuthoringStoreState()
+        try AuthoringStore.saveRequest(input, pin: nil, in: &state)
+        state = try JSONDecoder().decode(AuthoringStoreState.self, from: JSONEncoder().encode(state))
+        let late = input.deadlineAt + 86_400_000
+        var cancelled = state
+        cancelled.cancelledRequestIDs = [input.requestID]
+        XCTAssertEqual(try AuthoringStore.apply(output, to: &cancelled, currentScreenRevision: nil, now: late).status, "rejected")
+        let receipt = try AuthoringStore.apply(output, to: &state, currentScreenRevision: nil, now: late)
+        XCTAssertEqual(receipt.status, "applied")
+        XCTAssertEqual(receipt.appliedAt, late)
+        XCTAssertEqual(try AuthoringStore.apply(output, to: &state, currentScreenRevision: nil, now: late + 1), receipt)
     }
     func testAcknowledgedSourceCompactionKeepsReplayAndRejectsRequestReuse() throws {
         var state = AuthoringStoreState(); let input = try request(); try AuthoringStore.saveRequest(input, in: &state)

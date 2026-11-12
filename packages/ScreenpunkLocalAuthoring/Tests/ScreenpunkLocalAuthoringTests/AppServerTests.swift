@@ -275,11 +275,11 @@ final class AppServerTests: XCTestCase {
         XCTAssertThrowsError(try vault.load(reference: one.reference))
         XCTAssertEqual(try vault.load(reference: two.reference).appServerToken, "private-token-two")
     }
-    @MainActor private func fixture(_ peer: Peer, client injectedClient: AppServerClient? = nil) throws -> (URL, LocalDeliveryLedger, LocalAgentConfigurationRepository, LocalAuthoringTransport, AuthoringRequestV1) {
+    @MainActor private func fixture(_ peer: Peer, client injectedClient: AppServerClient? = nil, createdAt: Int64? = nil) throws -> (URL, LocalDeliveryLedger, LocalAgentConfigurationRepository, LocalAuthoringTransport, AuthoringRequestV1) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("screenpunk-client-" + UUID().uuidString)
         let ledger = try LocalDeliveryLedger(rootDirectory: root.appendingPathComponent("delivery")), config = try LocalAgentConfigurationRepository(rootDirectory: root.appendingPathComponent("config"))
         try config.save(.init(host: "localhost", username: "test", hostKeySHA256: "SHA256:" + String(repeating: "A", count: 43), macWorkspace: "/tmp/Screenpunk", credentialReference: "test"))
-        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        let now = createdAt ?? Int64(Date().timeIntervalSince1970 * 1000)
         let request = try AuthoringContract.seal(.init(requestID: "request-" + UUID().uuidString, createdAt: now, deadlineAt: now + 600_000, designGuidance: AuthoringContract.designGuidance, runtime: AuthoringContract.runtime, services: [], context: .init(profileID: "profile", deviceID: "device", screenID: "screen", userRequest: "Make large labels", viewport: .init(width: 1024, height: 768, orientation: "landscape")), delivery: .init(route: "local")))
         let client = injectedClient ?? AppServerClient(openSocket: { await peer.socket() }, rpcTimeoutNanoseconds: 100_000_000)
         let adapter = LocalAuthoringTransport(profileID: "profile", configurationRepository: config, ledger: ledger, credentialStore: MemoryLocalCredentialStore(), requestLookup: { $0 == request.requestID ? request : nil }, client: client)
@@ -289,7 +289,7 @@ final class AppServerTests: XCTestCase {
         String(decoding: try JSONEncoder().encode(AuthoringResultV1(requestID: request.requestID, inputDigest: request.delivery.snapshotDigest, preferenceRevisions: [:], operationID: "operation", answer: "Ready")), as: UTF8.self)
     }
     @MainActor func testResponseLossRecoversExactHistoryWithoutResubmittingAndAcknowledgesNativeReceipt() async throws {
-        let peer = Peer(); let (root, ledger, _, adapter, request) = try fixture(peer); defer { try? FileManager.default.removeItem(at: root) }
+        let peer = Peer(); let (root, ledger, _, adapter, request) = try fixture(peer, createdAt: 1_000); defer { try? FileManager.default.removeItem(at: root) }
         await peer.set(result: try result(request), lose: true)
         _ = try await adapter.submit(request)
         XCTAssertEqual(try ledger.record(requestID: request.requestID)?.status, .deliveryUncertain)
@@ -303,7 +303,7 @@ final class AppServerTests: XCTestCase {
         await adapter.disconnect()
     }
     @MainActor func testCancellationTombstoneBlocksLateOutput() async throws {
-        let peer = Peer(); let (root, ledger, _, adapter, request) = try fixture(peer); defer { try? FileManager.default.removeItem(at: root) }
+        let peer = Peer(); let (root, ledger, _, adapter, request) = try fixture(peer, createdAt: 1_000); defer { try? FileManager.default.removeItem(at: root) }
         await peer.set(result: try result(request), completes: false)
         _ = try await adapter.submit(request); try await adapter.cancel(requestID: request.requestID)
         XCTAssertEqual(try ledger.record(requestID: request.requestID)?.status, .cancelled)
@@ -396,8 +396,8 @@ final class AppServerTests: XCTestCase {
 }
 
 extension AppServerTests {
-    @MainActor private func fixtureV2(_ peer: Peer, resultSource: Bool = false, client injectedClient: AppServerClient? = nil) throws -> (URL, LocalDeliveryLedger, LocalAgentConfigurationRepository, LocalAuthoringTransportV2, AuthoringRequestV2) {
-        let (root, ledger, config, _, old) = try fixture(peer)
+    @MainActor private func fixtureV2(_ peer: Peer, resultSource: Bool = false, client injectedClient: AppServerClient? = nil, createdAt: Int64? = nil) throws -> (URL, LocalDeliveryLedger, LocalAgentConfigurationRepository, LocalAuthoringTransportV2, AuthoringRequestV2) {
+        let (root, ledger, config, _, old) = try fixture(peer, createdAt: createdAt)
         var legacy = old
         if resultSource {
             legacy.context.baseRevision = "base-revision"
@@ -432,7 +432,7 @@ extension AppServerTests {
         await adapter.disconnect()
     }
     @MainActor func testV2LostStartResponseRecoversOnceAcrossRestartAndAcknowledges() async throws {
-        let peer = Peer(); let (root, ledger, config, adapter, request) = try fixtureV2(peer, resultSource: true)
+        let peer = Peer(); let (root, ledger, config, adapter, request) = try fixtureV2(peer, resultSource: true, createdAt: 1_000)
         defer { try? FileManager.default.removeItem(at: root) }
         let source = try XCTUnwrap(request.context.currentScreen?.files.first { $0.path == "cosmo.svg" })
         let result = AuthoringResultV2(requestID: request.requestID, inputDigest: request.delivery.snapshotDigest, baseRevision: request.context.baseRevision, preferenceRevisions: [:], operationID: "v2-operation", screen: .init(title: "Synthetic Cosmo", files: [
@@ -457,7 +457,7 @@ extension AppServerTests {
         await recovered.disconnect()
     }
     @MainActor func testV2CancellationRejectsLateOutputAndWrongContractCannotRecover() async throws {
-        let peer = Peer(); let (root, ledger, config, adapter, request) = try fixtureV2(peer)
+        let peer = Peer(); let (root, ledger, config, adapter, request) = try fixtureV2(peer, createdAt: 1_000)
         defer { try? FileManager.default.removeItem(at: root) }
         let result = AuthoringResultV2(requestID: request.requestID, inputDigest: request.delivery.snapshotDigest, preferenceRevisions: [:], operationID: "v2-operation", answer: "Ready")
         await peer.set(result: String(decoding: try JSONEncoder().encode(result), as: UTF8.self), completes: false)
@@ -966,7 +966,7 @@ extension AppServerTests {
     @MainActor func testSameV1AdapterReconnectRecoversOfflineCompletionWithoutReplayingTurn() async throws {
         for remoteClose in [false, true] {
             let peer = Peer(), client = AppServerClient(openSocket: { await peer.socket() })
-            let (root, ledger, _, adapter, request) = try fixture(peer, client: client)
+            let (root, ledger, _, adapter, request) = try fixture(peer, client: client, createdAt: 1_000)
             defer { try? FileManager.default.removeItem(at: root) }
             let outputText = try result(request)
             await peer.set(result: outputText, completes: false)
@@ -998,7 +998,7 @@ extension AppServerTests {
     @MainActor func testSameV2AdapterReconnectRecoversOfflineCompletionWithoutReplayingTurn() async throws {
         for remoteClose in [false, true] {
             let peer = Peer(), client = AppServerClient(openSocket: { await peer.socket() })
-            let (root, ledger, _, adapter, request) = try fixtureV2(peer, client: client)
+            let (root, ledger, _, adapter, request) = try fixtureV2(peer, client: client, createdAt: 1_000)
             defer { try? FileManager.default.removeItem(at: root) }
             let output = AuthoringResultV2(requestID: request.requestID, inputDigest: request.delivery.snapshotDigest, preferenceRevisions: [:], operationID: "offline-v2-completion", answer: "Recovered")
             await peer.set(result: String(decoding: try JSONEncoder().encode(output), as: UTF8.self), completes: false)

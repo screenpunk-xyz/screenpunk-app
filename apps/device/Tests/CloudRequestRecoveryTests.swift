@@ -48,11 +48,11 @@ final class CloudRequestRecoveryTests: XCTestCase {
         XCTAssertEqual(try v2.deliveryState(requestID: "old-request", now: expiredNow), .completed(try XCTUnwrap(v2.authoringResult)))
     }
 
-    func testAuthoritativelyPendingExpiredRequestsStillTimeOutForV1AndV2() throws {
+    func testPendingRequestsRemainRecoverableAfterLegacyDeadlineForV1AndV2() throws {
         let v1 = try JSONDecoder().decode(AgentRequest.self, from: response(version: 1, status: "pending"))
         let v2 = try JSONDecoder().decode(AgentRequestV2.self, from: response(status: "pending"))
-        XCTAssertEqual(try v1.deliveryState(requestID: "old-request", now: expiredNow), .ended(status: "timed_out", message: nil))
-        XCTAssertEqual(try v2.deliveryState(requestID: "old-request", now: expiredNow), .ended(status: "timed_out", message: nil))
+        guard case .pending = try v1.deliveryState(requestID: "old-request", now: expiredNow) else { return XCTFail("Age must not cancel V1 work") }
+        guard case .pending = try v2.deliveryState(requestID: "old-request", now: expiredNow) else { return XCTFail("Age must not cancel V2 work") }
     }
 
     @MainActor func testFreshLibraryWithRestoredIdentityDoesNotAdoptTerminalCloudHistory() async throws {
@@ -78,10 +78,10 @@ final class CloudRequestRecoveryTests: XCTestCase {
         }
     }
 
-    @MainActor func testRestoresOnlyUnexpiredInFlightWorkAndNeverConsumedWork() async throws {
+    @MainActor func testRestoresAgedInFlightWorkButNeverConsumedWork() async throws {
         for (consumed, applied, now, expectedReads, expectedRequest) in [
             (nil, nil, 3_000.0, 1, true), ("old-request", nil, 3_000.0, 0, false),
-            (nil, "old-request", 3_000.0, 0, false), (nil, nil, expiredNow, 1, false),
+            (nil, "old-request", 3_000.0, 0, false), (nil, nil, expiredNow, 1, true),
         ] as [(String?, String?, Double, Int, Bool)] {
             var reads = 0
             let restored = try await CloudRequestRecovery.discoverPending(id: "old-request", status: "pending",

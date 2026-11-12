@@ -1,7 +1,9 @@
 import Foundation
 
 public enum LocalDeliveryStatus: String, Codable, Sendable {
-    case prepared, submitting, running, deliveryUncertain, needsAttention, completed, cancelled, applied, conflict, rejected, failed, timedOut
+    case prepared, submitting, running, deliveryUncertain, needsAttention, completed, cancelled, applied, conflict, rejected, failed
+    /// Persisted terminal status from older clients that ended requests at a deadline.
+    case timedOut
     public var isTerminal: Bool { [.cancelled, .applied, .conflict, .rejected, .failed, .timedOut].contains(self) }
     /// A completed transport result still awaits native CAS application and receipt.
     public var blocksNewRequest: Bool { !isTerminal }
@@ -15,6 +17,7 @@ public struct LocalDeliveryRecord: Codable, Equatable, Sendable {
     public var threadID: String?
     public var turnID: String?
     public var baseRevision: String?
+    /// Historical timestamp retained as part of the immutable request binding.
     public var deadlineAt: Int64
     public var status: LocalDeliveryStatus
     public var contractVersion: Int
@@ -112,25 +115,19 @@ public final class LocalDeliveryLedger: @unchecked Sendable {
             state.records[next.requestID] = next; try file.save(state)
         }
     }
-    public func cancel(requestID: String) throws { try end(requestID: requestID, status: .cancelled, reason: "Cancelled on this device.") }
-    public func expire(requestID: String, now: Int64) throws {
-        try lock.locallyLocked {
-            guard let record = try record(requestID: requestID), now >= record.deadlineAt else { return }
-            try end(requestID: requestID, status: .timedOut, reason: "The local request deadline passed.")
-        }
-    }
+    public func cancel(requestID: String) throws { try cancel(requestID: requestID, reason: "Cancelled on this device.") }
     public func blockOutstanding(configurationID: String, reason: String) throws {
         try lock.locallyLocked {
             for record in try records() where record.connectionID == configurationID && !record.status.isTerminal {
-                try end(requestID: record.requestID, status: .cancelled, reason: reason)
+                try cancel(requestID: record.requestID, reason: reason)
             }
         }
     }
-    private func end(requestID: String, status: LocalDeliveryStatus, reason: String) throws {
+    private func cancel(requestID: String, reason: String) throws {
         try lock.locallyLocked {
             guard var record = try record(requestID: requestID) else { throw LocalPersistenceError.invalid("The local delivery is missing.") }
             guard !record.status.isTerminal else { return }
-            record.status = status; record.failure = reason; record.finalResult = nil; record.finalResultV2 = nil
+            record.status = .cancelled; record.failure = reason; record.finalResult = nil; record.finalResultV2 = nil
             // A cancellation tombstone deliberately discards a transport-only result.
             var state = try file.load() ?? .init(); state.records[requestID] = record; try file.save(state)
         }
@@ -165,7 +162,7 @@ public final class LocalDeliveryLedger: @unchecked Sendable {
     }
     private func canTransition(_ old: LocalDeliveryStatus, _ next: LocalDeliveryStatus) -> Bool {
         if old == next { return true }; if old.isTerminal { return false }
-        if [.cancelled, .timedOut, .failed, .rejected].contains(next) { return true }
+        if [.cancelled, .failed, .rejected].contains(next) { return true }
         switch old {
         case .prepared: return [.submitting, .needsAttention].contains(next)
         case .submitting: return [.running, .deliveryUncertain, .needsAttention, .completed].contains(next)

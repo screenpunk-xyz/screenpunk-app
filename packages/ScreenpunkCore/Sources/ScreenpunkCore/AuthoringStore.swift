@@ -91,7 +91,6 @@ public enum AuthoringStore {
         _ = try AuthoringContract.validateResult(JSONEncoder().encode(result), request: request)
         var status = "applied", message: String?
         if cancelled || (state.cancelledRequestIDs ?? []).contains(result.requestID) { status = "rejected"; message = "This request was cancelled on this device." }
-        else if now >= request.deadlineAt { status = "rejected"; message = "The authoring request has expired." }
         else if request.context.baseRevision != currentScreenRevision { status = "conflict"; message = "The screen changed after this request started." }
         else if request.preferences.contains(where: { state.records[$0.id]?.revision != $0.revision || state.records[$0.id]?.deleted == true }) {
             status = "conflict"; message = "A preference changed after this request started."
@@ -177,7 +176,6 @@ public enum AuthoringStore {
         _ = try AuthoringV2Contract.validateResult(JSONEncoder().encode(result), request: request)
         var status = "applied", message: String?
         if cancelled || (state.cancelledRequestIDs ?? []).contains(result.requestID) { status = "rejected"; message = "This request was cancelled on this device." }
-        else if now >= request.deadlineAt { status = "rejected"; message = "The authoring request has expired." }
         else if request.context.baseRevision != currentScreenRevision { status = "conflict"; message = "The screen changed after this request started." }
         else if request.preferences.contains(where: { state.records[$0.id]?.revision != $0.revision || state.records[$0.id]?.deleted == true }) { status = "conflict"; message = "A preference changed after this request started." }
         if status == "applied", result.screen == nil, currentScreenRevision == nil,

@@ -176,7 +176,6 @@ public struct LocalAgentTestReceipt: Sendable, Equatable {
     public func reconcile(requestID: String) async throws -> AuthoringDeliveryState {
         guard var record = try ledger.record(requestID: requestID) else { throw AuthoringCoordinationError.unknownRequest }
         if record.status.isTerminal { return .ended(status: record.status.rawValue, message: record.failure) }
-        if Self.now >= record.deadlineAt { try ledger.expire(requestID: requestID, now: Self.now); return .ended(status: "timedOut", message: "The local request deadline passed.") }
         let c = try configuration(); let request = try savedRequest(requestID); try verify(record, c: c, request: request)
         if let result = record.finalResult { return .completed(result) }
         guard let threadID = record.threadID else { return .deliveryUncertain(message: LocalAuthoringError.uncertain.localizedDescription) }
@@ -217,7 +216,7 @@ public struct LocalAgentTestReceipt: Sendable, Equatable {
                 return .ended(status: "failed", message: record.failure)
             }
             record.status = .running; record.failure = nil; try ledger.update(record)
-            return .pending(.init(status: "running", caption: "Codex is preparing your screen", deadlineAt: Double(record.deadlineAt)))
+            return .pending(.init(status: "running", caption: "Codex is preparing your screen"))
         } catch {
             guard let latest = try ledger.record(requestID: requestID), !latest.status.isTerminal else { return .ended(status: "cancelled", message: nil) }
             if error is AuthoringContractError {

@@ -27,7 +27,6 @@ import ScreenpunkLocalTransport
     init(profileID: String, authoringProfileID: String? = nil, configurationRepository: LocalAgentConfigurationRepository, ledger: LocalDeliveryLedger, credentialStore: any SSHCredentialStore, requestLookup: @escaping (String) throws -> AuthoringRequestV2?, client: AppServerClient) {
         self.profileID = profileID; self.authoringProfileID = authoringProfileID ?? profileID; configurations = configurationRepository; self.ledger = ledger; self.credentialStore = credentialStore; self.requestLookup = requestLookup; injectedClient = client
     }
-    private static var now: Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
     private func configuration() throws -> LocalAgentConfiguration {
         guard let c = try configurations.load() else { throw LocalAuthoringError.notConfigured }
         guard c.pinnedCodexVersion == AppServerClient.pinnedVersion else { throw LocalAuthoringError.unsupportedVersion }
@@ -192,7 +191,6 @@ import ScreenpunkLocalTransport
     public func reconcile(requestID: String) async throws -> AuthoringDeliveryStateV2 {
         guard var record = try ledger.record(requestID: requestID) else { throw AuthoringCoordinationError.unknownRequest }
         if record.status.isTerminal { return .ended(status: record.status.rawValue, message: record.failure) }
-        if Self.now >= record.deadlineAt { try ledger.expire(requestID: requestID, now: Self.now); return .ended(status: "timedOut", message: "The local request deadline passed.") }
         let c = try configuration(); let request = try savedRequest(requestID); try verify(record, c: c, request: request)
         if let result = record.finalResultV2 { return .completed(result) }
         guard let threadID = record.threadID else { return .deliveryUncertain(message: LocalAuthoringError.uncertain.localizedDescription) }
@@ -234,7 +232,7 @@ import ScreenpunkLocalTransport
                 return .ended(status: "failed", message: record.failure)
             }
             record.status = .running; record.failure = nil; try ledger.update(record)
-            return .pending(.init(status: "running", caption: "Codex is preparing your screen", deadlineAt: Double(record.deadlineAt)))
+            return .pending(.init(status: "running", caption: "Codex is preparing your screen"))
         } catch {
             guard let latest = try ledger.record(requestID: requestID), !latest.status.isTerminal else { return .ended(status: "cancelled", message: nil) }
             if let result = latest.finalResultV2 { return .completed(result) }

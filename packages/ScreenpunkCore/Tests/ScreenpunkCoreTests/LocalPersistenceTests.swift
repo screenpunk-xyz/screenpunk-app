@@ -101,18 +101,17 @@ final class LocalPersistenceTests: XCTestCase {
         var changed = record; changed.turnID = "other-turn"; XCTAssertThrowsError(try restart.update(changed))
         changed = record; changed.profileID = "other-account"; XCTAssertThrowsError(try restart.update(changed))
     }
-    func testCancelTimeoutAndForgottenEndpointBlockLateResultsAcrossRestart() throws {
-        for terminal in [LocalDeliveryStatus.cancelled, .timedOut] {
-            let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
-            let ledger = try LocalDeliveryLedger(rootDirectory: root)
-            var record = binding(); try ledger.prepare(record); record.status = .submitting; try ledger.update(record)
-            if terminal == .cancelled { try ledger.cancel(requestID: record.requestID) }
-            else { try ledger.expire(requestID: record.requestID, now: record.deadlineAt) }
-            let restart = try LocalDeliveryLedger(rootDirectory: root)
-            XCTAssertEqual(try restart.record(requestID: record.requestID)?.status, terminal)
-            record.status = .completed; record.finalResult = .init(requestID: record.requestID, inputDigest: record.inputDigest, baseRevision: record.baseRevision, preferenceRevisions: [:], operationID: "operation", answer: "late")
-            XCTAssertThrowsError(try restart.update(record)); XCTAssertNil(try restart.unresolvedRecord())
-        }
+    func testCancelAndForgottenEndpointBlockLateResultsAcrossRestart() throws {
+        let cancelledRoot = directory(); defer { try? FileManager.default.removeItem(at: cancelledRoot) }
+        let cancelledLedger = try LocalDeliveryLedger(rootDirectory: cancelledRoot)
+        var record = binding(); try cancelledLedger.prepare(record); record.status = .submitting; try cancelledLedger.update(record)
+        var timedOut = record; timedOut.status = .timedOut
+        XCTAssertThrowsError(try cancelledLedger.update(timedOut))
+        try cancelledLedger.cancel(requestID: record.requestID)
+        let restart = try LocalDeliveryLedger(rootDirectory: cancelledRoot)
+        XCTAssertEqual(try restart.record(requestID: record.requestID)?.status, .cancelled)
+        record.status = .completed; record.finalResult = .init(requestID: record.requestID, inputDigest: record.inputDigest, baseRevision: record.baseRevision, preferenceRevisions: [:], operationID: "operation", answer: "late")
+        XCTAssertThrowsError(try restart.update(record)); XCTAssertNil(try restart.unresolvedRecord())
         let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
         let ledger = try LocalDeliveryLedger(rootDirectory: root); try ledger.prepare(binding())
         try ledger.blockOutstanding(configurationID: "connection", reason: "Forgotten")

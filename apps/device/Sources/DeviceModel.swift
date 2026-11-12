@@ -383,15 +383,8 @@ import ScreenpunkLocalTransport
     }
     /// Runs independently of Cloud I/O, including when outbound requests are stalled.
     func reconcileTemporary() {
-        let settled = settleAcknowledgedPending()
+        _ = settleAcknowledgedPending()
         takingLonger = requestPending && progressTiming.isTakingLonger(at: Date())
-        if !settled, requestPending, currentRequestRoute == .local, let id = pendingID, let library {
-            if let snapshot = library.authoringRequestV2(id: id) {
-                if recoveryAction(snapshot, library: library) == .cancelExpired { cancelKnownRequest(id, timedOut: true) }
-            } else if let deadline = library.state.requestDeadline, Date().timeIntervalSince1970 * 1000 >= deadline {
-                cancelKnownRequest(id, timedOut: true)
-            }
-        }
         do { try library?.reconcileTemporary(); if screen?.id != library?.selected?.id { refreshScreen() } }
         catch { message = error.localizedDescription }
     }
@@ -444,13 +437,20 @@ import ScreenpunkLocalTransport
             agentReady = routePreference == .automatic ? (localAgent != nil || cloudAgentReady) : cloudAgentReady
             if let command = status.command { await applyCommand(command) }
             guard cloud.session?.accessToken == token, foreground, generation == connectionGeneration, !Task.isCancelled else { return true }
+            if pendingID == nil, !busy, !requestPending, let profileID = cloud.session?.profileID, let deviceID = cloud.session?.deviceId,
+               let recovered = library?.recoverableCloudCompletion(status.awaitingApplicationRequestIDs ?? [], profileID: profileID, deviceID: deviceID) {
+                pendingID = recovered
+                try persistPending()
+                busy = true; requestPending = true; canCancelRequest = true
+            }
             var discoveredRequest: AgentRequest?
-            if pendingID == nil, let latest = status.latestRequest {
+            if pendingID == nil, !busy, !requestPending, library?.state.submissionKey == nil, let latest = status.latestRequest {
                 discoveredRequest = try await CloudRequestRecovery.discoverPending(id: latest.id, status: latest.status,
                     consumedID: consumedID, lastAppliedRequestID: library?.state.lastRequest) { id in
                     try await self.cloud.call("api/device/requests/\(id)", authoringVersion: 2)
                 }
                 guard cloud.session?.accessToken == token, foreground, generation == connectionGeneration, !Task.isCancelled else { return true }
+                guard pendingID == nil, !busy, !requestPending, library?.state.submissionKey == nil else { return true }
                 if let discoveredRequest {
                     pendingID = discoveredRequest.id
                     try persistPending()
@@ -463,7 +463,7 @@ import ScreenpunkLocalTransport
                     let restored: AgentRequest
                     if let discoveredRequest { restored = discoveredRequest }
                     else { restored = try await cloud.call("api/device/requests/\(id)", authoringVersion: 2) }
-                    guard cloud.session?.accessToken == token, foreground, generation == connectionGeneration, !Task.isCancelled else { return true }
+                    guard pendingID == id, cloud.session?.accessToken == token, foreground, generation == connectionGeneration, !Task.isCancelled else { return true }
                     if let snapshot = restored.snapshotV2 {
                         guard snapshot.delivery.route == "cloud", snapshot.context.profileID == cloud.session?.profileID, snapshot.context.deviceID == cloud.session?.deviceId else { throw DeviceError.message("This request belongs to a different connection.") }
                         try library?.saveAuthoringRequest(snapshot)
@@ -479,7 +479,7 @@ import ScreenpunkLocalTransport
                     try library?.saveAuthoringRequest(snapshot)
                 }
                 let delivery = try await authoring.reconcile(requestID: id)
-                guard cloud.session?.accessToken == token, foreground, generation == connectionGeneration, !Task.isCancelled else { return true }
+                guard pendingID == id, cloud.session?.accessToken == token, foreground, generation == connectionGeneration, !Task.isCancelled else { return true }
                 if cancelledLocally.contains(id) { cancelKnownRequest(id); return false }
                 switch delivery {
                 case .completed(let result):
@@ -505,10 +505,7 @@ import ScreenpunkLocalTransport
                     try finishRequest(id, status: status, failure: failure)
                 case .pending(let progress):
                     agentWorkingRequestID = id
-                    if let deadline = progress.deadlineAt {
-                        try library?.submissionAccepted(deadline: deadline)
-                        if Date().timeIntervalSince1970 * 1000 >= deadline { cancelKnownRequest(id, timedOut: true); return false }
-                    }
+                    try library?.submissionAccepted(deadline: progress.deadlineAt)
                     busy = true; requestPending = true; canCancelRequest = true; canRetry = false
                     progressCaption = progress.caption ?? "Your agent is working…"
                     progressTiming.lastProgressAt = Date(timeIntervalSince1970: (progress.updatedAt ?? Date().timeIntervalSince1970 * 1000) / 1000)
@@ -660,6 +657,19 @@ import ScreenpunkLocalTransport
         } catch { message = "Your result is saved. Final delivery state will be recovered when local storage is available." }
         return true
     }
+    private func localReceiptRecovery(_ receipt: ApplicationReceiptV1, record: LocalDeliveryRecord?) -> PreparedRequestRecoveryPolicy.LocalReceiptRecovery {
+        guard let record, record.profileID == activeProfile?.id else { return .preserve }
+        let adapterAvailable = record.contractVersion == 2 ? localAuthoringV2 != nil : localAuthoring != nil
+        return PreparedRequestRecoveryPolicy.localReceiptRecovery(receipt, record: record, adapterAvailable: adapterAvailable)
+    }
+    private func releaseLocalReceiptPending(_ id: String, settled: Bool, library: ScreenLibrary) throws {
+        guard pendingID == id else { return }
+        let consumed = settled ? id : consumedID
+        try library.savePending(id: nil, screenID: nil, consumedID: consumed)
+        pendingID = nil; pendingScreenID = nil; consumedID = consumed
+        agentWorkingRequestID = nil
+        busy = false; requestPending = false; canCancelRequest = false; canRetry = false; takingLonger = false
+    }
     private func recoveryAction(_ snapshot: AuthoringRequestV2, library: ScreenLibrary) -> PreparedRequestRecoveryPolicy.Action {
         PreparedRequestRecoveryPolicy.action(requestID: snapshot.requestID,
             route: AuthoringRoute(rawValue: snapshot.delivery.route) ?? .cloud,
@@ -667,17 +677,21 @@ import ScreenpunkLocalTransport
             hasReceipt: library.state.authoring?.receipts.values.contains(where: { $0.requestID == snapshot.requestID }) == true,
             submissionKey: library.state.submissionKey, cancelled: cancelledLocally.contains(snapshot.requestID))
     }
+    private func ownsSubmission(_ id: String, library: ScreenLibrary) -> Bool {
+        self.library === library && PreparedRequestRecoveryPolicy.ownsSubmission(requestID: id,
+            pendingID: pendingID, submissionKey: library.state.submissionKey, cancelled: cancelledLocally.contains(id))
+    }
     private func submitPreparedV2(_ snapshot: AuthoringRequestV2, library: ScreenLibrary) async {
         if snapshot.delivery.route == "local" {
             let generation = connectionGeneration
             await localConnectionLifecycle.wait()
             guard foreground, self.library === library, generation == connectionGeneration, !Task.isCancelled else { return }
         }
+        guard ownsSubmission(snapshot.requestID, library: library) else { return }
         if pendingID == snapshot.requestID, settleAcknowledgedPending() { return }
         let route = AuthoringRoute(rawValue: snapshot.delivery.route) ?? .cloud
         guard let coordinator = route == .local ? localAuthoringV2 : cloudAuthoringV2 else { message = "Reconnect this request’s agent in Settings. Your instructions are saved."; return }
         switch recoveryAction(snapshot, library: library) {
-        case .cancelExpired: cancelKnownRequest(snapshot.requestID, timedOut: true); return
         case .cancelled: message = "This request was cancelled. Its delivery will not be retried."; return
         case .acknowledgeReceipt, .reconcile:
             pendingID = snapshot.requestID
@@ -695,13 +709,12 @@ import ScreenpunkLocalTransport
         do {
             try persistPending()
             let accepted = try await coordinator.submit(snapshot)
-            guard self.library === library, generation == connectionGeneration else { return }
-            if cancelledLocally.contains(accepted.requestID) { cancelKnownRequest(accepted.requestID); return }
+            guard ownsSubmission(snapshot.requestID, library: library), generation == connectionGeneration else { return }
             try library.submissionAccepted(deadline: Double(accepted.deadlineAt))
             agentWorkingRequestID = accepted.requestID
             progressCaption = "\(resolvedAgentName ?? "Your agent") is working on this screen…"
         } catch {
-            guard self.library === library, generation == connectionGeneration else { return }
+            guard ownsSubmission(snapshot.requestID, library: library), generation == connectionGeneration else { return }
             agentWorkingRequestID = nil
             // Once prepared, even failures before/after acceptance stay on this route.
             progressCaption = error.localizedDescription
@@ -729,14 +742,14 @@ import ScreenpunkLocalTransport
             // A receipt can precede network acknowledgement at any crash boundary.
             if let receipt = library.state.authoring?.receipts.values.first(where: { $0.requestID == id }) {
                 agentWorkingRequestID = nil
+                canCancelRequest = false
                 try await coordinator.acknowledge(receipt)
-                guard self.library === library, generation == connectionGeneration else { return true }
+                guard self.library === library, pendingID == id, generation == connectionGeneration else { return true }
                 consumedID = id; pendingID = nil; busy = false; requestPending = false; canCancelRequest = false; canRetry = false; takingLonger = false
                 try persistPending(); refreshScreen(); refreshPreferences(); return true
             }
-            if snapshot.delivery.route == "local", recoveryAction(snapshot, library: library) == .cancelExpired { cancelKnownRequest(id, timedOut: true); return true }
             let delivery = try await coordinator.reconcile(requestID: id)
-            guard self.library === library, generation == connectionGeneration, !Task.isCancelled else { return true }
+            guard self.library === library, pendingID == id, generation == connectionGeneration, !Task.isCancelled else { return true }
             if cancelledLocally.contains(id) { return true }
             switch delivery {
             case .completed(let result):
@@ -749,18 +762,15 @@ import ScreenpunkLocalTransport
                 message = receipt.status == "applied" ? (result.preferenceMutations?.isEmpty == false ? "Preference saved" : result.answer) : (receipt.message ?? "Your screen is unchanged.")
                 // Keep pending identity until acknowledgement; restart can finish the exact receipt.
                 agentWorkingRequestID = nil
+                canCancelRequest = false
                 try await coordinator.acknowledge(receipt)
-                guard self.library === library, generation == connectionGeneration else { return true }
+                guard self.library === library, pendingID == id, generation == connectionGeneration else { return true }
                 consumedID = id; pendingID = nil; busy = false; requestPending = false; canCancelRequest = false; canRetry = false; takingLonger = false
                 try persistPending()
             case .ended(let status, let failure): try finishRequest(id, status: status, failure: failure)
             case .pending(let progress):
                 agentWorkingRequestID = id
-                if let deadline = progress.deadlineAt {
-                    try library.submissionAccepted(deadline: deadline)
-                    // This response is authoritative pending work, not an expired local snapshot.
-                    if Date().timeIntervalSince1970 * 1000 >= deadline { cancelKnownRequest(id, timedOut: true); return true }
-                }
+                try library.submissionAccepted(deadline: progress.deadlineAt)
                 busy = true; requestPending = true; canCancelRequest = true; canRetry = false
                 progressCaption = progress.caption ?? "\(resolvedAgentName ?? "Your agent") is working…"
                 if let updated = progress.updatedAt { progressTiming.lastProgressAt = Date(timeIntervalSince1970: updated / 1000) }
@@ -770,9 +780,9 @@ import ScreenpunkLocalTransport
             }
             return AuthoringRefreshPolicy.reconciliationSucceeded(delivery, route: snapshot.delivery.route)
         } catch {
-            guard self.library === library, generation == connectionGeneration else { return true }
+            guard self.library === library, pendingID == id, generation == connectionGeneration else { return true }
             agentWorkingRequestID = nil
-            progressCaption = error.localizedDescription; canCancelRequest = true
+            progressCaption = error.localizedDescription; canCancelRequest = !library.hasApplicationReceipt(requestID: id)
             if snapshot.delivery.route == "cloud", library.state.submissionKey == id {
                 busy = false; requestPending = false; canRetry = true
                 message = "Cloud delivery could not be confirmed. Retry keeps this same Cloud request and request ID."
@@ -804,6 +814,7 @@ import ScreenpunkLocalTransport
         busy = true; requestPending = true; canCancelRequest = false; takingLonger = false; canRetry = false
         progressTiming.begin(at: Date())
         progressCaption = "Sending your instructions…"; message = nil
+        var attemptID: String?
         do {
             let snapshot: AuthoringRequestV1
             if let key = library.state.submissionKey, let saved = library.authoringRequest(id: key) { snapshot = saved }
@@ -817,14 +828,17 @@ import ScreenpunkLocalTransport
                 try library.saveSubmission(key: snapshot.requestID, text: text, screen: screen?.artifact)
                 try persistPending()
             }
+            attemptID = snapshot.requestID
             let accepted = try await authoring.submit(snapshot)
             guard cloud.session?.accessToken == session.accessToken, self.library === library, generation == connectionGeneration else { return }
-            if cancelledLocally.contains(accepted.requestID) { cancelKnownRequest(accepted.requestID); return }
+            guard ownsSubmission(snapshot.requestID, library: library) else { return }
             try library.submissionAccepted(deadline: Double(accepted.deadlineAt))
             agentWorkingRequestID = accepted.requestID
             pendingID = accepted.requestID; try persistPending()
             canCancelRequest = true; progressCaption = "Your agent is working on this screen…"; requestRefresh()
         } catch {
+            if let attemptID { guard ownsSubmission(attemptID, library: library) else { return } }
+            else { guard pendingID == nil, library.state.submissionKey == nil else { return } }
             guard cloud.session?.accessToken == session.accessToken, self.library === library, generation == connectionGeneration else { return }
             agentWorkingRequestID = nil
             busy = false; requestPending = false; canRetry = true; canCancelRequest = library.state.submissionKey != nil; message = error.localizedDescription; requestRefresh()
@@ -874,7 +888,12 @@ import ScreenpunkLocalTransport
         defer { RequestTimeline.record(.applyEnd, requestID: requestID) }
         return try apply()
     }
-    func keepWaiting() { progressTiming.warningDismissedAt = Date(); takingLonger = false }
+    func keepWaiting() {
+        progressTiming.warningDismissedAt = Date(); takingLonger = false
+        // Explicit user recovery reads the same durable request; it never resubmits
+        // agent work or starts periodic checks while Cloud is idle.
+        requestRefresh()
+    }
     private func finishRequest(_ id: String, status: String, failure: String?) throws {
         if agentWorkingRequestID == id { agentWorkingRequestID = nil }
         try library?.retireAuthoringRequest(id: id)
@@ -896,6 +915,9 @@ import ScreenpunkLocalTransport
     }
     func cancelRequest() {
         guard canCancelRequest, let id = pendingID ?? library?.state.submissionKey else { return }
+        guard library?.hasApplicationReceipt(requestID: id) != true else {
+            canCancelRequest = false; requestRefresh(); return
+        }
         cancelKnownRequest(id)
     }
     private func cancelKnownRequest(_ id: String, timedOut: Bool = false) {
@@ -1307,6 +1329,9 @@ import ScreenpunkLocalTransport
                 await self.billing.billingUpdated(operationID: notice.operation_id, eventID: notice.event_id, cloud: self.cloud)
             }
         })
+        // Foreground recovery must not depend on a successful socket handshake.
+        // A missed completion is reconciled by ID even while the socket reconnects.
+        requestCloudStatusReconciliation()
     }
     private func rejectCloudAuthorization() {
         if currentRequestRoute == .cloud { agentWorkingRequestID = nil }
@@ -1390,6 +1415,9 @@ import ScreenpunkLocalTransport
             let success = await self.poll(generation: generation)
             guard self.connectionGeneration == generation, !Task.isCancelled else { return .idle }
             if success { self.refreshFailures = 0; return .idle }
+            let submittedCloud = self.library?.hasCloudSubmission == true
+            let hasWork = self.pendingID != nil || submittedCloud || !(self.library?.state.cancelIntents ?? []).isEmpty
+            guard AuthoringRefreshPolicy.retryFailedRead(hasPendingWork: hasWork, hasCloudSocket: self.cloudSocketEpoch != nil) else { return .idle }
             self.refreshFailures = min(self.refreshFailures + 1, 6)
             let delay = min(60, pow(2, Double(self.refreshFailures)) * Double.random(in: 0.75...1.25))
             return .retry(Date().addingTimeInterval(delay))
@@ -1499,12 +1527,49 @@ import ScreenpunkLocalTransport
         if pendingID == nil, let key = opened.state.submissionKey, (opened.authoringRequestV2(id: key)?.delivery.route ?? opened.authoringRequest(id: key)?.delivery.route) == "local" { pendingID = key }
         pendingScreenID = opened.state.pendingScreenID; consumedID = opened.state.consumedID
         cancelledLocally = Set(opened.state.cancelledRequests ?? [])
-        if let outstanding = try localLedger?.unresolvedRecord(), outstanding.profileID == profile.id {
+        // A committed receipt may still occupy the interactive slot after a crash.
+        // Recover its exact delivery or release the slot while retaining the receipt.
+        let localReceiptIDs = opened.unacknowledgedLocalReceiptIDs
+        if let id = pendingID, localReceiptIDs.contains(id),
+           let receipt = opened.state.authoring?.receipts.values.first(where: { $0.requestID == id }) {
+            switch localReceiptRecovery(receipt, record: try localLedger?.record(requestID: id)) {
+            case .settleNative:
+                try opened.acknowledgeReceipt(receipt)
+                try releaseLocalReceiptPending(id, settled: true, library: opened)
+            case .acknowledgeTransport: break
+            case .preserve: try releaseLocalReceiptPending(id, settled: false, library: opened)
+            }
+        }
+        if let outstanding = try localLedger?.unresolvedRecord(), outstanding.profileID == profile.id,
+           !opened.hasApplicationReceipt(requestID: outstanding.requestID) {
             if cancelledLocally.contains(outstanding.requestID) { try localLedger?.cancel(requestID: outstanding.requestID) }
             else if pendingID == nil { pendingID = outstanding.requestID; try persistPending() }
         }
-        inventorySignature = nil; busy = pendingID != nil; requestPending = busy; canCancelRequest = busy || opened.state.submissionKey != nil
-        canRetry = opened.state.submissionKey != nil && currentRequestRoute == .cloud
+        // Route recoverable acknowledgements to Local even when Automatic would
+        // otherwise select Cloud. Preserved receipts remain in the native journal.
+        if pendingID == nil, opened.state.submissionKey == nil {
+            for id in localReceiptIDs {
+                guard let state = opened.state.authoring,
+                      let receipt = state.receipts.values.first(where: { $0.requestID == id }),
+                      !state.acknowledgedReceiptIDs.contains(receipt.operationID) else { continue }
+                switch localReceiptRecovery(receipt, record: try localLedger?.record(requestID: id)) {
+                case .settleNative: try opened.acknowledgeReceipt(receipt)
+                case .acknowledgeTransport: pendingID = id; try persistPending()
+                case .preserve: continue
+                }
+                if pendingID != nil { break }
+            }
+        }
+        var retryUnsentLocal = false
+        if let key = opened.state.submissionKey, let localLedger,
+           opened.isUnsentLocalRequest(key, ledgerRecordExists: try localLedger.record(requestID: key) != nil) {
+            // A crash before transport preparation proves no turn was dispatched.
+            // Offer an explicit retry of the sealed request, never auto-start a turn.
+            pendingID = nil; try persistPending(); retryUnsentLocal = true
+        }
+        inventorySignature = nil; busy = pendingID != nil; requestPending = busy
+        canCancelRequest = (busy || opened.state.submissionKey != nil) && !(pendingID.map { opened.hasApplicationReceipt(requestID: $0) } ?? false)
+        canRetry = retryUnsentLocal || (opened.state.submissionKey != nil && currentRequestRoute == .cloud)
         if canRetry, message == nil { message = "Your previous instructions are saved. Retry to confirm delivery." }
         refreshScreen()
     }
@@ -1533,19 +1598,26 @@ import ScreenpunkLocalTransport
         agentWorkingRequestID = nil
         busy = true; requestPending = true; canCancelRequest = false; canRetry = false; takingLonger = false
         progressTiming.begin(at: Date()); message = nil; progressCaption = "Sending to your Mac…"
+        var attemptID: String?
         do {
-            let snapshot = try makeAuthoringRequest(text: text, library: library)
+            let snapshot: AuthoringRequestV1
+            if let key = library.state.submissionKey, let saved = library.authoringRequest(id: key) {
+                guard saved.delivery.route == "local", library.state.submissionText == text, !cancelledLocally.contains(key) else { throw DeviceError.message("The saved Local request changed.") }
+                snapshot = saved
+            } else { snapshot = try makeAuthoringRequest(text: text, library: library, route: .local) }
+            attemptID = snapshot.requestID
             pendingID = snapshot.requestID; pendingScreenID = snapshot.context.screenID
             try library.saveSubmission(key: snapshot.requestID, text: text, screen: screen?.artifact)
             try library.saveAuthoringRequest(snapshot); try persistPending()
             canCancelRequest = true
             let accepted = try await authoring.submit(snapshot)
-            guard self.library === library, generation == connectionGeneration else { return }
-            if cancelledLocally.contains(accepted.requestID) { cancelKnownRequest(accepted.requestID); return }
+            guard ownsSubmission(snapshot.requestID, library: library), generation == connectionGeneration else { return }
             try library.submissionAccepted(deadline: Double(accepted.deadlineAt))
             agentWorkingRequestID = accepted.requestID
             progressCaption = "Your Mac is working on this screen…"; requestRefresh()
         } catch {
+            if let attemptID { guard ownsSubmission(attemptID, library: library) else { return } }
+            else { guard pendingID == nil, library.state.submissionKey == nil else { return } }
             guard self.library === library, generation == connectionGeneration else { return }
             agentWorkingRequestID = nil
             let submissionError = error
@@ -1553,9 +1625,8 @@ import ScreenpunkLocalTransport
             do {
                 guard let ledger = localLedger else { throw DeviceError.message("Local delivery storage is unavailable.") }
                 if let id = pendingID, try ledger.record(requestID: id) == nil {
-                    try library.retireAuthoringRequest(id: id)
                     pendingID = nil; pendingScreenID = nil; try persistPending()
-                    busy = false; requestPending = false; canCancelRequest = false; canRetry = true; message = submissionError.localizedDescription
+                    busy = false; requestPending = false; canCancelRequest = true; canRetry = true; message = submissionError.localizedDescription
                 } else {
                     // Acceptance can be uncertain; preserve this route and request for history reconciliation.
                     progressCaption = submissionError.localizedDescription; canCancelRequest = pendingID != nil
@@ -1574,16 +1645,25 @@ import ScreenpunkLocalTransport
         if let id = pendingID, library.authoringRequestV2(id: id) != nil { return await pollAuthoringV2(generation: generation) }
         do {
             // Local delivery and native receipt acknowledgement are separate durable commits.
-            // Replay exact receipts even when the transport ledger is already terminal and no request is pending.
+            // A preserved receipt must not block another request’s reconciliation.
             if let state = library.state.authoring {
-                for receipt in state.receipts.values where !state.acknowledgedReceiptIDs.contains(receipt.operationID) {
-                    guard let record = try localLedger?.record(requestID: receipt.requestID), record.profileID == activeProfile?.id else { continue }
-                    if record.contractVersion == 2, let localAuthoringV2 { try await localAuthoringV2.acknowledge(receipt) }
-                    else { try await authoring.acknowledge(receipt) }
-                    guard self.library === library, generation == connectionGeneration, !Task.isCancelled else { return true }
+                let localReceiptIDs = Set(library.unacknowledgedLocalReceiptIDs)
+                for receipt in state.receipts.values where localReceiptIDs.contains(receipt.requestID) && !state.acknowledgedReceiptIDs.contains(receipt.operationID) {
+                    let record = try localLedger?.record(requestID: receipt.requestID)
+                    switch localReceiptRecovery(receipt, record: record) {
+                    case .preserve:
+                        try releaseLocalReceiptPending(receipt.requestID, settled: false, library: library)
+                        continue
+                    case .settleNative: try library.acknowledgeReceipt(receipt)
+                    case .acknowledgeTransport:
+                        if record?.contractVersion == 2, let localAuthoringV2 { try await localAuthoringV2.acknowledge(receipt) }
+                        else { try await authoring.acknowledge(receipt) }
+                        guard self.library === library, generation == connectionGeneration, !Task.isCancelled else { return true }
+                    }
                     if pendingID == receipt.requestID {
-                        consumedID = receipt.requestID; pendingID = nil; busy = false; requestPending = false; canCancelRequest = false; takingLonger = false; canRetry = false
-                        try persistPending()
+                        try releaseLocalReceiptPending(receipt.requestID, settled: true, library: library)
+                        refreshScreen(); refreshPreferences()
+                        message = receipt.status == "applied" ? "Your previous result is saved on this device." : (receipt.message ?? "Your screen is unchanged.")
                     }
                 }
             }
@@ -1595,19 +1675,8 @@ import ScreenpunkLocalTransport
         }
         guard let id = pendingID else { return true }
         do {
-            // Repair a crash between the native journal commit and local ledger acknowledgement.
-            if let record = try localLedger?.record(requestID: id), let result = record.finalResult,
-               let receipt = library.state.authoring?.receipts[result.operationID] {
-                agentWorkingRequestID = nil
-                try await authoring.acknowledge(receipt)
-                guard self.library === library, generation == connectionGeneration, !Task.isCancelled else { return true }
-                consumedID = id; pendingID = nil; busy = false; requestPending = false; canCancelRequest = false; takingLonger = false; canRetry = false
-                try persistPending(); refreshScreen(); refreshPreferences()
-                message = receipt.status == "applied" ? "Your previous result is saved on this device." : (receipt.message ?? "Your screen is unchanged.")
-                return true
-            }
             let delivery = try await authoring.reconcile(requestID: id)
-            guard self.library === library, generation == connectionGeneration, !Task.isCancelled else { return true }
+            guard self.library === library, pendingID == id, generation == connectionGeneration, !Task.isCancelled else { return true }
             if cancelledLocally.contains(id) { return true }
             switch delivery {
             case .completed(let result):
@@ -1618,8 +1687,9 @@ import ScreenpunkLocalTransport
                 }
                 // The application receipt is committed before the Mac delivery is acknowledged.
                 agentWorkingRequestID = nil
+                canCancelRequest = false
                 try await authoring.acknowledge(receipt)
-                guard self.library === library, generation == connectionGeneration else { return true }
+                guard self.library === library, pendingID == id, generation == connectionGeneration else { return true }
                 refreshScreen(); refreshPreferences()
                 message = receipt.status == "applied" ? (result.preferenceMutations?.isEmpty == false ? "Preference saved" : result.answer) : (receipt.message ?? "Your screen is unchanged.")
                 consumedID = id; pendingID = nil; busy = false; requestPending = false; canCancelRequest = false; takingLonger = false; canRetry = false
@@ -1627,7 +1697,7 @@ import ScreenpunkLocalTransport
             case .ended(let status, let failure): try finishRequest(id, status: status, failure: failure)
             case .pending(let progress):
                 agentWorkingRequestID = id
-                if let deadline = progress.deadlineAt { try library.submissionAccepted(deadline: deadline) }
+                try library.submissionAccepted(deadline: progress.deadlineAt)
                 busy = true; requestPending = true; canCancelRequest = true; canRetry = false
                 progressCaption = progress.caption ?? "Your Mac is working…"
                 if let updated = progress.updatedAt { progressTiming.lastProgressAt = Date(timeIntervalSince1970: updated / 1000) }
@@ -1637,9 +1707,9 @@ import ScreenpunkLocalTransport
             }
             return pendingID == nil
         } catch {
-            guard self.library === library, generation == connectionGeneration, !Task.isCancelled else { return true }
+            guard self.library === library, pendingID == id, generation == connectionGeneration, !Task.isCancelled else { return true }
             agentWorkingRequestID = nil
-            progressCaption = error.localizedDescription; busy = true; requestPending = true; canCancelRequest = true
+            progressCaption = error.localizedDescription; busy = true; requestPending = true; canCancelRequest = !library.hasApplicationReceipt(requestID: id)
             return false
         }
     }
