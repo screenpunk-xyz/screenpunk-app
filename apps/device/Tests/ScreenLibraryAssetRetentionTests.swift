@@ -129,7 +129,7 @@ final class ScreenLibraryAssetRetentionTests: XCTestCase {
             XCTAssertEqual(library.selected?.revision, revision); XCTAssertTrue(library.preferences.isEmpty)
         }
     }
-    @MainActor func testCancelledAndExpiredV2NeverReadReleasedBase() throws {
+    @MainActor func testCancelledV2CannotReadReleasedBaseButAgedWorkKeepsItsPin() throws {
         for cancel in [true, false] {
             let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
             let library = try ScreenLibrary(accountID: "library-owner", rootDirectory: root)
@@ -145,9 +145,16 @@ final class ScreenLibraryAssetRetentionTests: XCTestCase {
                 XCTAssertTrue(library.state.authoring?.cancelledRequestIDs?.contains(input.requestID) == true)
             }
             let revision = library.selected?.revision
-            if cancel { XCTAssertThrowsError(try library.applyAuthoringResult(result(input, preferences: true), now: 2000)) }
-            else { XCTAssertEqual(try library.applyAuthoringResult(result(input, preferences: true), now: input.deadlineAt).status, "rejected") }
-            XCTAssertEqual(library.selected?.revision, revision); XCTAssertTrue(library.preferences.isEmpty)
+            if cancel {
+                XCTAssertThrowsError(try library.applyAuthoringResult(result(input, preferences: true), now: input.deadlineAt + 60_000_000))
+                XCTAssertEqual(library.selected?.revision, revision); XCTAssertTrue(library.preferences.isEmpty)
+            } else {
+                XCTAssertNotNil(library.state.authoring?.revisionPins?[input.requestID])
+                XCTAssertEqual(try library.applyAuthoringResult(result(input, preferences: true), now: input.deadlineAt + 60_000_000).status, "applied")
+                XCTAssertNotEqual(library.selected?.revision, revision)
+                XCTAssertEqual(library.selected?.artifact.files.first(where: { $0.path == "cosmo.svg" })?.content, svg)
+                XCTAssertEqual(library.preferences.first?.value, .string("large"))
+            }
             XCTAssertNil(library.state.authoring?.revisionPins?[input.requestID])
         }
     }

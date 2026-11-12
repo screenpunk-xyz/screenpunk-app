@@ -19,6 +19,7 @@ struct AgentStatus: Decodable {
     let profileID: String?
     let authoringCapabilities: CloudAuthoringCapabilities?
     let latestRequest: Summary?
+    let awaitingApplicationRequestIDs: [String]?
     let command: Command?
     struct Command: Decodable { let id: String; let type: String; let screenID: String?; let activationID: String?; let expiresAt: Double }
     struct Summary: Decodable { let id: String; let status: String }

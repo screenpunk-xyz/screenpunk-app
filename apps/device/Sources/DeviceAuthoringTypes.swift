@@ -232,8 +232,7 @@ enum CloudRequestRecovery {
         guard status == "pending", id != consumedID, id != lastAppliedRequestID else { return nil }
         let response = try await load(id)
         guard response.id == id else { throw DeviceError.message("Cloud returned a different request.") }
-        guard response.status == "pending", response.applicationReceipt == nil,
-              let deadline = response.deadlineAt, deadline > now else { return nil }
+        guard response.status == "pending", response.applicationReceipt == nil else { return nil }
         return response
     }
 
@@ -267,7 +266,6 @@ extension AgentRequest {
             return .completed(authoringResult)
         }
         if ["failed", "cancelled", "timed_out"].contains(status) { return .ended(status: status, message: failure) }
-        if status == "pending", let deadlineAt, now >= deadlineAt { return .ended(status: "timed_out", message: nil) }
         return .pending(.init(status: status, caption: progress?.caption, updatedAt: progress?.updatedAt ?? createdAt, deadlineAt: deadlineAt))
     }
 }
@@ -290,7 +288,6 @@ extension AgentRequestV2 {
             return .completed(authoringResult)
         }
         if ["failed", "cancelled", "timed_out"].contains(status) { return .ended(status: status, message: failure) }
-        if status == "pending", let deadlineAt, now >= deadlineAt { return .ended(status: "timed_out", message: nil) }
         return .pending(.init(status: status, caption: progress?.caption, updatedAt: progress?.updatedAt ?? createdAt, deadlineAt: deadlineAt))
     }
 }
@@ -366,6 +363,10 @@ struct RequestProgressTiming {
 /// The existing Local adapter has no device wake callback and still needs its
 /// bounded reconciliation fallback until that separate transport gains one.
 enum AuthoringRefreshPolicy {
+    /// A foreground probe with no work and no live push channel must go idle.
+    static func retryFailedRead(hasPendingWork: Bool, hasCloudSocket: Bool) -> Bool {
+        hasPendingWork || hasCloudSocket
+    }
     static func reconciliationSucceeded(_ delivery: AuthoringDeliveryStateV2, route: String) -> Bool {
         switch delivery {
         case .pending: return route == "cloud"

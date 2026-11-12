@@ -32,8 +32,19 @@ enum NewRequestRoutePolicy {
 /// receipt takes precedence over enrollment/delivery deadlines and cancellation.
 enum PreparedRequestRecoveryPolicy {
     enum Action: Equatable {
-        case acknowledgeReceipt, cancelExpired, cancelled, reconcile
+        case acknowledgeReceipt, cancelled, reconcile
         case retrySameRequest(requestID: String, route: AuthoringRoute)
+    }
+    static func ownsSubmission(requestID: String, pendingID: String?, submissionKey: String?, cancelled: Bool) -> Bool {
+        !cancelled && (pendingID == requestID || submissionKey == requestID) &&
+            (pendingID == nil || pendingID == requestID) && (submissionKey == nil || submissionKey == requestID)
+    }
+    enum LocalReceiptRecovery: Equatable { case settleNative, acknowledgeTransport, preserve }
+    static func localReceiptRecovery(_ receipt: ApplicationReceiptV1, record: LocalDeliveryRecord, adapterAvailable: Bool) -> LocalReceiptRecovery {
+        guard record.requestID == receipt.requestID, record.inputDigest == receipt.inputDigest else { return .preserve }
+        if record.receipt == receipt { return .settleNative }
+        let operation = record.contractVersion == 2 ? record.finalResultV2?.operationID : record.finalResult?.operationID
+        return adapterAvailable && record.status == .completed && operation == receipt.operationID ? .acknowledgeTransport : .preserve
     }
     static func acknowledgedReceipt(requestID: String, receipts: [String: ApplicationReceiptV1], acknowledgedReceiptIDs: Set<String>) -> ApplicationReceiptV1? {
         let matches = receipts.filter { $0.value.requestID == requestID }
@@ -47,8 +58,7 @@ enum PreparedRequestRecoveryPolicy {
     static func action(requestID: String, route: AuthoringRoute, deadlineAt: Int64, now: Int64, hasReceipt: Bool, submissionKey: String?, cancelled: Bool) -> Action {
         if hasReceipt { return .acknowledgeReceipt }
         if cancelled { return .cancelled }
-        // Cloud must reconcile authoritative completion before declaring expiry.
-        if now >= deadlineAt { return route == .cloud ? .reconcile : .cancelExpired }
+        // Legacy deadline metadata never cancels or replaces durable user work.
         if submissionKey == requestID { return .retrySameRequest(requestID: requestID, route: route) }
         return .reconcile
     }

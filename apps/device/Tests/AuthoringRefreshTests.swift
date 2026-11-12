@@ -4,6 +4,12 @@ import ScreenpunkCore
 @testable import DeviceAuthoring
 
 final class AuthoringRefreshTests: XCTestCase {
+    func testOfflineForegroundProbeDoesNotStartIdleRetries() {
+        XCTAssertFalse(AuthoringRefreshPolicy.retryFailedRead(hasPendingWork: false, hasCloudSocket: false))
+        XCTAssertTrue(AuthoringRefreshPolicy.retryFailedRead(hasPendingWork: true, hasCloudSocket: false))
+        XCTAssertTrue(AuthoringRefreshPolicy.retryFailedRead(hasPendingWork: false, hasCloudSocket: true))
+    }
+
     func testPendingCloudReadSucceededButLocalFallbackAndRecoveryRemain() {
         let pending = AuthoringDeliveryStateV2.pending(.init(status: "pending"))
         XCTAssertTrue(AuthoringRefreshPolicy.reconciliationSucceeded(pending, route: "cloud"))

@@ -46,6 +46,28 @@ final class PreparedRequestRecoveryPolicyTests: XCTestCase {
         var duplicate = receipt; duplicate.operationID = "operation-two"
         XCTAssertNil(PreparedRequestRecoveryPolicy.acknowledgedReceipt(requestID: "original-id", receipts: [receipt.operationID: receipt, duplicate.operationID: duplicate], acknowledgedReceiptIDs: [receipt.operationID, duplicate.operationID]))
     }
+    func testLateSubmitCannotOwnCancelledOrNewerRequestSlot() {
+        XCTAssertTrue(PreparedRequestRecoveryPolicy.ownsSubmission(requestID: "a", pendingID: "a", submissionKey: "a", cancelled: false))
+        XCTAssertTrue(PreparedRequestRecoveryPolicy.ownsSubmission(requestID: "a", pendingID: nil, submissionKey: "a", cancelled: false))
+        XCTAssertFalse(PreparedRequestRecoveryPolicy.ownsSubmission(requestID: "a", pendingID: "b", submissionKey: "b", cancelled: false))
+        XCTAssertFalse(PreparedRequestRecoveryPolicy.ownsSubmission(requestID: "a", pendingID: nil, submissionKey: nil, cancelled: false))
+        XCTAssertFalse(PreparedRequestRecoveryPolicy.ownsSubmission(requestID: "a", pendingID: "a", submissionKey: "a", cancelled: true))
+    }
+
+    func testLocalReceiptRecoveryDoesNotBlockWhenComputerWasForgotten() {
+        let receipt = ApplicationReceiptV1(requestID: "a", operationID: "op", inputDigest: "digest", status: "applied", appliedAt: 1)
+        var record = LocalDeliveryRecord(requestID: "a", inputDigest: "digest", connectionID: "computer", profileID: "profile", hostKeySHA256: "host", deadlineAt: 2, status: .completed,
+            finalResult: AuthoringResultV1(requestID: "a", inputDigest: "digest", baseRevision: nil, preferenceRevisions: [:], operationID: "op", answer: "Done"))
+        XCTAssertEqual(PreparedRequestRecoveryPolicy.localReceiptRecovery(receipt, record: record, adapterAvailable: true), .acknowledgeTransport)
+        XCTAssertEqual(PreparedRequestRecoveryPolicy.localReceiptRecovery(receipt, record: record, adapterAvailable: false), .preserve)
+        record.status = .cancelled
+        XCTAssertEqual(PreparedRequestRecoveryPolicy.localReceiptRecovery(receipt, record: record, adapterAvailable: true), .preserve)
+        record.status = .applied; record.receipt = receipt
+        XCTAssertEqual(PreparedRequestRecoveryPolicy.localReceiptRecovery(receipt, record: record, adapterAvailable: false), .settleNative)
+        record.inputDigest = "different"
+        XCTAssertEqual(PreparedRequestRecoveryPolicy.localReceiptRecovery(receipt, record: record, adapterAvailable: true), .preserve)
+    }
+
     func testPreparedCloudRetryKeepsOriginalRequestAndRoute() {
         XCTAssertEqual(PreparedRequestRecoveryPolicy.action(requestID: "original-id", route: .cloud, deadlineAt: 200, now: 100, hasReceipt: false, submissionKey: "original-id", cancelled: false), .retrySameRequest(requestID: "original-id", route: .cloud))
         XCTAssertEqual(PreparedRequestRecoveryPolicy.action(requestID: "original-id", route: .local, deadlineAt: 200, now: 100, hasReceipt: false, submissionKey: "original-id", cancelled: false), .retrySameRequest(requestID: "original-id", route: .local))
@@ -61,9 +83,9 @@ final class PreparedRequestRecoveryPolicyTests: XCTestCase {
             XCTAssertEqual(PreparedRequestRecoveryPolicy.action(requestID: "original-id", route: route, deadlineAt: 200, now: 300, hasReceipt: true, submissionKey: "original-id", cancelled: true), .acknowledgeReceipt)
         }
     }
-    func testExpiredOrCancelledPreparedDeliveryCannotBeRetried() {
-        XCTAssertEqual(PreparedRequestRecoveryPolicy.action(requestID: "original-id", route: .cloud, deadlineAt: 200, now: 200, hasReceipt: false, submissionKey: "original-id", cancelled: false), .reconcile)
-        XCTAssertEqual(PreparedRequestRecoveryPolicy.action(requestID: "original-id", route: .local, deadlineAt: 200, now: 200, hasReceipt: false, submissionKey: "original-id", cancelled: false), .cancelExpired)
+    func testAgedPreparedDeliveryRetriesSameIdentityButCancellationWins() {
+        XCTAssertEqual(PreparedRequestRecoveryPolicy.action(requestID: "original-id", route: .cloud, deadlineAt: 200, now: 200, hasReceipt: false, submissionKey: "original-id", cancelled: false), .retrySameRequest(requestID: "original-id", route: .cloud))
+        XCTAssertEqual(PreparedRequestRecoveryPolicy.action(requestID: "original-id", route: .local, deadlineAt: 200, now: 200, hasReceipt: false, submissionKey: "original-id", cancelled: false), .retrySameRequest(requestID: "original-id", route: .local))
         XCTAssertEqual(PreparedRequestRecoveryPolicy.action(requestID: "original-id", route: .cloud, deadlineAt: 200, now: 100, hasReceipt: false, submissionKey: "original-id", cancelled: true), .cancelled)
     }
 }

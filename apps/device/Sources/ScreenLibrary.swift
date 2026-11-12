@@ -635,6 +635,49 @@ import ScreenpunkCore
     func preferences(profileID: String, deviceID: String, screenID: String) -> [PreferenceRecordV1] {
         AuthoringStore.preferences(in: state.authoring ?? .init(), profileID: profileID, deviceID: deviceID, screenID: screenID)
     }
+    var hasCloudSubmission: Bool {
+        guard let id = state.submissionKey else { return false }
+        return (authoringRequestV2(id: id)?.delivery.route ?? authoringRequest(id: id)?.delivery.route) == "cloud"
+    }
+    var unacknowledgedLocalReceiptIDs: [String] {
+        guard let authoring = state.authoring else { return [] }
+        return authoring.receipts.values.compactMap { receipt in
+            guard !authoring.acknowledgedReceiptIDs.contains(receipt.operationID) else { return nil }
+            let route = authoringRequestV2(id: receipt.requestID)?.delivery.route ?? authoringRequest(id: receipt.requestID)?.delivery.route
+            return route == "local" || (state.localRequestIDs ?? []).contains(receipt.requestID) ? receipt.requestID : nil
+        }.sorted()
+    }
+    func isUnsentLocalRequest(_ id: String, ledgerRecordExists: Bool) -> Bool {
+        state.submissionKey == id && (state.pendingID == nil || state.pendingID == id) &&
+            !ledgerRecordExists && !hasApplicationReceipt(requestID: id) &&
+            (authoringRequestV2(id: id)?.delivery.route ?? authoringRequest(id: id)?.delivery.route) == "local"
+    }
+
+    func hasApplicationReceipt(requestID: String) -> Bool {
+        state.authoring?.receipts.values.contains(where: { $0.requestID == requestID }) == true
+    }
+
+    /// Resume only work this library already owns, never completed Cloud history
+    /// restored into a fresh container or a different account/device.
+    func recoverableCloudCompletion(_ ids: [String], profileID: String, deviceID: String) -> String? {
+        guard state.pendingID == nil, state.submissionKey == nil, let authoring = state.authoring else { return nil }
+        return ids.first { id in
+            guard id != state.consumedID, id != state.lastRequest,
+                  !(state.cancelledRequests ?? []).contains(id),
+                  !(authoring.cancelledRequestIDs ?? []).contains(id),
+                  !(authoring.retiredRequestIDs ?? []).contains(id),
+                  !authoring.receipts.values.contains(where: { $0.requestID == id }) else { return false }
+            if let request = authoring.requestsV2?[id] {
+                return request.delivery.route == "cloud" && request.context.profileID == profileID &&
+                    request.context.deviceID == deviceID && request.context.libraryID == libraryOwner
+            }
+            if let request = authoring.requests[id] {
+                return request.delivery.route == "cloud" && request.context.profileID == profileID && request.context.deviceID == deviceID
+            }
+            return false
+        }
+    }
+
     func authoringRequestV2(id: String) -> AuthoringRequestV2? { state.authoring?.requestsV2?[id] }
     /// The model receives a compact manifest; raw native package bytes remain the authority.
     func makeAuthoringRequestV2(from request: AuthoringRequestV1, libraryID: String? = nil) throws -> AuthoringRequestV2 {

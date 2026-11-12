@@ -24,13 +24,71 @@ final class ScreenLibraryAuthoringTests: XCTestCase {
               durablePreferenceAuthorization: .init(requestID: request.requestID, quote: request.context.userRequest))
     }
 
+    @MainActor func testCompletionRecoveryRequiresLocallyOwnedUnsettledSnapshot() throws {
+        for version in [1, 2] {
+            let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
+            let library = try ScreenLibrary(accountID: "fixture-account", rootDirectory: root)
+            var input = try request(library)
+            input.delivery.route = "cloud"
+            input = try AuthoringContract.seal(input)
+            if version == 2 {
+                try library.saveAuthoringRequest(AuthoringV2Contract.makeRequest(from: input, libraryID: "fixture-account"))
+            } else { try library.saveAuthoringRequest(input) }
+            let ids = ["unrelated-history", input.requestID]
+            XCTAssertNil(library.recoverableCloudCompletion(ids, profileID: "other-profile", deviceID: "fixture-device"))
+            XCTAssertNil(library.recoverableCloudCompletion(ids, profileID: "fixture-profile", deviceID: "other-device"))
+            XCTAssertEqual(library.recoverableCloudCompletion(ids, profileID: "fixture-profile", deviceID: "fixture-device"), input.requestID)
+            try library.savePending(id: "another-request", screenID: nil, consumedID: nil)
+            XCTAssertNil(library.recoverableCloudCompletion(ids, profileID: "fixture-profile", deviceID: "fixture-device"))
+            try library.savePending(id: nil, screenID: nil, consumedID: nil)
+            try library.cancelRequest(input.requestID)
+            XCTAssertNil(library.recoverableCloudCompletion(ids, profileID: "fixture-profile", deviceID: "fixture-device"))
+        }
+    }
+
+    @MainActor func testLocalRestartRecoversUnsentSubmissionAndReceiptWithoutDeadline() throws {
+        for version in [1, 2] {
+            let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
+            var library = try ScreenLibrary(accountID: "fixture-account", rootDirectory: root)
+            var input = try request(library)
+            input.delivery.route = "local"; input = try AuthoringContract.seal(input)
+            let v2 = try AuthoringV2Contract.makeRequest(from: input, libraryID: "fixture-account")
+            if version == 2 { try library.saveAuthoringRequest(v2) }
+            else { try library.saveAuthoringRequest(input) }
+            try library.saveSubmission(key: input.requestID, text: input.context.userRequest, screen: nil)
+            try library.savePending(id: input.requestID, screenID: "fixture-screen", consumedID: nil)
+            library = try ScreenLibrary(accountID: "fixture-account", rootDirectory: root)
+            XCTAssertTrue(library.isUnsentLocalRequest(input.requestID, ledgerRecordExists: false))
+            XCTAssertFalse(library.hasCloudSubmission)
+            XCTAssertFalse(AuthoringRefreshPolicy.retryFailedRead(hasPendingWork: library.hasCloudSubmission, hasCloudSocket: false))
+            if version == 1 { XCTAssertEqual(library.authoringRequest(id: input.requestID), input) }
+            XCTAssertFalse(library.isUnsentLocalRequest(input.requestID, ledgerRecordExists: true))
+            XCTAssertFalse(library.isUnsentLocalRequest("other", ledgerRecordExists: false))
+            // Authoritative running state clears submission even without legacy deadline metadata.
+            try library.submissionAccepted(deadline: nil)
+            library = try ScreenLibrary(accountID: "fixture-account", rootDirectory: root)
+            XCTAssertNil(library.state.submissionKey); XCTAssertNil(library.state.submissionText)
+            let receipt: ApplicationReceiptV1
+            if version == 2 {
+                receipt = try library.applyAuthoringResult(AuthoringResultV2(requestID: v2.requestID, inputDigest: v2.delivery.snapshotDigest,
+                    baseRevision: nil, preferenceRevisions: [:], operationID: "local-operation", answer: "Done"), now: 60_000_000)
+            } else { receipt = try library.applyAuthoringResult(result(input), now: 60_000_000) }
+            library = try ScreenLibrary(accountID: "fixture-account", rootDirectory: root)
+            XCTAssertTrue(library.hasApplicationReceipt(requestID: input.requestID))
+            XCTAssertEqual(library.unacknowledgedLocalReceiptIDs, [input.requestID])
+            XCTAssertFalse(library.isUnsentLocalRequest(input.requestID, ledgerRecordExists: false))
+            try library.acknowledgeReceipt(receipt)
+            XCTAssertTrue(library.unacknowledgedLocalReceiptIDs.isEmpty)
+        }
+    }
+
     @MainActor func testCombinedScreenPreferenceReceiptOutboxAndReplaySurviveRestart() throws {
         let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
         let library = try ScreenLibrary(accountID: "fixture-account", rootDirectory: root)
         try library.install(artifact("Original fixture"), requestID: "original", replacing: "fixture-screen")
         let input = try request(library); try library.saveAuthoringRequest(input)
         let output = result(input)
-        let receipt = try library.applyAuthoringResult(output, now: 2_000)
+        let receipt = try library.applyAuthoringResult(output, now: 60_000_000)
         XCTAssertEqual(receipt.status, "applied")
         XCTAssertEqual(library.selected?.id, "fixture-screen")
         XCTAssertEqual(library.selected?.artifact.title, "Updated fixture")
@@ -40,15 +98,15 @@ final class ScreenLibraryAuthoringTests: XCTestCase {
         XCTAssertEqual(library.pendingReceipts, [receipt])
         let revision = library.selected?.revision
         let restarted = try ScreenLibrary(accountID: "fixture-account", rootDirectory: root)
-        XCTAssertEqual(try restarted.applyAuthoringResult(output, now: 3_000), receipt)
+        XCTAssertEqual(try restarted.applyAuthoringResult(output, now: 60_001_000), receipt)
         XCTAssertEqual(restarted.selected?.revision, revision)
         XCTAssertEqual(restarted.preferences.first?.revision, 1)
         try restarted.acknowledgeReceipt(receipt)
         let acknowledged = try ScreenLibrary(accountID: "fixture-account", rootDirectory: root)
         XCTAssertTrue(acknowledged.pendingReceipts.isEmpty)
-        XCTAssertEqual(try acknowledged.applyAuthoringResult(output, now: 4_000), receipt)
+        XCTAssertEqual(try acknowledged.applyAuthoringResult(output, now: 60_002_000), receipt)
         var reused = output; reused.answer = "different content"
-        XCTAssertThrowsError(try acknowledged.applyAuthoringResult(reused, now: 4_000))
+        XCTAssertThrowsError(try acknowledged.applyAuthoringResult(reused, now: 60_002_000))
     }
 
     @MainActor func testEveryCrashCutRecoversEntireCombinedTransaction() throws {
