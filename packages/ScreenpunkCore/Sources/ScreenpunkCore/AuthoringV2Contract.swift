@@ -52,7 +52,10 @@ public enum AuthoringV2Contract {
                 guard paths.insert(file.path.lowercased()).inserted else { throw AuthoringContractError("duplicate source path") }
                 guard file.mediaType == (try mediaType(path: file.path)), file.reference == (try reference(request: request, file: file)) else { throw AuthoringContractError("source scope/reference/media mismatch") }
                 bytes += file.byteLength
-                if let content = file.content { guard content.utf8.count == file.byteLength, AuthoringContract.contentDigest(Data(content.utf8)) == file.digest else { throw AuthoringContractError("source content hash/length mismatch") } }
+                if let content = file.content {
+                    guard content.utf8.count == file.byteLength, AuthoringContract.contentDigest(Data(content.utf8)) == file.digest else { throw AuthoringContractError("source content hash/length mismatch") }
+                    if file.path == "manifest.json" { try ScreenDataContract.validateManifestDeclaration(content) }
+                }
             }
             guard bytes <= 204800, source.files.contains(where: { $0.path == "index.html" }) else { throw AuthoringContractError("source package limit/entry") }
         }
@@ -78,12 +81,27 @@ public enum AuthoringV2Contract {
             guard !screen.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, screen.title.utf16.count <= 100 else { throw AuthoringContractError("invalid screen title") }
             var destinations = Set<String>(); var deleted = Set<String>(); var bytes = 0
             let base = request?.context.currentScreen?.files ?? []
+            let supportsScreenData = request.map { $0.runtime == AuthoringContract.runtime(supportsScreenData: true) } ?? true
+            let previousManifest = base.first(where: { $0.path == "manifest.json" })?.content
             for path in screen.deletedPaths { guard deleted.insert(path.lowercased()).inserted else { throw AuthoringContractError("duplicate delete path") } }
             for file in screen.files {
                 guard destinations.insert(file.path.lowercased()).inserted, !deleted.contains(file.path.lowercased()) else { throw AuthoringContractError("duplicate/overlapping destination") }
-                if file.kind == "write" { bytes += file.content!.utf8.count }
+                if file.kind == "write" {
+                    bytes += file.content!.utf8.count
+                    if file.path == "manifest.json" {
+                        try ScreenDataContract.validateManifestDeclaration(file.content!, previous: previousManifest, supportsScreenData: supportsScreenData)
+                    }
+                }
                 else if request != nil {
-                    guard let source = base.first(where: { $0.path == file.sourcePath && $0.reference == file.reference && $0.digest == file.digest }) else { throw AuthoringContractError("unknown/out-of-scope source reference") }; bytes += source.byteLength
+                    guard let source = base.first(where: { $0.path == file.sourcePath && $0.reference == file.reference && $0.digest == file.digest }) else { throw AuthoringContractError("unknown/out-of-scope source reference") }
+                    bytes += source.byteLength
+                    if file.path == "manifest.json", source.path != file.path {
+                        if let content = source.content {
+                            try ScreenDataContract.validateManifestDeclaration(content, previous: previousManifest, supportsScreenData: supportsScreenData)
+                        } else if !supportsScreenData {
+                            throw AuthoringContractError("target runtime cannot admit a manifest from an opaque reference")
+                        }
+                    }
                 }
             }
             guard bytes <= 204800, screen.files.contains(where: { $0.path == "index.html" }) else { throw AuthoringContractError("materialized entry/byte limit") }
@@ -106,7 +124,13 @@ public enum AuthoringV2Contract {
             let source = request.context.currentScreen!.files.first(where: { $0.path == file.sourcePath })!
             let bytes = try resolve(source)
             guard bytes.count == source.byteLength, AuthoringContract.contentDigest(bytes) == source.digest, String(data: bytes, encoding: .utf8) != nil else { throw AuthoringContractError("pinned source missing/corrupt/not UTF8") }
-            files.append(.init(path: file.path, content: String(decoding: bytes, as: UTF8.self)))
+            let content = String(decoding: bytes, as: UTF8.self)
+            if file.path == "manifest.json", source.path != file.path {
+                try ScreenDataContract.validateManifestDeclaration(content,
+                    previous: request.context.currentScreen?.files.first(where: { $0.path == "manifest.json" })?.content,
+                    supportsScreenData: request.runtime == AuthoringContract.runtime(supportsScreenData: true))
+            }
+            files.append(.init(path: file.path, content: content))
         }
         return try AuthoringContract.validateScreen(JSONEncoder().encode(AuthoringScreen(title: mutation.title, entry: mutation.entry, files: files)))
     }

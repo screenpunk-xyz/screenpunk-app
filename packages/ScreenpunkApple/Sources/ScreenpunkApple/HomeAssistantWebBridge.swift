@@ -14,6 +14,8 @@ final class HomeAssistantWebBridge: NSObject, WKScriptMessageHandler {
     private let cameras: CameraPlaybackController?
     private let publicReads: PublicReadRuntime?
     private let resources: PublicRasterResources?
+    private let screenData: (any ScreenDataProvider)?
+    private var screenDataTasks: [String: Task<Void, Never>] = [:]
     private var publicTasks: [String: Task<Void, Never>] = [:]
     private let onHealth: (Bool) -> Void
     private var tasks: [String: Task<Void, Never>] = [:]
@@ -42,14 +44,15 @@ final class HomeAssistantWebBridge: NSObject, WKScriptMessageHandler {
     func setActive(_ value: Bool) {
         guard active != value else { return }
         active = value
-        if !value { voiceTapAt = nil; googleTV.close(); googleTVADB.close() }
+        if !value { voiceTapAt = nil; googleTV.close(); googleTVADB.close(); cancelScreenData() }
         status(navigation?.status ?? [:])
     }
 
     init(runtime: HomeAssistantDeviceRuntime?, connections: ConnectionRuntime? = nil, navigation: DashboardEventRuntime? = nil,
-         revision: String, mapManifest: DashboardManifest? = nil, preferenceStore: ScreenPreferenceStore = .shared, stateReadOnly: Bool = false, publicReads: PublicReadRuntime? = nil, resources: PublicRasterResources? = nil, onHealth: @escaping (Bool) -> Void) {
+         revision: String, mapManifest: DashboardManifest? = nil, preferenceStore: ScreenPreferenceStore = .shared, stateReadOnly: Bool = false, publicReads: PublicReadRuntime? = nil, resources: PublicRasterResources? = nil, screenData: (any ScreenDataProvider)? = nil, onHealth: @escaping (Bool) -> Void) {
         self.cameras = runtime.map { CameraPlaybackController(resolver: $0, revision: revision) }
         self.publicReads = publicReads; self.resources = resources
+        self.screenData = stateReadOnly ? nil : screenData
         self.runtime = runtime; self.connections = connections; self.navigation = navigation
         self.mapManifest = mapManifest
         self.preferenceStore = preferenceStore; self.stateReadOnly = stateReadOnly
@@ -67,6 +70,7 @@ final class HomeAssistantWebBridge: NSObject, WKScriptMessageHandler {
     func cancel() {
         voiceTapAt = nil; googleTV.close(); googleTVADB.close(); maps.cancel(); interactiveMaps.close()
         documentGeneration = UUID()
+        cancelScreenData()
         for task in publicTasks.values { task.cancel() }; publicTasks.removeAll(); resources?.clear()
         let reads = publicReads; Task { await reads?.cancel() }
         cameras?.stopAll()
@@ -75,7 +79,7 @@ final class HomeAssistantWebBridge: NSObject, WKScriptMessageHandler {
 
     func status(_ value: [String: Any]) {
         dispatch(["protocolVersion": 1, "id": "runtime-status", "kind": "event", "method": "runtime.onStatus",
-                  "value": ["active": active, "navigation": value, "homeAssistantTransport": "websocket-with-http", "homeAssistantServiceCalls": 1, "cameraPlayback": 1, "publicReadHTTP": 1, "googleCalendar": 1, "appleMaps": 1, "appleMapsInteractive": 1, "appleMapsTap": 1, "appleMapsLocation": 1, "persistentState": 1, "persistentStateWritable": stateReadOnly ? 0 : 1, "googleTVRemote": 1, "googleTVVoice": 1, "googleTVDirectChannels": 1, "googleTVDirectPower": 1, "macIsRuntimeProxy": false]])
+                  "value": ["active": active, "navigation": value, "homeAssistantTransport": "websocket-with-http", "homeAssistantServiceCalls": 1, "cameraPlayback": 1, "publicReadHTTP": 1, "googleCalendar": 1, "appleMaps": 1, "appleMapsInteractive": 1, "appleMapsTap": 1, "appleMapsLocation": 1, "persistentState": 1, "persistentStateWritable": stateReadOnly ? 0 : 1, "screenData": screenData == nil ? 0 : 1, "googleTVRemote": 1, "googleTVVoice": 1, "googleTVDirectChannels": 1, "googleTVDirectPower": 1, "macIsRuntimeProxy": false]])
     }
 
     deinit { let cameras = cameras; let interactiveMaps = interactiveMaps; Task { @MainActor in cameras?.cancel(); interactiveMaps.cancel() } }
@@ -84,16 +88,21 @@ final class HomeAssistantWebBridge: NSObject, WKScriptMessageHandler {
         guard message.frameInfo.isMainFrame,
               let url = message.frameInfo.request.url?.absoluteString,
               IsolationEvaluator.isLocalPackageURL(url),
-              let body = message.body as? [String: Any], let id = body["id"] as? String, (1...128).contains(id.utf8.count),
+              let body = message.body as? [String: Any], let id = body["id"] as? String, (1...128).contains(id.utf8.count) else { return }
+        let method = body["method"] as? String
+        let isScreenData = ["data.publish", "data.remove", "data.query"].contains { $0 == method }
+        guard
               JSONSerialization.isValidJSONObject(body),
-              let data = try? JSONSerialization.data(withJSONObject: body), data.count <= 64 * 1024 else { return }
-        guard body["protocolVersion"] as? Int == 1, body["kind"] as? String == "request" else {
-            reply(id: id, error: "validation_failed"); return
+              let data = try? JSONSerialization.data(withJSONObject: body, options: [.withoutEscapingSlashes]), data.count <= 64 * 1024 else {
+            if isScreenData { reply(id: id, error: ScreenDataError.invalidRequest.rawValue) }; return
         }
-        switch body["method"] as? String {
+        guard body["protocolVersion"] as? Int == 1, body["kind"] as? String == "request" else {
+            reply(id: id, error: isScreenData ? ScreenDataError.invalidRequest.rawValue : "validation_failed"); return
+        }
+        switch method {
         case "runtime.ready": reply(id: id, value: NSNull())
         case "runtime.onStatus":
-            reply(id: id, value: ["publicReadHTTP": 1, "appleMaps": 1, "appleMapsInteractive": 1, "appleMapsTap": 1, "appleMapsLocation": 1, "persistentState": 1, "persistentStateWritable": stateReadOnly ? 0 : 1]); status(navigation?.status ?? [:])
+            reply(id: id, value: ["publicReadHTTP": 1, "appleMaps": 1, "appleMapsInteractive": 1, "appleMapsTap": 1, "appleMapsLocation": 1, "persistentState": 1, "persistentStateWritable": stateReadOnly ? 0 : 1, "screenData": screenData == nil ? 0 : 1]); status(navigation?.status ?? [:])
         case "navigation.get": reply(id: id, value: navigation?.status ?? ["pageId": "default"])
         case "navigation.open":
             guard let parameters = body["parameters"] as? [String: String], parameters.count == 1,
@@ -124,6 +133,7 @@ final class HomeAssistantWebBridge: NSObject, WKScriptMessageHandler {
                     reply(id: id, value: NSNull())
                 }
             } catch { reply(id: id, error: (error as? ConnectionFailure)?.rawValue ?? "device_offline") }
+        case "data.publish", "data.remove", "data.query": handleScreenData(id: id, body: body)
         case "connections.cancel":
             if let target = (body["parameters"] as? [String: String])?["requestId"] { publicTasks.removeValue(forKey: target)?.cancel(); tasks.removeValue(forKey: target)?.cancel() }
             reply(id: id, value: NSNull())
@@ -291,6 +301,46 @@ final class HomeAssistantWebBridge: NSObject, WKScriptMessageHandler {
     }
 
     private func current(_ generation: UUID) -> Bool { generation == documentGeneration && !Task.isCancelled }
+
+    private func cancelScreenData() {
+        for task in screenDataTasks.values { task.cancel() }
+        screenDataTasks.removeAll()
+    }
+
+    private func handleScreenData(id: String, body: [String: Any]) {
+        // Preserve the waiter on an ID that already has an outstanding query.
+        guard screenDataTasks[id] == nil else { return }
+        do {
+            let request = try ScreenDataBridgeRequest(body: body)
+            let provider = try request.authorizedProvider(screenData, declaration: navigation?.manifest.screenData, active: active)
+            switch request {
+            case .publish(let name, let value):
+                try provider.publish(name: name, value: value)
+                reply(id: id)
+            case .remove(let name):
+                try provider.remove(name: name)
+                reply(id: id)
+            case .query(let alias):
+                guard screenDataTasks.count < 4 else { throw ScreenDataError.rateLimited }
+                let generation = documentGeneration
+                screenDataTasks[id] = Task { @MainActor [weak self] in
+                    guard let self, self.active, self.current(generation) else { return }
+                    defer { if self.current(generation) { self.screenDataTasks.removeValue(forKey: id) } }
+                    do {
+                        let snapshot = try await provider.query(alias: alias)
+                        guard self.active, self.current(generation) else { return }
+                        guard (1...ScreenDataContract.maxVersion).contains(snapshot.version) else { throw ScreenDataError.unavailable }
+                        do { try ScreenDataContract.validateValue(snapshot.value) } catch { throw ScreenDataError.unavailable }
+                        let value = try JSONSerialization.jsonObject(with: JSONEncoder().encode(snapshot))
+                        self.reply(id: id, value: value)
+                    } catch {
+                        guard self.active, self.current(generation) else { return }
+                        self.reply(id: id, error: (error as? ScreenDataError ?? .unavailable).rawValue)
+                    }
+                }
+            }
+        } catch { reply(id: id, error: (error as? ScreenDataError ?? .unavailable).rawValue) }
+    }
 
     private func subscribe(id: String, alias: String, operation: String, parameters: [String: String], generation: UUID) async throws {
         if alias == "home", let runtime {

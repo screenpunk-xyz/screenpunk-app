@@ -275,7 +275,20 @@ import ScreenpunkLocalTransport
     private var cloudSetupStatusTask: Task<Void, Never>?
     private var foreground = false
     private var connectionActive = false
-    private var connectionGeneration = UUID()
+    @Published private var connectionGeneration = UUID()
+    @Published private var screenDataRendererEpoch = UUID()
+    @Published private(set) var screenDataPrompt: DeviceScreenDataPrompt?
+    @Published private(set) var screenDataPermissions: [DeviceScreenDataPermission] = []
+    private var screenDataSocketID: String?
+    private var screenDataInventorySignature: Data?
+    private var screenDataInventorySequence = 0
+    private var screenDataInventorySelectedID: String?
+    private var screenDataInventoryGenerations: [String: String] = [:]
+    private var screenDataInventoryDirty = false
+    private var screenDataInventoryTask: Task<Void, Never>?
+    private var screenDataQueryTasks: [String: (id: UUID, task: Task<Void, Never>)] = [:]
+    private var screenDataPrompts: [DeviceScreenDataPrompt] = []
+    private var screenDataRate: [String: [TimeInterval]] = [:]
     private let refreshPump = CatalogWorkPump()
     private var refreshFailures = 0
     private struct PreferenceSyncBinding: Equatable {
@@ -404,6 +417,10 @@ import ScreenpunkLocalTransport
             activeProfile = try profileRepository?.activateCloudProfile(accountID: accountID, profileID: profileID, deviceID: session.deviceId)
         }
         try cloud.rememberProfile(profileID)
+        screenDataRendererEpoch = UUID()
+        resetScreenDataWork(disconnectSocket: false)
+        refreshScreenDataPermissions()
+        requestScreenDataInventory()
         refreshCatalogScope()
         refreshPreferences()
         requestPreferenceSync()
@@ -881,7 +898,8 @@ import ScreenpunkLocalTransport
             return service
         }
         let source = screen.map { AuthoringScreen(title: $0.artifact.title, entry: $0.artifact.entry, files: $0.artifact.files.map { .init(path: $0.path, content: $0.content) }) }
-        return try AuthoringContract.seal(AuthoringRequestV1(requestID: UUID().uuidString, createdAt: now, deadlineAt: now + 10 * 60 * 1000, designGuidance: AuthoringContract.designGuidance, runtime: AuthoringContract.runtime, services: services, preferences: library.preferences(profileID: profileID, deviceID: deviceID, screenID: screenID), context: .init(profileID: profileID, deviceID: deviceID, screenID: screenID, baseRevision: screen?.revision, userRequest: text, currentScreen: source, viewport: .init(width: size.width, height: size.height, scale: scale, orientation: size.width > size.height ? "landscape" : "portrait")), delivery: .init(route: route.rawValue)))
+        let supportsScreenData = route == .local || screenDataSocketID != nil
+        return try AuthoringContract.seal(AuthoringRequestV1(requestID: UUID().uuidString, createdAt: now, deadlineAt: now + 10 * 60 * 1000, designGuidance: AuthoringContract.designGuidance(supportsScreenData: supportsScreenData), runtime: AuthoringContract.runtime(supportsScreenData: supportsScreenData), services: services, preferences: library.preferences(profileID: profileID, deviceID: deviceID, screenID: screenID), context: .init(profileID: profileID, deviceID: deviceID, screenID: screenID, baseRevision: screen?.revision, userRequest: text, currentScreen: source, viewport: .init(width: size.width, height: size.height, scale: scale, orientation: size.width > size.height ? "landscape" : "portrait")), delivery: .init(route: route.rawValue)))
     }
     private func measureRequestApply(_ requestID: String, _ apply: () throws -> ApplicationReceiptV1) rethrows -> ApplicationReceiptV1 {
         RequestTimeline.record(.applyStart, requestID: requestID)
@@ -1241,13 +1259,20 @@ import ScreenpunkLocalTransport
     func newScreen() { guard !needsAgentSetup else { return }; do { try library?.newScreen(); refreshScreen(); settingsOpen = false } catch { message = error.localizedDescription } }
     func rollback() { guard !needsAgentSetup else { return }; do { try library?.rollback(); refreshScreen(); settingsOpen = false } catch { message = error.localizedDescription } }
     private func syncInventory() async throws {
-        guard cloudBindingMatches, let library else { return }
+        guard cloudBindingMatches, let library, let token = cloud.session?.accessToken else { return }
+        if screenDataSocketID != nil {
+            requestScreenDataInventory()
+            await screenDataInventoryTask?.value
+            return
+        }
+        let generation = connectionGeneration
         var body: [String: Any] = ["screens": library.state.screens.map { ["id": $0.id, "title": $0.artifact.title] }]
         if let id = library.selected?.id { body["selectedID"] = id }
         let signature = String(data: try JSONSerialization.data(withJSONObject: body, options: .sortedKeys), encoding: .utf8)!
         guard signature != inventorySignature else { return }
-        let _: EmptyResponse = try await cloud.call("api/device/screens", method: "POST", body: body)
-        guard self.library === library, !Task.isCancelled else { return }
+        let _: EmptyResponse = try await cloud.call("api/device/screens", method: "POST", body: body, authorizationToken: token)
+        guard self.library === library, connectionGeneration == generation, cloud.session?.accessToken == token,
+              screenDataSocketID == nil, !Task.isCancelled else { return }
         inventorySignature = signature
     }
     private func applyCommand(_ command: AgentStatus.Command) async {
@@ -1290,6 +1315,7 @@ import ScreenpunkLocalTransport
             requestPreferenceSync()
             requestCatalogCatchUp()
             requestCloudStatusReconciliation()
+            requestScreenDataInventory()
             return
         }
         cloudSocketToken = session.accessToken
@@ -1314,6 +1340,12 @@ import ScreenpunkLocalTransport
                 if self.preferenceSyncBinding?.cloud.profileID == profileID, !initial { self.requestPreferenceSync() }
             case .catalogUpdated:
                 if !initial { self.requestCatalogPreviewSync(discoverCandidates: true) }
+            case .screenDataConnected(let socketID):
+                guard initial else { return }
+                self.screenDataSocketID = socketID
+                self.requestScreenDataInventory()
+            case .screenDataQuery(let query):
+                if !initial { self.handleScreenDataQuery(query) }
             }
         }, disconnected: { [weak self] authorizationRejected in
             guard let self, self.foreground, self.cloudSocketToken == session.accessToken,
@@ -1362,6 +1394,8 @@ import ScreenpunkLocalTransport
         cloudListenerObservations.clear()
     }
     private func clearCloudSocketObservation() {
+        resetScreenDataWork(disconnectSocket: true)
+        inventorySignature = nil
         cloudSocketEpoch = nil
         listenerStatusPump.cancel()
         cloudListenerObservations.clearSocket()
@@ -1382,6 +1416,7 @@ import ScreenpunkLocalTransport
         agentWorkingRequestID = nil
         connectionActive = false
         connectionGeneration = UUID()
+        resetScreenDataWork(disconnectSocket: false)
         if releaseCloudSocket {
             clearCloudStatusReads()
             cloudSocketToken = nil
@@ -1716,6 +1751,8 @@ import ScreenpunkLocalTransport
     /// A failed open after authentication must leave no previous account's inventory
     /// attached to the new session. Durable account directories remain untouched.
     private func detachAccountLibrary() {
+        resetScreenDataWork(disconnectSocket: true)
+        screenDataPermissions = []
         publicReads?.cancel(); publicReads = nil; publicReadSessionKey = ""
         if let previous = homeAssistant { Task { await previous.cancelPending() } }
         homeAssistant = nil; manifest = nil; assets = nil; screen = nil; activeProfile = nil
@@ -1729,7 +1766,13 @@ import ScreenpunkLocalTransport
     private func persistPending() throws { try library?.savePending(id: pendingID, screenID: pendingScreenID, consumedID: consumedID) }
     func refreshConnections() { refreshScreen() }
     private func refreshScreen() {
-        defer { refreshPublicReads(); requestRefresh() }
+        defer {
+            refreshPublicReads()
+            refreshScreenDataPermissions()
+            refreshScreenDataPrompts()
+            requestScreenDataInventory()
+            requestRefresh()
+        }
         if let previous = homeAssistant { Task { await previous.cancelPending() } }
         homeAssistant = nil; manifest = nil
         onboarding = library?.state.onboarding
@@ -1767,6 +1810,277 @@ import ScreenpunkLocalTransport
     }
 }
 
+
+extension DeviceModel {
+    private struct ScreenDataScope: Equatable {
+        let library: ObjectIdentifier
+        let generation: UUID
+        let profileID: String
+        let owner: String
+        let deviceID: String
+        let token: String?
+    }
+
+    private struct ScreenDataCloudScope: Equatable {
+        let scope: ScreenDataScope
+        let socketID: String
+        let token: String
+    }
+
+    private var screenDataScope: ScreenDataScope? {
+        guard let library, let profile = activeProfile else { return nil }
+        return .init(library: ObjectIdentifier(library), generation: connectionGeneration,
+                     profileID: profile.id, owner: profile.cloudBinding?.accountID ?? profile.libraryOwner,
+                     deviceID: profile.authoringDeviceID, token: cloud.session?.accessToken)
+    }
+
+    private var screenDataCloudScope: ScreenDataCloudScope? {
+        guard foreground, connectionActive, !accountOperationInProgress, !cloudAuthorizationRejected,
+              cloudBindingMatches, let profile = activeProfile?.cloudBinding,
+              cloud.session?.profileID == profile.profileID,
+              let scope = screenDataScope, let token = scope.token, let socketID = screenDataSocketID,
+              cloudSocketToken == token else { return nil }
+        return .init(scope: scope, socketID: socketID, token: token)
+    }
+
+    var screenDataRendererKey: String {
+        guard manifest?.screenData != nil, let screen,
+              let installation = library?.screenDataInstallation(screen.id) else { return "" }
+        return connectionGeneration.uuidString + screenDataRendererEpoch.uuidString + installation.generation
+    }
+
+    var screenDataProvider: (any ScreenDataProvider)? {
+        guard let scope = screenDataScope, let screen,
+              let library, let installed = library.screenDataInstallation(screen.id),
+              installed.screen.revision == screen.revision else { return nil }
+        let requireCurrent: () throws -> (DeviceModel, ScreenLibrary) = { [weak self, weak library] in
+            guard let self, let library, self.screenDataScope == scope, self.foreground, self.connectionActive,
+                  !self.accountOperationInProgress, library.selected?.id == installed.screen.id,
+                  library.selected?.revision == installed.screen.revision,
+                  library.state.screenDataGenerations?[installed.screen.id] == installed.generation,
+                  !Task.isCancelled else { throw ScreenDataError.unavailable }
+            return (self, library)
+        }
+        return DeviceScreenDataProvider(publishValue: { name, value in
+            let (_, library) = try requireCurrent()
+            try library.publishScreenData(owner: scope.owner, target: installed.target(exportName: name), value: value)
+        }, readValue: { alias in
+            let (model, library) = try requireCurrent()
+            guard let declaration = installed.declarations.queries.first(where: { $0.alias == alias }) else {
+                throw ScreenDataError.permissionRequired
+            }
+            try model.consumeScreenDataQuery(for: installed.generation)
+            if declaration.deviceId == nil || declaration.deviceId == scope.deviceID {
+                guard let target = library.screenDataInstallation(declaration.screenId) else { throw ScreenDataError.notFound }
+                let reader = DeviceScreenDataReader(kind: .screen, deviceId: scope.deviceID, screenId: installed.screen.id,
+                    revision: installed.screen.revision, generation: installed.generation, grantId: nil,
+                    title: installed.screen.artifact.title, deviceTitle: model.displayName)
+                let permission = try library.screenDataPermission(owner: scope.owner,
+                    target: target.target(exportName: declaration.exportName), reader: reader)
+                let decision = try library.screenDataArchive.decision(for: permission.key)
+                if decision == nil { model.enqueueScreenDataPrompt(permission, remote: false) }
+                return try library.screenDataArchive.query(permission.key)
+            }
+
+            guard let cloudScope = model.screenDataCloudScope, cloudScope.scope == scope else { throw ScreenDataError.unavailable }
+            guard model.screenDataInventorySelectedID == installed.screen.id,
+                  model.screenDataInventoryGenerations[installed.screen.id] == installed.generation else {
+                model.requestScreenDataInventory()
+                throw ScreenDataError.unavailable
+            }
+            let result = try await model.cloud.queryScreenData(readerID: installed.screen.id, revision: installed.screen.revision,
+                generation: installed.generation, alias: alias, socketID: cloudScope.socketID, token: cloudScope.token)
+            _ = try requireCurrent()
+            guard model.screenDataCloudScope == cloudScope else { throw ScreenDataError.unavailable }
+            return result
+        })
+    }
+
+    private func consumeScreenDataQuery(for reader: String) throws {
+        let now = ProcessInfo.processInfo.systemUptime
+        for id in Array(screenDataRate.keys) {
+            let current = screenDataRate[id, default: []].filter { now - $0 < 60 }
+            screenDataRate[id] = current.isEmpty ? nil : current
+        }
+        guard screenDataRate[reader, default: []].count < 60, screenDataRate.count < 128 || screenDataRate[reader] != nil else {
+            throw ScreenDataError.rateLimited
+        }
+        screenDataRate[reader, default: []].append(now)
+    }
+
+    private func requestScreenDataInventory() {
+        guard let scope = screenDataCloudScope else { return }
+        screenDataInventoryDirty = true
+        guard screenDataInventoryTask == nil else { return }
+        screenDataInventoryTask = Task { [weak self] in
+            guard let self else { return }
+            while self.screenDataInventoryDirty, self.screenDataCloudScope == scope, !Task.isCancelled {
+                self.screenDataInventoryDirty = false
+                try? await self.sendScreenDataInventory(scope: scope)
+            }
+            if self.screenDataCloudScope == scope, !Task.isCancelled { self.screenDataInventoryTask = nil }
+        }
+    }
+
+    private func sendScreenDataInventory(scope: ScreenDataCloudScope) async throws {
+        guard screenDataCloudScope == scope, let library else { return }
+        let encoder = JSONEncoder()
+        var screens: [[String: Any]] = []
+        var generations: [String: String] = [:]
+        for screen in library.state.screens {
+            var record: [String: Any] = ["id": screen.id, "title": screen.artifact.title]
+            if let installed = library.screenDataInstallation(screen.id) {
+                record["revision"] = screen.revision
+                record["screenDataGeneration"] = installed.generation
+                generations[screen.id] = installed.generation
+                record["screenData"] = try JSONSerialization.jsonObject(with: encoder.encode(installed.declarations))
+            }
+            screens.append(record)
+        }
+        var body: [String: Any] = ["screens": screens, "screenDataProtocol": 1, "screenDataSocketId": scope.socketID]
+        let selectedID = library.selected?.id
+        if let selectedID { body["selectedID"] = selectedID }
+        let signature = Data(SHA256.hash(data: try JSONSerialization.data(withJSONObject: body, options: .sortedKeys)))
+        guard signature != screenDataInventorySignature else { return }
+        guard screenDataInventorySequence < ScreenDataContract.maxVersion else { throw ScreenDataError.unavailable }
+        screenDataInventorySequence += 1
+        body["screenDataInventorySequence"] = screenDataInventorySequence
+        let _: EmptyResponse = try await cloud.call("api/device/screens", method: "POST", body: body,
+            authorizationToken: scope.token, screenDataProtocol: true)
+        guard screenDataCloudScope == scope, !Task.isCancelled else { return }
+        screenDataInventorySignature = signature
+        screenDataInventorySelectedID = selectedID
+        screenDataInventoryGenerations = generations
+    }
+
+    private func handleScreenDataQuery(_ query: DeviceScreenDataNotice) {
+        guard let scope = screenDataCloudScope, screenDataQueryTasks.count < 16,
+              screenDataQueryTasks[query.queryId] == nil, let library else { return }
+        let deadline = Date(timeIntervalSince1970: Double(query.deadlineAt) / 1000)
+        guard deadline > Date() else { return }
+        let taskID = UUID()
+        screenDataQueryTasks[query.queryId] = (taskID, Task { [weak self, weak library] in
+            guard let self, let library else { return }
+            defer {
+                if self.screenDataQueryTasks[query.queryId]?.id == taskID {
+                    self.screenDataQueryTasks[query.queryId] = nil
+                }
+            }
+            guard self.screenDataCloudScope == scope, deadline > Date(), !Task.isCancelled else { return }
+            let reply: DeviceScreenDataWire.Reply
+            var candidate: DeviceScreenDataPermission?
+            do {
+                let permission = try library.screenDataPermission(owner: scope.scope.owner, target: query.target, reader: query.reader)
+                if try library.screenDataArchive.decision(for: permission.key) == nil { candidate = permission }
+                reply = .init(try library.screenDataArchive.query(permission.key))
+            } catch { reply = .init(error as? ScreenDataError ?? .unavailable) }
+            guard self.screenDataCloudScope == scope, deadline > Date(), !Task.isCancelled,
+                  (try? await self.cloud.replyToScreenDataQuery(id: query.queryId, reply: reply, token: scope.token)) == true,
+                  self.screenDataCloudScope == scope, deadline > Date(), !Task.isCancelled,
+                  let candidate, self.currentScreenDataPermission(candidate, remote: true),
+                  (try? library.screenDataArchive.decision(for: candidate.key)) == nil else { return }
+            self.enqueueScreenDataPrompt(candidate, remote: true)
+        })
+    }
+
+    private func currentScreenDataPermission(_ permission: DeviceScreenDataPermission, remote: Bool) -> Bool {
+        let key = permission.key
+        guard foreground, connectionActive, !accountOperationInProgress,
+              let scope = screenDataScope, key.owner == scope.owner, let library,
+              let target = library.screenDataInstallation(key.target.screenId),
+              target.target(exportName: key.target.exportName) == key.target,
+              target.declarations.exports.contains(where: { $0.name == key.target.exportName }) else { return false }
+        if remote { return screenDataCloudScope != nil }
+        guard key.reader.deviceId == scope.deviceID, let readerID = key.reader.screenId,
+              let reader = library.screenDataInstallation(readerID), reader.screen.revision == key.reader.revision,
+              reader.generation == key.reader.generation else { return false }
+        return reader.declarations.queries.contains {
+            ($0.deviceId == nil || $0.deviceId == scope.deviceID) &&
+                $0.screenId == key.target.screenId && $0.exportName == key.target.exportName
+        }
+    }
+
+    private func enqueueScreenDataPrompt(_ permission: DeviceScreenDataPermission, remote: Bool) {
+        refreshScreenDataPrompts()
+        guard currentScreenDataPermission(permission, remote: remote), screenDataPrompts.count < 4,
+              !screenDataPrompts.contains(where: { $0.permission.key == permission.key }) else { return }
+        screenDataPrompts.append(.init(permission: permission, expiresAt: Date().addingTimeInterval(120), remote: remote))
+        refreshScreenDataPrompts()
+    }
+
+    private func refreshScreenDataPrompts() {
+        let now = Date()
+        screenDataPrompts = screenDataPrompts.filter { $0.expiresAt > now && currentScreenDataPermission($0.permission, remote: $0.remote) }
+        if screenDataPrompt?.id != screenDataPrompts.first?.id { screenDataPrompt = screenDataPrompts.first }
+    }
+
+    func respondToScreenDataPrompt(_ prompt: DeviceScreenDataPrompt, allow: Bool) {
+        guard screenDataPrompt?.id == prompt.id else { return }
+        screenDataPrompts.removeAll { $0.id == prompt.id }
+        screenDataPrompt = nil
+        if prompt.expiresAt > Date(), currentScreenDataPermission(prompt.permission, remote: prompt.remote), let library {
+            do {
+                if try library.screenDataArchive.decision(for: prompt.permission.key) == nil {
+                    var permission = prompt.permission
+                    permission.decision = allow ? .allowed : .denied
+                    try library.screenDataArchive.set(permission)
+                }
+            } catch { message = "Couldn’t save this screen data permission. Review permissions in Settings." }
+        }
+        refreshScreenDataPermissions()
+        Task { @MainActor [weak self] in self?.refreshScreenDataPrompts() }
+    }
+
+    private func refreshScreenDataPermissions() {
+        guard let scope = screenDataScope, let library else { screenDataPermissions = []; return }
+        screenDataPermissions = ((try? library.screenDataArchive.permissions(owner: scope.owner)) ?? []).filter { permission in
+            let target = permission.key.target
+            return library.state.screenDataGenerations?[target.screenId] == target.generation
+        }
+    }
+
+    func revokeScreenDataPermission(_ permission: DeviceScreenDataPermission) {
+        updateScreenDataPermission(permission, forget: false)
+    }
+
+    func forgetScreenDataDecision(_ permission: DeviceScreenDataPermission) {
+        updateScreenDataPermission(permission, forget: true)
+    }
+
+    private func updateScreenDataPermission(_ permission: DeviceScreenDataPermission, forget: Bool) {
+        guard !accountOperationInProgress, let scope = screenDataScope, permission.key.owner == scope.owner,
+              screenDataPermissions.contains(where: { $0.key == permission.key }), let library else { return }
+        do {
+            if forget { try library.screenDataArchive.forget(permission.key) }
+            else {
+                var revoked = permission
+                revoked.decision = .revoked
+                try library.screenDataArchive.set(revoked)
+            }
+            refreshScreenDataPermissions()
+        } catch { message = "Couldn’t update this screen data permission." }
+    }
+
+    private func resetScreenDataWork(disconnectSocket: Bool) {
+        screenDataInventoryTask?.cancel()
+        screenDataInventoryTask = nil
+        screenDataInventoryDirty = false
+        screenDataInventorySignature = nil
+        screenDataInventorySelectedID = nil
+        screenDataInventoryGenerations.removeAll()
+        for request in screenDataQueryTasks.values { request.task.cancel() }
+        screenDataQueryTasks.removeAll()
+        if disconnectSocket {
+            screenDataSocketID = nil
+            screenDataInventorySequence = 0
+            screenDataPrompts.removeAll { $0.remote }
+        } else {
+            screenDataPrompts.removeAll()
+            screenDataRate.removeAll()
+        }
+        refreshScreenDataPrompts()
+    }
+}
 
 extension DeviceModel {
     private struct CatalogFlight: Equatable {

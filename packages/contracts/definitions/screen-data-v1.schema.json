@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://screenpunk.local/contracts/screen-data/v1/ManifestDeclaration.schema.json",
+  "type": "object",
+  "description": "Optional screenData member of a Screenpunk dashboard manifest. Additional validation requires unique export names and query aliases, 240 UTF-8 bytes per description, and no ASCII control characters in descriptions.",
+  "properties": {
+    "exports": {
+      "type": "array",
+      "maxItems": 16,
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "$ref": "#/$defs/name"
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 240,
+            "allOf": [
+              {
+                "pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]"
+              },
+              {
+                "pattern": "^[^\\u0000-\\u001F\\u007F]*(?![\\s\\S])"
+              }
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "description"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "queries": {
+      "type": "array",
+      "maxItems": 16,
+      "items": {
+        "type": "object",
+        "properties": {
+          "alias": {
+            "$ref": "#/$defs/name"
+          },
+          "deviceId": {
+            "$ref": "#/$defs/installedId"
+          },
+          "screenId": {
+            "$ref": "#/$defs/installedId"
+          },
+          "exportName": {
+            "$ref": "#/$defs/name"
+          }
+        },
+        "required": [
+          "alias",
+          "screenId",
+          "exportName"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "name": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}(?![\\s\\S])"
+    },
+    "installedId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}(?![\\s\\S])"
+    }
+  }
+}

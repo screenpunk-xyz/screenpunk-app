@@ -97,6 +97,7 @@ public enum PackageValidator {
             issues.append(.missingEntrypoint)
         }
         do { try manifest.deviceBehavior?.validate() } catch { issues.append(.validationFailed) }
+        do { try manifest.screenData?.validate() } catch { issues.append(.validationFailed) }
         do { try EventNavigationEngine.validateManifest(manifest) } catch { issues.append(.validationFailed) }
         if issues.isEmpty == false {
             throw PackageValidationError(issues: Array(Set(issues)))

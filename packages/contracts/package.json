@@ -1,12 +1,13 @@
 {
   "name": "@screenpunk/contracts",
-  "version": "0.1.0-beta.9",
+  "version": "0.1.0-beta.10",
   "private": true,
   "type": "module",
   "license": "Apache-2.0",
   "exports": {
     "./authoring": "./authoring.ts",
     "./authoring-v2": "./authoring-v2.ts",
-    "./catalog": "./catalog.ts"
+    "./catalog": "./catalog.ts",
+    "./screen-data": "./screen-data.ts"
   }
 }

@@ -328,18 +328,27 @@ public struct ApplicationReceiptV1: Codable, Sendable, Equatable {
     }
 }
 
+public struct AuthoringScreenDataDefinition: Codable, Sendable, Equatable {
+    public var version: Int
+    public var features: [String]
+    public var rules: [String]
+    public var manifestSchema: AuthoringJSONValue
+}
+
 public struct AuthoringDefinitionV1: Codable, Sendable, Equatable {
     public var schemaVersion: Int
     public var designGuidance: AuthoringDesignGuidanceV1
     public var runtime: AuthoringRuntimeV1
     public var serviceCatalog: [AuthoringServiceDefinitionV1]
     public var schemas: [String: AuthoringJSONValue]
-    public init(schemaVersion: Int, designGuidance: AuthoringDesignGuidanceV1, runtime: AuthoringRuntimeV1, serviceCatalog: [AuthoringServiceDefinitionV1], schemas: [String: AuthoringJSONValue]) {
+    public var screenData: AuthoringScreenDataDefinition?
+    public init(schemaVersion: Int, designGuidance: AuthoringDesignGuidanceV1, runtime: AuthoringRuntimeV1, serviceCatalog: [AuthoringServiceDefinitionV1], schemas: [String: AuthoringJSONValue], screenData: AuthoringScreenDataDefinition? = nil) {
         self.schemaVersion = schemaVersion
         self.designGuidance = designGuidance
         self.runtime = runtime
         self.serviceCatalog = serviceCatalog
         self.schemas = schemas
+        self.screenData = screenData
     }
 }
 

@@ -188,8 +188,10 @@ struct DeviceRootView: View {
                     .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { weatherDestination = nil } } }
             }
         }
+        .modifier(ScreenDataConsentAlert(model: model, isHost: scenePhase == .active && !model.settingsOpen &&
+            galleryIntro == nil && weatherDestination == nil && !onboardingHelpInFlight && !settingsCoverPresented && !speech.recording))
         .alert("Weather location", isPresented: Binding(
-            get: { scenePhase == .active && !model.settingsOpen && galleryIntro == nil && weatherDestination == nil && !onboardingHelpInFlight &&
+            get: { model.screenDataPrompt == nil && scenePhase == .active && !model.settingsOpen && galleryIntro == nil && weatherDestination == nil && !onboardingHelpInFlight &&
                 !settingsCoverPresented && !speech.recording && model.weatherLocationOfferScreen != nil },
             set: { _ in }
         ), presenting: weatherOffer) { offer in
@@ -382,7 +384,7 @@ struct DeviceRootView: View {
 
     private var currentRecordingBackdropScope: RecordingBackdropScope {
         RecordingBackdropScope(owner: model.permissionOwner, accountID: model.cloud.localAccountID,
-                               rendererID: model.screen.map { $0.revision + model.publicReadSessionKey },
+                               rendererID: model.screen.map { $0.revision + model.publicReadSessionKey + model.screenDataRendererKey },
                                temporaryActivationID: model.temporaryActivationID)
     }
 
@@ -448,12 +450,13 @@ struct DeviceRootView: View {
         if let screen = model.screen, let assets = model.assets {
             // The isolated WebView coordinator owns an immutable package and bridge scope.
             // A new local revision must create a new renderer, including on rollback/swipe.
-            DashboardRuntimeView(store: assets, homeAssistant: model.homeAssistant, publicReads: model.publicReads, revision: screen.revision, catalogContext: model.catalogPreviewContext, connectionCount: 1, screenName: screen.artifact.title,
+            let rendererID = screen.revision + model.publicReadSessionKey + model.screenDataRendererKey
+            DashboardRuntimeView(store: assets, homeAssistant: model.homeAssistant, publicReads: model.publicReads, screenData: model.screenDataProvider, revision: screen.revision, catalogContext: model.catalogPreviewContext, connectionCount: 1, screenName: screen.artifact.title,
                                  onMenu: { if swipeID == nil { model.openSettings() } })
                 .environment(\.dashboardSnapshotRegistration, DashboardSnapshotRegistration(
-                    source: dashboardSnapshot, rendererID: screen.revision + model.publicReadSessionKey
+                    source: dashboardSnapshot, rendererID: rendererID
                 ))
-                .id(screen.revision + model.publicReadSessionKey)
+                .id(rendererID)
                 .ignoresSafeArea()
         } else if model.allInstalledScreensHidden {
             Color.clear
@@ -1014,6 +1017,7 @@ struct CloudListenerSetupView_Previews: PreviewProvider {
 enum DeviceSettingsPage: String, Hashable {
     case overview = "Overview", guidedAccess = "Guided Access", display = "General", account = "Account", screens = "Screens"
     case home = "Home Assistant", television = "Google TV", calendar = "Google Calendar", publicData = "Public Data"
+    case screenData = "Screen Data Access"
     var symbol: String {
         switch self {
         case .overview: return "hand.draw"
@@ -1025,9 +1029,61 @@ enum DeviceSettingsPage: String, Hashable {
         case .television: return "tv"
         case .calendar: return "calendar"
         case .publicData: return "network"
+        case .screenData: return "lock.shield"
         }
     }
 }
+private struct ScreenDataConsentAlert: ViewModifier {
+    @ObservedObject var model: DeviceModel
+    let isHost: Bool
+
+    func body(content: Content) -> some View {
+        content.alert("Allow screen data access?", isPresented: Binding(
+            get: { isHost && model.screenDataPrompt.map { $0.expiresAt > Date() } == true },
+            set: { _ in }
+        ), presenting: model.screenDataPrompt) { prompt in
+            Button("Allow") { model.respondToScreenDataPrompt(prompt, allow: true) }
+            Button("Don’t Allow", role: .cancel) { model.respondToScreenDataPrompt(prompt, allow: false) }
+        } message: { prompt in
+            let permission = prompt.permission
+            Text("\(permission.readerLabel) wants to read “\(permission.key.target.exportName)” from \(permission.targetTitle). \(permission.exportDescription) If you allow access, the reader can try again.")
+        }
+    }
+}
+
+private struct ScreenDataAccessSettings: View {
+    @ObservedObject var model: DeviceModel
+
+    var body: some View {
+        Form {
+            Section {
+                if model.screenDataPermissions.isEmpty {
+                    Text("No screen data access decisions yet.").foregroundStyle(.secondary)
+                }
+                ForEach(model.screenDataPermissions) { permission in
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(permission.readerLabel).font(.headline)
+                        Text("\(permission.targetTitle) · \(permission.key.target.exportName)")
+                        Text(permission.exportDescription).font(.subheadline).foregroundStyle(.secondary)
+                        if permission.decision == .allowed {
+                            Button("Revoke Access", role: .destructive) { model.revokeScreenDataPermission(permission) }
+                                .accessibilityLabel("Revoke \(permission.readerLabel)’s access to \(permission.key.target.exportName)")
+                        } else {
+                            Text(permission.decision == .revoked ? "Revoked" : "Denied")
+                                .font(.subheadline).foregroundStyle(.secondary)
+                            Button("Forget Decision") { model.forgetScreenDataDecision(permission) }
+                                .accessibilityHint("A future request can ask for permission again.")
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+            } footer: {
+                Text("Only data a screen explicitly publishes can be shared. Access applies to the reader and screen version you approved. Forgetting a denied or revoked decision lets the reader ask again.")
+            }
+        }
+    }
+}
+
 struct DeviceSettingsView: View {
     @ObservedObject var model: DeviceModel
     @ObservedObject var display: DeviceDisplayPreferences
@@ -1056,7 +1112,7 @@ struct DeviceSettingsView: View {
                 Section {
                     row(.account)
                 }
-                Section("Device") { row(.display); row(.screens) }
+                Section("Device") { row(.display); row(.screens); row(.screenData) }
                 if !providers.isEmpty {
                     Section("Connections") { ForEach(providers, id: \.self) { row($0) } }
                 }
@@ -1078,6 +1134,7 @@ struct DeviceSettingsView: View {
             }
         }
         .navigationSplitViewStyle(.balanced)
+        .modifier(ScreenDataConsentAlert(model: model, isHost: model.settingsOpen && sheet == nil && screenToRemove == nil))
         .modifier(BackupUpgradeAlert(model: model, billing: model.billing,
                                      isHost: model.settingsOpen && sheet == nil && screenToRemove == nil))
         // Present from Settings itself, not a Form Section/row whose hosting
@@ -1155,6 +1212,8 @@ struct DeviceSettingsView: View {
                     Section("Local agent") { Text("Local agent storage could not be opened.") }
                 }
             }
+        case .screenData:
+            ScreenDataAccessSettings(model: model)
         case .screens:
             Form {
                 Section {

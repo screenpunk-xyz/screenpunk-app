@@ -3,6 +3,9 @@
 (function (global) {
 const BRIDGE_TIMEOUT_MS = 15000;
 const BRIDGE_MESSAGE_BYTES = 64 * 1024;
+const SCREEN_DATA_BYTES = 16 * 1024;
+const SCREEN_DATA_DEPTH = 16;
+const SCREEN_DATA_ERRORS = new Set(["permission_required", "not_found", "unavailable", "timeout", "rate_limited", "invalid_request"]);
 const CLIENT_AUTH_OVERRIDE_KEYS = [
     "authorization",
     "Authorization",
@@ -113,8 +116,7 @@ function createDashboardClient(options = {}) {
             kind: "request",
             method,
             ...fields,
-            id,
-            parameters: fields.parameters
+            id
         };
         const encoded = new TextEncoder().encode(JSON.stringify(message)).byteLength;
         if (encoded > BRIDGE_MESSAGE_BYTES) {
@@ -159,6 +161,14 @@ function createDashboardClient(options = {}) {
             throw new BridgeClientError("size_limit");
         }
         transport.send(message);
+    }
+    async function screenDataRequest(method, fields) {
+        try {
+            return (await sendRequest(method, fields)).value;
+        } catch (error) {
+            if (SCREEN_DATA_ERRORS.has(error?.code)) throw error;
+            throw new BridgeClientError(error?.code === "render_timeout" ? "timeout" : "unavailable");
+        }
     }
     return {
         navigation: {
@@ -332,6 +342,27 @@ function createDashboardClient(options = {}) {
                 await sendRequest("state.remove", { key });
             }
         },
+        data: {
+            async publish(name, value) {
+                assertScreenDataName(name);
+                await screenDataRequest("data.publish", { name, value: screenDataJSON(value) });
+            },
+            async remove(name) {
+                assertScreenDataName(name);
+                await screenDataRequest("data.remove", { name });
+            },
+            async query(alias) {
+                assertScreenDataName(alias);
+                const snapshot = await screenDataRequest("data.query", { alias });
+                if (!snapshot || !Object.prototype.hasOwnProperty.call(snapshot, "value") ||
+                    !Number.isSafeInteger(snapshot.version) || snapshot.version < 1 ||
+                    !isScreenDataTimestamp(snapshot.updatedAt) || !isScreenDataTimestamp(snapshot.readAt))
+                    throw new BridgeClientError("unavailable");
+                try { screenDataJSON(snapshot.value); }
+                catch { throw new BridgeClientError("unavailable"); }
+                return { value: snapshot.value, version: snapshot.version, updatedAt: snapshot.updatedAt, readAt: snapshot.readAt };
+            }
+        },
         runtime: {
             ready() {
                 fire("runtime.ready");
@@ -389,6 +420,51 @@ function isBridgeMessage(value) {
         return false;
     const message = value;
     return message.protocolVersion === PROTOCOL_VERSION && typeof message.id === "string" && !!message.kind;
+}
+function assertScreenDataName(value) {
+    if (typeof value !== "string" || /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.exec(value)?.[0] !== value)
+        throw new BridgeClientError("invalid_request");
+}
+function isScreenDataTimestamp(value) {
+    return typeof value === "string" && value.length <= 64 && value.endsWith("Z") && Number.isFinite(Date.parse(value));
+}
+function screenDataJSON(value) {
+    let minimumBytes = 0;
+    const invalid = () => { throw new BridgeClientError("invalid_request"); };
+    const spend = (size) => { if ((minimumBytes += size) > SCREEN_DATA_BYTES) invalid(); };
+    function copy(v, depth) {
+        spend(1);
+        if (typeof v === "string") { spend(v.length); return v; }
+        if (v === null || typeof v === "boolean" || (typeof v === "number" && Number.isFinite(v))) return v;
+        if (typeof v !== "object" || depth >= SCREEN_DATA_DEPTH) invalid();
+        if (Array.isArray(v)) {
+            if (v.length > SCREEN_DATA_BYTES) invalid();
+            const out = [];
+            for (let i = 0; i < v.length; i++) {
+                const d = Object.getOwnPropertyDescriptor(v, i);
+                if (!d || !("value" in d)) invalid();
+                out.push(copy(d.value, depth + 1));
+            }
+            return out;
+        }
+        const proto = Object.getPrototypeOf(v);
+        if (proto !== null && proto !== Object.prototype) invalid();
+        const out = Object.create(null);
+        const keys = new Set();
+        for (const key of Object.keys(v)) {
+            spend(key.length);
+            const canonical = key.normalize("NFC");
+            if (keys.has(canonical)) invalid();
+            keys.add(canonical);
+            const d = Object.getOwnPropertyDescriptor(v, key);
+            if (!d || !("value" in d)) invalid();
+            out[key] = copy(d.value, depth + 1);
+        }
+        return out;
+    }
+    const json = copy(value, 0);
+    if (new TextEncoder().encode(JSON.stringify(json)).length > SCREEN_DATA_BYTES) invalid();
+    return json;
 }
 function assertSafeParameters(parameters) {
     for (const key of Object.keys(parameters)) {

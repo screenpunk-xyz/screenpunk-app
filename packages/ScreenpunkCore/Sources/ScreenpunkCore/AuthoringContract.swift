@@ -27,6 +27,16 @@ public enum AuthoringContract {
     public static let resultMetadataBytes = 131072
     public static let resultBytes = 393216
 
+    public static func designGuidance(supportsScreenData: Bool) -> AuthoringDesignGuidanceV1 {
+        guard supportsScreenData, let screenData = definition.screenData else { return designGuidance }
+        return .init(version: designGuidance.version, rules: designGuidance.rules + screenData.rules)
+    }
+
+    public static func runtime(supportsScreenData: Bool) -> AuthoringRuntimeV1 {
+        guard supportsScreenData, let screenData = definition.screenData else { return runtime }
+        return .init(version: runtime.version, packageFormat: runtime.packageFormat, features: runtime.features + screenData.features, limits: runtime.limits)
+    }
+
     public static func makeServices(observedAt: Int64) -> [AuthoringServiceV1] {
         serviceCatalog.map { service in
             let unknown = AuthoringCapabilityStateV1(observedAt: observedAt)
@@ -49,7 +59,9 @@ public enum AuthoringContract {
         try validateSchema("Request", data: data)
         let request = try JSONDecoder().decode(AuthoringRequestV1.self, from: data)
         guard request.deadlineAt > request.createdAt else { throw AuthoringContractError("deadline must follow creation") }
-        guard request.designGuidance == designGuidance, request.runtime == runtime else { throw AuthoringContractError("unsupported guidance/runtime definition") }
+        let screenData = request.runtime == runtime(supportsScreenData: true)
+        guard request.runtime == runtime(supportsScreenData: screenData),
+              request.designGuidance == designGuidance(supportsScreenData: screenData) else { throw AuthoringContractError("unsupported guidance/runtime definition") }
         var services = Set<String>()
         for service in request.services {
             guard services.insert(service.id).inserted,
@@ -101,6 +113,11 @@ public enum AuthoringContract {
         }
         if let request {
             _ = try validateRequest(JSONEncoder().encode(request))
+            if let manifest = result.screen?.files.first(where: { $0.path == "manifest.json" }) {
+                try ScreenDataContract.validateManifestDeclaration(manifest.content,
+                    previous: request.context.currentScreen?.files.first(where: { $0.path == "manifest.json" })?.content,
+                    supportsScreenData: request.runtime == runtime(supportsScreenData: true))
+            }
             guard result.requestID == request.requestID, result.inputDigest == request.delivery.snapshotDigest,
                   result.baseRevision == request.context.baseRevision else { throw AuthoringContractError("result is not bound to request snapshot") }
             let revisions = Dictionary(uniqueKeysWithValues: request.preferences.map { ($0.id,$0.revision) })
@@ -159,6 +176,9 @@ public enum AuthoringContract {
                   paths.insert(path.lowercased()).inserted else { throw AuthoringContractError("unsafe/duplicate screen path") }
         }
         guard screen.files.contains(where: { $0.path == "index.html" }), try encodedCanonical(screen).count <= runtime.limits.screenBytes else { throw AuthoringContractError("screen entry/serialized size limit") }
+        if let manifest = screen.files.first(where: { $0.path == "manifest.json" }) {
+            try ScreenDataContract.validateManifestDeclaration(manifest.content)
+        }
     }
     private static func json(_ data: Data) throws -> Any { try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) }
     private static func validateSchema(_ name: String, data: Data) throws {
