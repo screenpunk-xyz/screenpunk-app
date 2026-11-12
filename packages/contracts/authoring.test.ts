@@ -6,6 +6,7 @@ import {
   canonicalJSON, authoringSnapshotDigest, sealAuthoringRequest, verifyAuthoringRequestDigest,
   validateAuthoringRequest, validateAuthoringResult, validatePreferenceRecord, validateApplicationReceipt, validateAuthoringScreen,
 } from "./authoring";
+import { makeAuthoringRequestV2, validateAuthoringRequestV2, validateAuthoringResultV2, verifyAuthoringRequestDigestV2 } from "./authoring-v2";
 const fixtures = JSON.parse(readFileSync("packages/contracts/fixtures/conformance-v1.json","utf8"));
 function changed(value: any, change: any) {
   const copy = structuredClone(value); let parent = copy;
@@ -14,6 +15,27 @@ function changed(value: any, change: any) {
   return copy;
 }
 describe("canonical authoring v1 shared conformance", () => {
+  it("round-trips Calendar configuration facts through local and Cloud v1/v2 edits", async () => {
+    for (const route of ["local", "cloud"] as const) for (const state of ["yes", "no", "unknown"] as const) {
+      const input = structuredClone(fixtures.request);
+      input.delivery.route = route;
+      input.context.currentScreen = structuredClone(fixtures.result.screen);
+      const calendar = input.services.find((service: any) => service.provider === "googleCalendar");
+      calendar.configured.state = state;
+      const request = await sealAuthoringRequest(input);
+      expect(await verifyAuthoringRequestDigest(request)).toBe(true);
+      expect(request.services.find(service => service.provider === "googleCalendar")?.authorized.state).toBe("unknown");
+      const result = { ...structuredClone(fixtures.result), inputDigest: request.delivery.snapshotDigest };
+      expect(validateAuthoringResult(result, request)).toEqual(result);
+      const v2 = await makeAuthoringRequestV2(request, "calendar-library");
+      expect(validateAuthoringRequestV2(v2)).toEqual(v2);
+      expect(await verifyAuthoringRequestDigestV2(v2)).toBe(true);
+      expect(validateAuthoringResultV2({schemaVersion:2,requestID:v2.requestID,inputDigest:v2.delivery.snapshotDigest,baseRevision:v2.context.baseRevision,preferenceRevisions:{"pref-color":1},operationID:"calendar-answer",answer:"Calendar instructions accepted."},v2)).toBeDefined();
+      const tampered = structuredClone(request);
+      tampered.services.find(service => service.provider === "googleCalendar")!.configured.state = state === "yes" ? "no" : "yes";
+      expect(await verifyAuthoringRequestDigest(tampered)).toBe(false);
+    }
+  });
   it("binds the explicit local route without changing Cloud snapshots", async () => {
     const request = structuredClone(fixtures.request);
     request.delivery.route = "local";

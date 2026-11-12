@@ -55,7 +55,6 @@ public enum AuthoringContract {
             guard services.insert(service.id).inserted,
                   let catalog = serviceCatalog.first(where: { $0.provider == service.provider }),
                   service.operations == catalog.operations else { throw AuthoringContractError("unsupported/duplicate service definition") }
-            guard service.provider != "googleCalendar" || service.configured.state == "no" else { throw AuthoringContractError("Calendar OAuth configuration is unavailable in this build") }
             for state in [service.supported,service.configured,service.authorized,service.entitled,service.reachable] {
                 guard state.observedAt <= request.createdAt else { throw AuthoringContractError("capability observation is in the future") }
             }

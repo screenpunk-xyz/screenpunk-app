@@ -2,6 +2,34 @@ import XCTest
 @testable import ScreenpunkCore
 
 final class AuthoringContractTests: XCTestCase {
+    func testCalendarConfigurationFactsRoundTripThroughLocalAndCloudEdits() throws {
+        let f = try fixtures()
+        let original = try AuthoringContract.validateRequest(data(f["request"]!))
+        let originalResult = try JSONDecoder().decode(AuthoringResultV1.self, from: data(f["result"]!))
+        let index = try XCTUnwrap(original.services.firstIndex { $0.provider == "googleCalendar" })
+        for route in ["local", "cloud"] {
+            for state in ["yes", "no", "unknown"] {
+                var request = original
+                request.delivery.route = route
+                request.context.currentScreen = originalResult.screen
+                request.services[index].configured.state = state
+                request = try AuthoringContract.seal(request)
+                XCTAssertEqual(try AuthoringContract.validateRequest(JSONEncoder().encode(request)), request)
+                XCTAssertEqual(request.services[index].authorized.state, "unknown")
+                var result = originalResult
+                result.inputDigest = request.delivery.snapshotDigest
+                XCTAssertNoThrow(try AuthoringContract.validateResult(JSONEncoder().encode(result), request: request))
+                let v2 = try AuthoringV2Contract.makeRequest(from: request, libraryID: "calendar-library")
+                XCTAssertEqual(try AuthoringV2Contract.validateRequest(JSONEncoder().encode(v2)), v2)
+                XCTAssertEqual(try v2.legacyRequest().services[index].configured.state, state)
+                let answer = AuthoringResultV2(requestID: v2.requestID, inputDigest: v2.delivery.snapshotDigest, baseRevision: v2.context.baseRevision, preferenceRevisions: ["pref-color": 1], operationID: "calendar-answer", answer: "Calendar instructions accepted.")
+                XCTAssertNoThrow(try AuthoringV2Contract.validateResult(JSONEncoder().encode(answer), request: v2))
+                var tampered = request
+                tampered.services[index].configured.state = state == "yes" ? "no" : "yes"
+                XCTAssertThrowsError(try AuthoringContract.validateRequest(JSONEncoder().encode(tampered)))
+            }
+        }
+    }
     func testLocalRouteHasItsOwnImmutableDigest() throws {
         let f = try fixtures()
         let original = try AuthoringContract.validateRequest(data(f["request"]!))
