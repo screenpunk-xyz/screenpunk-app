@@ -1,4 +1,5 @@
 import definition from "./generated/authoring-definition";
+import { validateManifestScreenData } from "./screen-data";
 
 export type JSONValue = null | boolean | number | string | JSONValue[] | { [key: string]: JSONValue };
 export type JSONSchema = { [key: string]: any };
@@ -15,7 +16,7 @@ export interface DurablePreferenceAuthorizationV1 { requestID: string; quote: st
 export interface AuthoringRequestV1 { schemaVersion: 1; requestID: string; createdAt: number; deadlineAt: number; designGuidance: AuthoringDesignGuidanceV1; runtime: AuthoringRuntimeV1; services: AuthoringServiceV1[]; preferences: PreferenceRecordV1[]; context: { profileID: string; deviceID: string; screenID: string; baseRevision: string | null; userRequest: string; currentScreen?: AuthoringScreen; viewport: { width: number; height: number; scale: number; orientation: "portrait" | "landscape" } }; delivery: { route: "cloud" | "fixture" | "local"; contractVersion: "1"; snapshotDigest: string } }
 export interface AuthoringResultV1 { schemaVersion: 1; requestID: string; inputDigest: string; baseRevision: string | null; preferenceRevisions: Record<string, number>; operationID: string; screen?: AuthoringScreen; answer?: string; preferenceMutations?: PreferenceMutationV1[]; durablePreferenceAuthorization?: DurablePreferenceAuthorizationV1 }
 export interface ApplicationReceiptV1 { schemaVersion: 1; requestID: string; operationID: string; inputDigest: string; status: "applied" | "conflict" | "rejected"; appliedAt: number; message?: string }
-export interface AuthoringDefinitionV1 { schemaVersion: 1; designGuidance: AuthoringDesignGuidanceV1; runtime: AuthoringRuntimeV1; serviceCatalog: AuthoringServiceDefinitionV1[]; schemas: Record<"Request" | "Result" | "Preference" | "Receipt", JSONSchema> }
+export interface AuthoringDefinitionV1 { schemaVersion: 1; designGuidance: AuthoringDesignGuidanceV1; runtime: AuthoringRuntimeV1; serviceCatalog: AuthoringServiceDefinitionV1[]; schemas: Record<"Request" | "Result" | "Preference" | "Receipt", JSONSchema>; screenData: { version: 1; features: string[]; rules: string[]; manifestSchema: JSONSchema } }
 const baseDefinition = definition as unknown as AuthoringDefinitionV1;
 function deepFreeze<T>(value: T): T {
   if (value !== null && typeof value === "object") { for (const item of Object.values(value)) deepFreeze(item); Object.freeze(value); }
@@ -23,6 +24,14 @@ function deepFreeze<T>(value: T): T {
 }
 export const AUTHORING_DEFINITION = deepFreeze({ ...baseDefinition, schemas: { ...baseDefinition.schemas, request: baseDefinition.schemas.Request, result: baseDefinition.schemas.Result, preference: baseDefinition.schemas.Preference, receipt: baseDefinition.schemas.Receipt } });
 export const SCREEN_AUTHORING_GUIDANCE: readonly string[] = AUTHORING_DEFINITION.designGuidance.rules;
+export function authoringRuntime(supportsScreenData: boolean): AuthoringRuntimeV1 {
+  const { runtime, screenData } = AUTHORING_DEFINITION;
+  return { ...runtime, features: [...runtime.features, ...(supportsScreenData ? screenData.features : [])] };
+}
+export function authoringDesignGuidance(supportsScreenData: boolean): AuthoringDesignGuidanceV1 {
+  const { designGuidance, screenData } = AUTHORING_DEFINITION;
+  return { ...designGuidance, rules: [...designGuidance.rules, ...(supportsScreenData ? screenData.rules : [])] };
+}
 function inlineSchema(schema: JSONSchema, defs: JSONSchema = schema.$defs): JSONSchema {
   if (schema.$ref) return inlineSchema(defs[schema.$ref.split("/").pop()!], defs);
   return Object.fromEntries(Object.entries(schema).filter(([key]) => !["$defs", "$id", "$schema"].includes(key)).map(([key, value]) => [key, Array.isArray(value) ? value.map(v => plainSchema(v) ? inlineSchema(v, defs) : v) : plainSchema(value) ? inlineSchema(value, defs) : value]));
@@ -106,6 +115,17 @@ function screenBounds(screen: AuthoringScreen): void {
     paths.add(path.toLowerCase());
   }
   if (!screen.files.some(f => f.path === "index.html") || utf8(canonicalJSON(screen)) > 204800) fail("screen entry/serialized size limit", "$.screen");
+  const manifest = screen.files.find(f => f.path === "manifest.json");
+  if (manifest) checkAuthoringManifestScreenData(manifest.content);
+}
+export function checkAuthoringManifestScreenData(content: string, previous?: string, supportsScreenData = true): void {
+  const read = (source: string) => {
+    try { return validateManifestScreenData(source); } catch { return fail("invalid manifest or screenData declaration", "$.screen.files.manifest.json"); }
+  };
+  const current = read(content);
+  if (current && !supportsScreenData && canonicalJSON(current) !== canonicalJSON((previous === undefined ? undefined : read(previous)) ?? null)) {
+    fail("target runtime does not advertise screen data", "$.screen.files.manifest.json");
+  }
 }
 export function makeAuthoringServices(observedAt: number): AuthoringServiceV1[] {
   return AUTHORING_DEFINITION.serviceCatalog.map(service => ({id:service.id,provider:service.provider,operations:structuredClone(service.operations),supported:{state:"yes",observedAt},configured:{state:service.provider === "googleCalendar" ? "no" : "unknown",observedAt},authorized:{state:"unknown",observedAt},entitled:{state:"unknown",observedAt},reachable:{state:"unknown",observedAt}}));
@@ -114,7 +134,9 @@ export function validatePreferenceRecord(value: unknown): PreferenceRecordV1 { v
 export function validateAuthoringRequest(value: unknown): AuthoringRequestV1 {
   validate("Request", value); const request = value as AuthoringRequestV1;
   if (request.deadlineAt <= request.createdAt) fail("deadline must follow creation");
-  if (canonicalJSON(request.designGuidance) !== canonicalJSON(AUTHORING_DEFINITION.designGuidance) || canonicalJSON(request.runtime) !== canonicalJSON(AUTHORING_DEFINITION.runtime)) fail("unsupported guidance/runtime definition");
+  const runtime = canonicalJSON(request.runtime);
+  const screenData = runtime === canonicalJSON(authoringRuntime(true));
+  if (runtime !== canonicalJSON(authoringRuntime(screenData)) || canonicalJSON(request.designGuidance) !== canonicalJSON(authoringDesignGuidance(screenData))) fail("unsupported guidance/runtime definition");
   const seen = new Set<string>();
   for (const service of request.services) {
     if (seen.has(service.id)) fail("duplicate service id"); seen.add(service.id);
@@ -151,6 +173,9 @@ export function validateAuthoringResult(value: unknown, request?: AuthoringReque
   }
   if (request) {
     validateAuthoringRequest(request);
+    const manifest = result.screen?.files.find(f => f.path === "manifest.json");
+    if (manifest) checkAuthoringManifestScreenData(manifest.content, request.context.currentScreen?.files.find(f => f.path === "manifest.json")?.content,
+      canonicalJSON(request.runtime) === canonicalJSON(authoringRuntime(true)));
     if (result.requestID !== request.requestID || result.inputDigest !== request.delivery.snapshotDigest || result.baseRevision !== request.context.baseRevision) fail("result is not bound to request snapshot");
     const revisions = Object.fromEntries(request.preferences.map(p => [p.id,p.revision]));
     if (canonicalJSON(revisions) !== canonicalJSON(result.preferenceRevisions)) fail("preference revisions differ from snapshot");

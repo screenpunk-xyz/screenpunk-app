@@ -26,10 +26,12 @@ import ScreenpunkCore
     func containsRotationScreen(_ id: String) -> Bool { id == Self.instructionsID || state.screens.contains { $0.id == id } }
 
     struct Saved: Codable, Identifiable { let id: String; let revision: String; let artifact: ScreenArtifact }
-    struct State: Codable { var screens: [Saved] = []; var selectedID: String?; var previous: Saved?; var lastRequest: String?; var pendingID: String?; var pendingScreenID: String?; var consumedID: String?; var cancelledRequests: [String]?; var cancelIntents: [String]?; var lastInstruction: String?; var submissionKey: String?; var submissionText: String?; var submissionScreen: ScreenArtifact?; var requestDeadline: Double?; var authoring: AuthoringStoreState?; var linkedProfile: LocalProfileDescriptor?; var localRequestIDs: Set<String>?; var bundledScreenSeeds: Set<String>?; var catalog: CatalogQueue?; var hiddenScreenIDs: Set<String>?; var onboarding: Onboarding?; var publicDataRevocations: Set<String>? }
+    struct State: Codable { var screens: [Saved] = []; var selectedID: String?; var previous: Saved?; var lastRequest: String?; var pendingID: String?; var pendingScreenID: String?; var consumedID: String?; var cancelledRequests: [String]?; var cancelIntents: [String]?; var lastInstruction: String?; var submissionKey: String?; var submissionText: String?; var submissionScreen: ScreenArtifact?; var requestDeadline: Double?; var authoring: AuthoringStoreState?; var linkedProfile: LocalProfileDescriptor?; var localRequestIDs: Set<String>?; var bundledScreenSeeds: Set<String>?; var catalog: CatalogQueue?; var hiddenScreenIDs: Set<String>?; var onboarding: Onboarding?; var publicDataRevocations: Set<String>?; var screenDataGenerations: [String: String]? }
     private(set) var state = State()
     var onCatalogRevisionCommitted: (() -> Void)?
     private let root: URL
+    let screenDataArchive: DeviceScreenDataArchive
+    private let screenDataLocalDeviceIds: Set<String>
     private let libraryOwner: String
     private var approvalOwner: String
     private let catalogDefaults: UserDefaults
@@ -39,11 +41,13 @@ import ScreenpunkCore
     private var catalogCapabilityChecked = false
     private var temporary: LocalTemporaryActivationController!
     private var journal: AuthoringJournal!
-    init(accountID: String, rootDirectory: URL? = nil, permissionOwner: String? = nil, catalogDefaults: UserDefaults = .standard, journalFault: AuthoringJournal.Fault? = nil, onboardNewLibrary: Bool = false) throws {
+    init(accountID: String, rootDirectory: URL? = nil, permissionOwner: String? = nil, catalogDefaults: UserDefaults = .standard, journalFault: AuthoringJournal.Fault? = nil, onboardNewLibrary: Bool = false, screenDataLocalDeviceIds: Set<String> = []) throws {
+        self.screenDataLocalDeviceIds = screenDataLocalDeviceIds
         libraryOwner = accountID
         approvalOwner = permissionOwner ?? accountID
         self.catalogDefaults = catalogDefaults
         root = try rootDirectory ?? Self.directory(for: accountID)
+        screenDataArchive = DeviceScreenDataArchive(root: root)
         let discarded = Self.discardedDirectory(for: root)
         if FileManager.default.fileExists(atPath: discarded.path),
            let data = try AuthoringJournal(root: discarded).recover() {
@@ -62,6 +66,10 @@ import ScreenpunkCore
             next.selectedID = Self.instructionsID
             try commit(next)
         }
+        if state.screenDataGenerations == nil, !state.screens.isEmpty {
+            try commit(state, captureCatalog: false)
+        }
+        reconcileScreenDataArchive()
         try flushPublicDataRevocations()
         try retireCancelledLocalSources()
         temporary = try LocalTemporaryActivationController(root: root, owner: accountID)
@@ -70,7 +78,40 @@ import ScreenpunkCore
         pruneUnusedRevisions()
     }
     convenience init(profile: LocalProfileDescriptor, rootDirectory: URL? = nil, journalFault: AuthoringJournal.Fault? = nil, onboardNewLibrary: Bool = false) throws {
-        try self.init(accountID: profile.libraryOwner, rootDirectory: rootDirectory, permissionOwner: profile.permissionOwner, journalFault: journalFault, onboardNewLibrary: onboardNewLibrary)
+        try self.init(accountID: profile.libraryOwner, rootDirectory: rootDirectory, permissionOwner: profile.permissionOwner, journalFault: journalFault, onboardNewLibrary: onboardNewLibrary, screenDataLocalDeviceIds: [profile.localDeviceID, profile.authoringDeviceID])
+    }
+
+    struct ScreenDataInstallation {
+        let screen: Saved
+        let generation: String
+        let declarations: ManifestScreenData
+
+        func target(exportName: String) -> DeviceScreenDataTarget {
+            .init(screenId: screen.id, revision: screen.revision, generation: generation, exportName: exportName)
+        }
+    }
+
+    func screenDataInstallation(_ id: String) -> ScreenDataInstallation? {
+        guard let screen = state.screens.first(where: { $0.id == id }),
+              let generation = state.screenDataGenerations?[id],
+              let file = screen.artifact.files.first(where: { $0.path == "manifest.json" }),
+              let manifest = try? JSONDecoder().decode(DashboardManifest.self, from: Data(file.content.utf8)),
+              let declarations = manifest.screenData,
+              (try? PackageValidator.validate(manifest)) != nil else { return nil }
+        return .init(screen: screen, generation: generation, declarations: declarations)
+    }
+
+    func screenDataPermission(owner: String, target: DeviceScreenDataTarget, reader: DeviceScreenDataReader) throws -> DeviceScreenDataPermission {
+        guard let installed = screenDataInstallation(target.screenId), installed.target(exportName: target.exportName) == target,
+              let declaration = installed.declarations.exports.first(where: { $0.name == target.exportName }) else { throw ScreenDataError.notFound }
+        return .init(key: .init(owner: owner, target: target, reader: reader.identity), targetTitle: installed.screen.artifact.title,
+                     exportDescription: declaration.description, readerLabel: reader.label, decision: .denied)
+    }
+
+    func publishScreenData(owner: String, target: DeviceScreenDataTarget, value: AuthoringJSONValue?) throws {
+        guard let installed = screenDataInstallation(target.screenId), installed.target(exportName: target.exportName) == target,
+              installed.declarations.exports.contains(where: { $0.name == target.exportName }) else { throw ScreenDataError.permissionRequired }
+        try screenDataArchive.publish(owner: owner, target: target, value: value)
     }
 
     private static func directory(for owner: String, librariesDirectory: URL? = nil) throws -> URL {
@@ -538,6 +579,13 @@ import ScreenpunkCore
             }
         }
         var next = proposed
+        let currentRevisions = Dictionary(state.screens.map { ($0.id, $0.revision) }, uniquingKeysWith: { first, _ in first })
+        let generations = Dictionary(next.screens.map { screen in
+            let retained = currentRevisions[screen.id] == screen.revision ? state.screenDataGenerations?[screen.id] : nil
+            return (screen.id, retained ?? UUID().uuidString)
+        }, uniquingKeysWith: { first, _ in first })
+        next.screenDataGenerations = generations
+        let previousGenerations = state.screenDataGenerations
         if captureCatalog, catalogCapabilityChecked, let revision = stagedDirectory,
            let saved = next.screens.first(where: { $0.revision == revision }) {
             captureCatalogRevision(saved, origin: "apply", in: &next)
@@ -546,8 +594,20 @@ import ScreenpunkCore
             let retained = next.screens.map(\.revision) + [next.previous?.revision].compactMap { $0 }
             next.catalog?.knownSavedRevisions = known.intersection(retained)
         }
+        defer {
+            if state.screenDataGenerations != previousGenerations {
+                reconcileScreenDataArchive()
+            }
+        }
         try persist(next, encoded: JSONEncoder().encode(next), stagedDirectory: stagedDirectory)
     }
+    private func reconcileScreenDataArchive() {
+        let localDeviceIds = screenDataLocalDeviceIds.union(
+            [state.linkedProfile?.localDeviceID, state.linkedProfile?.authoringDeviceID].compactMap { $0 })
+        // The committed generation fences access even if removing old archive entries fails.
+        try? screenDataArchive.reconcile(generations: state.screenDataGenerations ?? [:], localDeviceIds: localDeviceIds)
+    }
+
     private func persist(_ next: State, encoded: Data, stagedDirectory: String? = nil) throws {
         do {
             try journal.commit(encoded, stagedDirectory: stagedDirectory)

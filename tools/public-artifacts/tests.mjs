@@ -23,6 +23,17 @@ test('portable artifact includes the contract validators, schemas, fixtures, lic
   assert.equal(lock.sourceRevision,null);assert.equal(lock.provenance,'local-provisional');
   assert.throws(()=>validateLock(lock,{requirePublished:true}),/cannot deploy/);
 });
+test('screen data extension ships with its source, schema and conformance vectors',()=>{
+  const verified=verifyBundle(bytes,lock);
+  const paths=['packages/contracts/screen-data.ts','packages/contracts/definitions/screen-data-v1.schema.json','packages/contracts/fixtures/conformance-screen-data-v1.json'];
+  for(const path of paths) assert.deepEqual(verified.files.get(path),readFileSync(join(root,path)),path);
+  const changed=structuredClone(bundle);
+  changed.files=changed.files.filter(file=>file.path!==paths[0]);
+  changed.sourceSnapshotSHA256=sourceSnapshot(changed.files);
+  const missing=Buffer.from(JSON.stringify(changed));
+  assert.throws(()=>verifyBundle(missing,lockFor(changed,missing)),/Required screen data artifact file missing/);
+  assert.throws(()=>safePath('packages/contracts/screen-data.test.ts'),/Unexpected artifact path/);
+});
 test('preserves every published setup version, checksum, URL and CSP',()=>{
   const expected=['2d208f5fc45737dc2aa89c00db96c784fa3142ff13508c7ada7f7a53dd5f8957','5f46adbf5a0582e0734fdc8d7ea7aab0e200edd103351248c344162783fe2e6d','0945173fe87e98d2e3a168dd3f461b59acdfa10eef6e0897f2931205779d1ed5','311a4d48ccd6c84637521e9c6291c38813202f3fa869dadf5db7eb05f7557e5e','a54dc9fc1daedd4f95b8e2be126629c0dc83bdd63eb8bbc6076fb88734102fe3','061de76d6ddb9d7a97dab21657da934404b152b97fa9e5583e24e11bd26f6134'];
   assert.deepEqual(Object.keys(setup.localAgentSetupScripts),['1','2','3','4','5','6']);

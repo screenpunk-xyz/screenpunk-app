@@ -23,6 +23,41 @@ npx vitest run packages/contracts/authoring.test.ts
 
 `sync-authoring.mjs --check` detects drift in generated TypeScript, standalone schemas, and Swift bundled definition/fixture resources. `fixtures/conformance-v1.json` is shared by TypeScript and Swift tests: synthetic screen/request/result/preference/receipt examples, SHA-256 and Unicode/number canonicalization vectors, strict-version/field/scope/CAS rejection cases, and exact escaped/multibyte screen boundary vectors. Fixtures contain no credentials or private context. Swift conformance runs in the ordinary ScreenpunkCore test suite.
 
+## Screen data v1
+
+Author a screen that shares data only when its current runtime advertises `data.publish`, `data.remove`, and `data.query`. Supported devices include the matching guidance in both Local and Cloud requests. Older snapshots retain the original runtime and guidance; results bound to those snapshots cannot add or change a screen data declaration. The standalone [declaration schema](definitions/screen-data-v1.schema.json) describes the optional `screenData` member of `manifest.json`; `screen-data.ts` and Swift `ScreenDataContract` enforce the semantic limits. `npm run contracts:generate` refreshes the mirrored schema, rules, and conformance fixture.
+
+A feeding screen could declare an export in `manifest.json`:
+
+```json
+{ "screenData": { "exports": [{ "name": "lastFeeding", "description": "Last recorded feeding time" }] } }
+```
+
+After a real entry, call `await screenpunk.data.publish("lastFeeding", { fedAt: "2026-11-12T12:34:00Z" })`. To withdraw it, call `await screenpunk.data.remove("lastFeeding")`. Both methods resolve to `undefined` on success. Removal leaves the export absent and preserves its version counter. The runtime never exports `screenpunk.state` automatically.
+
+A reader declares the specific target in its own manifest:
+
+```json
+{ "screenData": { "queries": [{ "alias": "feeding", "screenId": "verified-installed-screen-id", "exportName": "lastFeeding" }] } }
+```
+
+Use the installed target's verified ID; `dashboardId` is author-supplied. Omit `deviceId` for a local query, or supply the verified device ID for a linked remote target. A manifest supports up to 16 exports and 16 queries. Names and aliases are case-sensitive, start with an ASCII letter, use ASCII letters, digits, `_`, and `-`, and are 1–64 bytes. Descriptions are nonblank single-line text up to 240 UTF-8 bytes. JSON values are limited to 16 KiB of compact UTF-8 JSON and 16 nested object or array containers.
+
+```js
+try {
+  const { value, version, updatedAt, readAt } = await screenpunk.data.query("feeding");
+  renderRecord(value, { version, updatedAt, readAt });
+} catch (error) {
+  renderUnknown(error.code);
+}
+```
+
+`updatedAt` records when the export was published. `readAt` records when the target device read the archive. Both are UTC ISO 8601 strings. A query does not run the publisher or refresh its value. Success may contain a real `false` or `null`. Failures reject with `.code` equal to `permission_required`, `not_found`, `unavailable`, `timeout`, `rate_limited`, or `invalid_request`; treat every failure as unknown. For `permission_required`, explain native approval and offer a manual retry after the user approves. Do not poll or retry automatically.
+
+Native consent is specific to the reader and export and can be revoked on the target device. Local queries stay on device and can read a hidden target's archive while the app is active. Remote queries require linked, online, capable devices and the target app active. The relay holds values only while resolving a query; there is no offline Cloud copy. Remote limits are 10 seconds per query, four in flight per reader, 16 in flight per account, and 60 queries per minute per reader.
+
+The configured ChatGPT MCP connection can use `query_screen_data` after separate native consent for its exact OAuth grant. A tool response contains `{status:"ok",result:{value,version,updatedAt,readAt}}` or `{status:<error code>}`. Arbitrary external clients require separate approved client registration. Existing OAuth bearer tokens from other audiences do not grant access.
+
 ## Durable request lifecycle for v1 and v2
 
 `deadlineAt` remains required compatibility metadata in the sealed snapshot. Keep its existing validation and original value when verifying the digest, reconciling a delivery, or validating its result. This runtime policy supersedes any legacy guidance that treats the timestamp as request expiry. An elapsed timestamp or a network attempt timeout leaves a pending request recoverable on the original route with the same request ID, snapshot and digest.

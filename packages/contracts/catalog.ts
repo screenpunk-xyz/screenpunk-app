@@ -3,6 +3,7 @@
 import definition from './generated/catalog-definition';
 import { canonicalJSON, validateAuthoringScreen } from './authoring';
 import { authoringContentDigestV2, authoringMediaTypeV2 } from './authoring-v2';
+import { validateScreenDataDeclaration } from './screen-data';
 export const CATALOG_CAPABILITY = 'catalog-backup-v1';
 export const CATALOG_VERSION = '1';
 export const CATALOG_LIMITS = Object.freeze({ versionsPerScreen:3, screensPerAccount:20, packageBytes:10*1024*1024, previewBytes:512*1024, previewDimension:2048, accountBytes:1024*1024*1024, publicationOverlapBytes:20*1024*1024, queueRevisions:100, queueBytes:100*1024*1024, files:20, fileBytes:204800 });
@@ -116,6 +117,7 @@ export function catalogDependencies(files:{path:string;content:string}[]):{requi
 export function validateCatalogManifest(files:CatalogPackageFile[],textFiles:{path:string;content:string}[]):void {
  const source=textFiles.find(f=>f.path==='manifest.json');if(!source)return;let m:any;try{m=JSON.parse(source.content);}catch{return fail('invalid SDK manifest JSON');}
  if(!plain(m)||m.schemaVersion!==1||m.sdkVersion!=='1'||m.entrypoint!=='index.html'||!['dashboardId','name','revision'].every(k=>bounded(m[k],160))||/password|secret|token|api[_-]?key|bearer/.test(m.dashboardId+m.name+m.entrypoint)||!plain(m.target)||!bounded(m.target.profileId,160)||!integer(m.target.width,Number.MAX_SAFE_INTEGER)||!integer(m.target.height,Number.MAX_SAFE_INTEGER)||typeof m.target.scale!=='number'||!Number.isFinite(m.target.scale)||!['portrait','landscape'].includes(m.target.orientation)||!Array.isArray(m.connections)||m.connections.length>20||!Array.isArray(m.files)||m.files.length>20)fail('invalid SDK manifest');
+ if(Object.hasOwn(m,'screenData'))try{validateScreenDataDeclaration(m.screenData);}catch{return fail('invalid screenData declaration');}
  const aliases=new Set<string>();for(const c of m.connections){if(!plain(c)||!bounded(c.alias,160)||typeof c.required!=='boolean'||aliases.has(c.alias))fail('invalid manifest connection');aliases.add(c.alias);if(c.operations!==undefined&&(!Array.isArray(c.operations)||c.operations.some((o:any)=>!plain(o)||!bounded(o.name,160)||!bounded(o.kind,160))))fail('invalid manifest operations');}
  const actual=new Map(files.filter(f=>f.path!=='manifest.json').map(f=>[f.path,f]));if(m.files.length!==actual.size)fail('incomplete SDK manifest');const seen=new Set();let total=0;for(const d of m.files){if(!plain(d)||!catalogSafePath(d.path)||seen.has(d.path)||!integer(d.bytes,204800,0)||!digest(d.sha256))fail('invalid SDK manifest file');const file=actual.get(d.path);if(!file||d.bytes!==file.byteLength||d.sha256!==file.digest)fail('SDK manifest integrity mismatch');seen.add(d.path);total+=d.bytes;}if(!seen.has('index.html')||total>204800)fail('invalid SDK manifest entry');
 }

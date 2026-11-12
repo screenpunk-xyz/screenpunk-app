@@ -12,7 +12,7 @@ let package = Package(
     targets: [
         .target(name: "DeviceAuthoring", dependencies: ["ScreenpunkCore", "ScreenpunkApple"], path: "Sources",
                 exclude: ["WeatherLocationService.swift", "DevicePublicDataDetails.swift", "CloudClient.swift", "DeviceBillingCloudBackend.swift", "DeviceBillingSettings.swift", "DeviceBillingStore.swift", "DeviceDisplaySettings.swift", "DeviceGestures.swift", "DeviceModel.swift", "LocalAgentSettingsModel.swift", "LocalAgentSetupView.swift", "ScreenpunkApp.swift", "SpeechCapture.swift"],
-                sources: ["DeviceSwipeTransition.swift", "DeviceBillingWire.swift", "ScreenLibrary.swift", "DeviceAuthoringTypes.swift", "LocalAgentMacSetup.swift", "NewRequestRoutePolicy.swift", "LocalComputerDiscovery.swift", "StarterScreens.swift", "StarterWeather.swift", "PublicDataApprovalStore.swift"], resources: [.copy("StarterScreens")]),
+                sources: ["DeviceSwipeTransition.swift", "DeviceBillingWire.swift", "ScreenLibrary.swift", "DeviceScreenData.swift", "DeviceAuthoringTypes.swift", "LocalAgentMacSetup.swift", "NewRequestRoutePolicy.swift", "LocalComputerDiscovery.swift", "StarterScreens.swift", "StarterWeather.swift", "PublicDataApprovalStore.swift"], resources: [.copy("StarterScreens")]),
         .testTarget(name: "DeviceAuthoringTests", dependencies: ["DeviceAuthoring", "ScreenpunkCore", "ScreenpunkApple"], path: "Tests")
     ]
 )

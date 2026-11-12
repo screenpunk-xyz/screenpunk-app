@@ -94,9 +94,10 @@ public struct DashboardManifest: Codable, Sendable, Equatable {
     public var defaultPageId: String?
     public var eventRules: [ManifestEventRule]?
     public var deviceBehavior: DeviceBehavior?
+    public var screenData: ManifestScreenData?
 
     private enum CodingKeys: String, CodingKey {
-        case schemaVersion, dashboardId, name, revision, entrypoint, sdkVersion, digest, target, connections, files, pages, defaultPageId, eventRules, deviceBehavior
+        case schemaVersion, dashboardId, name, revision, entrypoint, sdkVersion, digest, target, connections, files, pages, defaultPageId, eventRules, deviceBehavior, screenData
     }
 
     public init(from decoder: Decoder) throws {
@@ -118,6 +119,7 @@ public struct DashboardManifest: Codable, Sendable, Equatable {
         defaultPageId = try values.decodeIfPresent(String.self, forKey: .defaultPageId)
         eventRules = try values.decodeIfPresent([ManifestEventRule].self, forKey: .eventRules)
         deviceBehavior = try values.decodeIfPresent(DeviceBehavior.self, forKey: .deviceBehavior)
+        screenData = values.contains(.screenData) ? try values.decode(ManifestScreenData.self, forKey: .screenData) : nil
     }
 
     public init(
@@ -134,7 +136,8 @@ public struct DashboardManifest: Codable, Sendable, Equatable {
         pages: [DashboardPage]? = nil,
         defaultPageId: String? = nil,
         eventRules: [ManifestEventRule]? = nil,
-        deviceBehavior: DeviceBehavior? = nil
+        deviceBehavior: DeviceBehavior? = nil,
+        screenData: ManifestScreenData? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.dashboardId = dashboardId
@@ -150,5 +153,6 @@ public struct DashboardManifest: Codable, Sendable, Equatable {
         self.defaultPageId = defaultPageId
         self.eventRules = eventRules
         self.deviceBehavior = deviceBehavior
+        self.screenData = screenData
     }
 }

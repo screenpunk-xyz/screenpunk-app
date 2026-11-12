@@ -16,7 +16,7 @@ function exactKeys(value, keys, name) {
 function digest(value, name) { if (typeof value !== 'string' || !/^[0-9a-f]{64}$/.test(value)) fail(`Invalid ${name}`); }
 export function safePath(value) {
   if (typeof value !== 'string' || value.length > 180 || !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(value) || value.split('/').some(part => !part || part === '.' || part === '..')) fail('Unsafe artifact path');
-  const allowed = value === 'LICENSE' || value === 'packages/contracts/README.md' || value === 'packages/contracts/LICENSE' || value === 'packages/contracts/package.json' || /^packages\/contracts\/(authoring|authoring-v2|catalog)\.ts$/.test(value) || /^packages\/contracts\/(definitions|fixtures|generated)\/[A-Za-z0-9][A-Za-z0-9._-]*\.(json|ts)$/.test(value) || value === 'tools/local-agent-setup/generated/local-agent-setup.ts';
+  const allowed = value === 'LICENSE' || value === 'packages/contracts/README.md' || value === 'packages/contracts/LICENSE' || value === 'packages/contracts/package.json' || /^packages\/contracts\/(authoring|authoring-v2|catalog|screen-data)\.ts$/.test(value) || /^packages\/contracts\/(definitions|fixtures|generated)\/[A-Za-z0-9][A-Za-z0-9._-]*\.(json|ts)$/.test(value) || value === 'tools/local-agent-setup/generated/local-agent-setup.ts';
   if (!allowed) fail(`Unexpected artifact path: ${value}`);
   return value;
 }
@@ -87,6 +87,7 @@ export function verifyBundle(bytes, lock, options = {}) {
   if (!script || sha256(JSON.parse(script[1])) !== bundle.setupSHA256) fail('Setup script SHA256 mismatch');
   const pkg = JSON.parse(files.get('packages/contracts/package.json'));
   if (pkg.exports?.['./catalog'] === './catalog.ts') for (const path of ['packages/contracts/catalog.ts','packages/contracts/definitions/catalog-v1.json','packages/contracts/generated/catalog-definition.ts','packages/contracts/fixtures/conformance-catalog-v1.json']) if (!files.has(path)) fail(`Required catalog artifact file missing: ${path}`);
+  if (pkg.exports?.['./screen-data'] === './screen-data.ts') for (const path of ['packages/contracts/screen-data.ts','packages/contracts/definitions/screen-data-v1.schema.json','packages/contracts/fixtures/conformance-screen-data-v1.json']) if (!files.has(path)) fail(`Required screen data artifact file missing: ${path}`);
   if (pkg.version !== bundle.version || pkg.license !== 'Apache-2.0') fail('Contract package identity mismatch');
   return {bundle, files};
 }

@@ -1,0 +1,497 @@
+{
+  "version": 1,
+  "manifestCases": [
+    {
+      "name": "legacy",
+      "accepted": true,
+      "manifest": {}
+    },
+    {
+      "name": "empty",
+      "accepted": true,
+      "manifest": {
+        "screenData": {}
+      }
+    },
+    {
+      "name": "local and remote",
+      "accepted": true,
+      "manifest": {
+        "screenData": {
+          "exports": [
+            {
+              "name": "lastFeeding",
+              "description": "Last recorded feeding time"
+            }
+          ],
+          "queries": [
+            {
+              "alias": "feeding",
+              "screenId": "installed-screen",
+              "exportName": "lastFeeding"
+            },
+            {
+              "alias": "FeedingRemote",
+              "screenId": "installed-screen",
+              "exportName": "lastFeeding",
+              "deviceId": "device-2"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "exact name and description bounds",
+      "accepted": true,
+      "manifest": {
+        "screenData": {
+          "exports": [
+            {
+              "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+              "description": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "null declaration",
+      "accepted": false,
+      "manifest": {
+        "screenData": null
+      }
+    },
+    {
+      "name": "null arrays",
+      "accepted": false,
+      "manifest": {
+        "screenData": {
+          "queries": null
+        }
+      }
+    },
+    {
+      "name": "duplicate export names",
+      "accepted": false,
+      "manifest": {
+        "screenData": {
+          "exports": [
+            {
+              "name": "lastFeeding",
+              "description": "Last recorded feeding time"
+            },
+            {
+              "name": "lastFeeding",
+              "description": "Different"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "duplicate query aliases",
+      "accepted": false,
+      "manifest": {
+        "screenData": {
+          "queries": [
+            {
+              "alias": "feeding",
+              "screenId": "installed-screen",
+              "exportName": "lastFeeding"
+            },
+            {
+              "alias": "feeding",
+              "screenId": "installed-screen",
+              "exportName": "lastFeeding",
+              "deviceId": "different"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "too many exports",
+      "accepted": false,
+      "manifest": {
+        "screenData": {
+          "exports": [
+            {
+              "name": "export0",
+              "description": "Last recorded feeding time"
+            },
+            {
+              "name": "export1",
+              "description": "Last recorded feeding time"
+            },
+            {
+              "name": "export2",
+              "description": "Last recorded feeding time"
+            },
+            {
+              "name": "export3",
+              "description": "Last recorded feeding time"
+            },
+            {
+              "name": "export4",
+              "description": "Last recorded feeding time"
+            },
+            {
+              "name": "export5",
+              "description": "Last recorded feeding time"
+            },
+            {
+              "name": "export6",
+              "description": "Last recorded feeding time"
+            },
+            {
+              "name": "export7",
+              "description": "Last recorded feeding time"
+            },
+            {
+              "name": "export8",
+              "description": "Last recorded feeding time"
+            },
+            {
+              "name": "export9",
+              "description": "Last recorded feeding time"
+            },
+            {
+              "name": "export10",
+              "description": "Last recorded feeding time"
+            },
+            {
+              "name": "export11",
+              "description": "Last recorded feeding time"
+            },
+            {
+              "name": "export12",
+              "description": "Last recorded feeding time"
+            },
+            {
+              "name": "export13",
+              "description": "Last recorded feeding time"
+            },
+            {
+              "name": "export14",
+              "description": "Last recorded feeding time"
+            },
+            {
+              "name": "export15",
+              "description": "Last recorded feeding time"
+            },
+            {
+              "name": "export16",
+              "description": "Last recorded feeding time"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "too many queries",
+      "accepted": false,
+      "manifest": {
+        "screenData": {
+          "queries": [
+            {
+              "alias": "query0",
+              "screenId": "installed-screen",
+              "exportName": "lastFeeding"
+            },
+            {
+              "alias": "query1",
+              "screenId": "installed-screen",
+              "exportName": "lastFeeding"
+            },
+            {
+              "alias": "query2",
+              "screenId": "installed-screen",
+              "exportName": "lastFeeding"
+            },
+            {
+              "alias": "query3",
+              "screenId": "installed-screen",
+              "exportName": "lastFeeding"
+            },
+            {
+              "alias": "query4",
+              "screenId": "installed-screen",
+              "exportName": "lastFeeding"
+            },
+            {
+              "alias": "query5",
+              "screenId": "installed-screen",
+              "exportName": "lastFeeding"
+            },
+            {
+              "alias": "query6",
+              "screenId": "installed-screen",
+              "exportName": "lastFeeding"
+            },
+            {
+              "alias": "query7",
+              "screenId": "installed-screen",
+              "exportName": "lastFeeding"
+            },
+            {
+              "alias": "query8",
+              "screenId": "installed-screen",
+              "exportName": "lastFeeding"
+            },
+            {
+              "alias": "query9",
+              "screenId": "installed-screen",
+              "exportName": "lastFeeding"
+            },
+            {
+              "alias": "query10",
+              "screenId": "installed-screen",
+              "exportName": "lastFeeding"
+            },
+            {
+              "alias": "query11",
+              "screenId": "installed-screen",
+              "exportName": "lastFeeding"
+            },
+            {
+              "alias": "query12",
+              "screenId": "installed-screen",
+              "exportName": "lastFeeding"
+            },
+            {
+              "alias": "query13",
+              "screenId": "installed-screen",
+              "exportName": "lastFeeding"
+            },
+            {
+              "alias": "query14",
+              "screenId": "installed-screen",
+              "exportName": "lastFeeding"
+            },
+            {
+              "alias": "query15",
+              "screenId": "installed-screen",
+              "exportName": "lastFeeding"
+            },
+            {
+              "alias": "query16",
+              "screenId": "installed-screen",
+              "exportName": "lastFeeding"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "overlong name",
+      "accepted": false,
+      "manifest": {
+        "screenData": {
+          "exports": [
+            {
+              "name": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+              "description": "Last recorded feeding time"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "alias newline",
+      "accepted": false,
+      "manifest": {
+        "screenData": {
+          "queries": [
+            {
+              "alias": "feeding\n",
+              "screenId": "installed-screen",
+              "exportName": "lastFeeding"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "overlong UTF8 description",
+      "accepted": false,
+      "manifest": {
+        "screenData": {
+          "exports": [
+            {
+              "name": "lastFeeding",
+              "description": "ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "blank Unicode description",
+      "accepted": false,
+      "manifest": {
+        "screenData": {
+          "exports": [
+            {
+              "name": "lastFeeding",
+              "description": "   "
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "next line Unicode whitespace description",
+      "accepted": false,
+      "manifest": {
+        "screenData": {
+          "exports": [
+            {
+              "name": "lastFeeding",
+              "description": ""
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "control in description",
+      "accepted": false,
+      "manifest": {
+        "screenData": {
+          "exports": [
+            {
+              "name": "lastFeeding",
+              "description": "Name\nOther name"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "unknown declaration field",
+      "accepted": false,
+      "manifest": {
+        "screenData": {
+          "extra": []
+        }
+      }
+    },
+    {
+      "name": "reader identity injection",
+      "accepted": false,
+      "manifest": {
+        "screenData": {
+          "queries": [
+            {
+              "alias": "feeding",
+              "screenId": "installed-screen",
+              "exportName": "lastFeeding",
+              "readerId": "fake"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "unsafe target ID",
+      "accepted": false,
+      "manifest": {
+        "screenData": {
+          "queries": [
+            {
+              "alias": "feeding",
+              "screenId": "../target",
+              "exportName": "lastFeeding"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "null optional target",
+      "accepted": false,
+      "manifest": {
+        "screenData": {
+          "queries": [
+            {
+              "alias": "feeding",
+              "screenId": "installed-screen",
+              "exportName": "lastFeeding",
+              "deviceId": null
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "requestDigests": [
+    {
+      "version": 1,
+      "route": "local",
+      "digest": "5e27f901450a4dfc2df71acb8b232603946a699eb2f9b6c3feff8f4e2a4a1ea8"
+    },
+    {
+      "version": 1,
+      "route": "cloud",
+      "digest": "c474ff5e034732ff4e797687bb4eefc60d178322fcd889c53c1fd4994d711a11"
+    },
+    {
+      "version": 2,
+      "route": "local",
+      "digest": "b3c082f6c4405463cf2ccfafed22bf430305a26b2b05eeff5d53e6b827b64c17"
+    },
+    {
+      "version": 2,
+      "route": "cloud",
+      "digest": "dee467e58960e34e7db585b38345c26874bdfc128d8748d81cde47370805a5db"
+    }
+  ],
+  "valueCases": [
+    {
+      "value": null,
+      "accepted": true
+    },
+    {
+      "value": false,
+      "accepted": true
+    },
+    {
+      "unit": "x",
+      "count": 16382,
+      "accepted": true
+    },
+    {
+      "unit": "x",
+      "count": 16383,
+      "accepted": false
+    },
+    {
+      "unit": "é",
+      "count": 8191,
+      "accepted": true
+    },
+    {
+      "unit": "é",
+      "count": 8192,
+      "accepted": false
+    },
+    {
+      "unit": "\"",
+      "count": 8191,
+      "accepted": true
+    },
+    {
+      "unit": "\"",
+      "count": 8192,
+      "accepted": false
+    },
+    {
+      "depth": 16,
+      "accepted": true
+    },
+    {
+      "depth": 17,
+      "accepted": false
+    }
+  ]
+}

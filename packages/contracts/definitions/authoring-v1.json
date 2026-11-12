@@ -1,5 +1,58 @@
 {
   "schemaVersion": 1,
+  "screenData": {
+    "version": 1,
+    "features": ["data.publish", "data.remove", "data.query"],
+    "rules": [
+      "Screen data v1 is available only when the current request's runtime.features advertises data.publish, data.remove, and data.query. Add optional screenData to manifest.json: {exports:[{name,description}],queries:[{alias,deviceId?,screenId,exportName}]}. Omit unused lists. Each list has at most 16 entries; names and aliases are unique within their list, case-sensitive, and match [A-Za-z][A-Za-z0-9_-]{0,63}. Descriptions are short single-line user-facing text, up to 240 UTF-8 bytes. Use verified installed screen and device IDs, never the author-supplied dashboardId. An omitted deviceId targets this device; never guess IDs.",
+      "Use await screenpunk.data.publish(name,value) to share only a declared export and await screenpunk.data.remove(name) to withdraw it. Both resolve to undefined on success. Publish explicit JSON up to 16 KiB of compact UTF-8 JSON and 16 nested object/array containers. Do not publish credentials, private state, or values the user did not intend to share. screenpunk.state stays private. Removal makes the export absent and preserves its version history; only publishing creates a value.",
+      "Use await screenpunk.data.query(alias) to read a declared target. Success is {value,version,updatedAt,readAt}. value may be any allowed JSON including false or null. version increases on publication; updatedAt is the publication time and readAt the time of the native read, both UTC ISO 8601. This is a stored snapshot. Reading does not run the publisher or refresh its value. Display the publication time where freshness matters.",
+      "Screen data calls reject a BridgeClientError with .code: permission_required, not_found, unavailable, timeout, rate_limited, or invalid_request. Treat denied, missing, offline, timed-out, or rate-limited data as unknown; never interpret it as false, an empty success, or permission to act. On permission_required explain the native approval step and offer a manual retry after approval. Do not poll for permission or automatically retry. Preview hosts without a provider return unavailable.",
+      "Both screens declare the data relationship, and the target device user approves the exact reader and export in native UI. Native identity and revision checks apply to every read. Local reads stay on device and can read a hidden screen's archive while the app is active. Cross-device reads need linked, online, capable devices with the target app active. A remote query has a 10-second deadline, at most four in flight per reader and 16 per account, and at most 60 per minute per reader. No stored Cloud copy is available when a target is offline. The existing configured ChatGPT MCP connection may query via query_screen_data only with separate approval for its exact OAuth grant. Arbitrary third-party clients need separately approved client registration; never reuse their bearer tokens here.",
+      "Example: a feeding log declares export {name:'lastFeeding',description:'Last recorded feeding time'} and after a real entry calls await screenpunk.data.publish('lastFeeding',{fedAt:'2026-11-12T12:34:00Z'}). A reader declares {alias:'feeding',screenId:'verified-installed-screen-id',exportName:'lastFeeding'} and calls await screenpunk.data.query('feeding'). Display value.fedAt separately from updatedAt. If the query rejects, show that the feeding record is unknown and the appropriate setup or availability message. Never infer 'not fed' from a failed read."
+    ],
+    "manifestSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "https://screenpunk.local/contracts/screen-data/v1/ManifestDeclaration.schema.json",
+      "type": "object",
+      "description": "Optional screenData member of a Screenpunk dashboard manifest. Additional validation requires unique export names and query aliases, 240 UTF-8 bytes per description, and no ASCII control characters in descriptions.",
+      "properties": {
+        "exports": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {"$ref": "#/$defs/name"},
+              "description": {"type": "string", "minLength": 1, "maxLength": 240, "allOf": [{"pattern": "[^\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]"}, {"pattern": "^[^\\u0000-\\u001F\\u007F]*(?![\\s\\S])"}]}
+            },
+            "required": ["name", "description"],
+            "additionalProperties": false
+          }
+        },
+        "queries": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "properties": {
+              "alias": {"$ref": "#/$defs/name"},
+              "deviceId": {"$ref": "#/$defs/installedId"},
+              "screenId": {"$ref": "#/$defs/installedId"},
+              "exportName": {"$ref": "#/$defs/name"}
+            },
+            "required": ["alias", "screenId", "exportName"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false,
+      "$defs": {
+        "name": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}(?![\\s\\S])"},
+        "installedId": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}(?![\\s\\S])"}
+      }
+    }
+  },
   "designGuidance": {
     "version": "1",
     "rules": [

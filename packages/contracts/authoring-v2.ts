@@ -1,5 +1,5 @@
 import definition from './generated/authoring-v2-definition';
-import { AUTHORING_DEFINITION, AuthoringContractError, canonicalJSON, sealAuthoringRequest, validateAuthoringRequest, validateAuthoringResult, validateAuthoringScreen, type AuthoringRequestV1, type AuthoringResultV1, type AuthoringScreen, type JSONSchema } from './authoring';
+import { AUTHORING_DEFINITION, AuthoringContractError, authoringRuntime, canonicalJSON, checkAuthoringManifestScreenData, sealAuthoringRequest, validateAuthoringRequest, validateAuthoringResult, validateAuthoringScreen, type AuthoringRequestV1, type AuthoringResultV1, type AuthoringScreen, type JSONSchema } from './authoring';
 export interface AuthoringSourceFileV2 { path: string; mediaType: string; byteLength: number; digest: string; reference: string; content?: string }
 export interface AuthoringSourceScreenV2 { title: string; entry: 'index.html'; files: AuthoringSourceFileV2[] }
 export interface AuthoringContextV2 extends Omit<AuthoringRequestV1['context'],'currentScreen'> { libraryID: string; currentScreen?: AuthoringSourceScreenV2 }
@@ -67,7 +67,7 @@ export function validateAuthoringRequestV2(value:unknown):AuthoringRequestV2 {
  if(source) {
   if(!source.title.trim() || source.title.length>100) fail('invalid source title');
   const paths=new Set<string>();let bytes=0;
-  for(const file of source.files) {if(paths.has(file.path.toLowerCase()))fail('duplicate source path');paths.add(file.path.toLowerCase());if(file.mediaType!==authoringMediaTypeV2(file.path))fail('source media type mismatch');bytes+=file.byteLength;if(file.content!==undefined&&utf8(file.content).length!==file.byteLength)fail('source byte length mismatch');}
+  for(const file of source.files) {if(paths.has(file.path.toLowerCase()))fail('duplicate source path');paths.add(file.path.toLowerCase());if(file.mediaType!==authoringMediaTypeV2(file.path))fail('source media type mismatch');bytes+=file.byteLength;if(file.content!==undefined&&utf8(file.content).length!==file.byteLength)fail('source byte length mismatch');if(file.path==='manifest.json'&&file.content!==undefined)checkAuthoringManifestScreenData(file.content);}
   if(!source.files.some(f=>f.path==='index.html') || bytes>204800)fail('source package limit/entry');
  }
  if(utf8(canonicalJSON(request)).length>393216)fail('request byte limit');
@@ -92,11 +92,14 @@ export function validateAuthoringResultV2(value:unknown,request?:AuthoringReques
  if(screen){
   if(!screen.title.trim()||screen.title.length>100)fail('invalid screen title');
   const targets=new Set<string>();const deleted=new Set<string>();const base=request?.context.currentScreen?.files??[];
+  const supportsScreenData = !request || canonicalJSON(request.runtime) === canonicalJSON(authoringRuntime(true));
+  const previousManifest = base.find(f => f.path === 'manifest.json')?.content;
   for(const path of screen.deletedPaths){if(deleted.has(path.toLowerCase()))fail('duplicate deleted path');deleted.add(path.toLowerCase());}
   let total=0;
   for(const file of screen.files){const path=file.path.toLowerCase();if(targets.has(path)||deleted.has(path))fail('duplicate/overlapping destination');targets.add(path);
-   if(file.kind==='write')total+=utf8(file.content).length;
-   else if(request){const source=base.find(f=>f.path===file.sourcePath&&f.reference===file.reference&&f.digest===file.digest);if(!source)fail('unknown/out-of-scope source reference');total+=source!.byteLength;}
+   if(file.kind==='write'){total+=utf8(file.content).length;if(file.path==='manifest.json')checkAuthoringManifestScreenData(file.content,previousManifest,supportsScreenData);}
+   else if(request){const source=base.find(f=>f.path===file.sourcePath&&f.reference===file.reference&&f.digest===file.digest)??fail('unknown/out-of-scope source reference');total+=source.byteLength;
+    if(file.path==='manifest.json'&&source.path!==file.path){if(source.content!==undefined)checkAuthoringManifestScreenData(source.content,previousManifest,supportsScreenData);else if(!supportsScreenData)fail('target runtime cannot admit a manifest from an opaque reference');}}
   }
   if(!screen.files.some(f=>f.path==='index.html')||total>204800)fail('materialized entry/byte limit');
   const required=new Set<string>();for(const path of screen.requiredAssets??[]){if(required.has(path.toLowerCase())||!screen.files.some(f=>f.path===path))fail('missing/duplicate declared asset');required.add(path.toLowerCase());}
@@ -107,6 +110,6 @@ export function validateAuthoringResultV2(value:unknown,request?:AuthoringReques
 /** Materialize exact UTF8 bytes after request digest/reference verification, before native dependency checks and atomic installation. */
 export async function materializeAuthoringResultV2(result:AuthoringResultV2,request:AuthoringRequestV2,resolve:(file:AuthoringSourceFileV2)=>Promise<Uint8Array>|Uint8Array):Promise<AuthoringScreen|undefined> {
  if(!await verifyAuthoringRequestDigestV2(request))fail('snapshot/reference digest mismatch');validateAuthoringResultV2(result,request);if(!result.screen)return undefined;const files=[];
- for(const file of result.screen.files){if(file.kind==='write'){files.push({path:file.path,content:file.content});continue;}const source=request.context.currentScreen!.files.find(f=>f.path===file.sourcePath)!;const bytes=await resolve(source);if(bytes.length!==source.byteLength||await authoringContentDigestV2(bytes)!==source.digest)fail('pinned source corrupt/missing');let content:string;try{content=new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(bytes);}catch{fail('source is not UTF8');}files.push({path:file.path,content:content!});}
+ for(const file of result.screen.files){if(file.kind==='write'){files.push({path:file.path,content:file.content});continue;}const source=request.context.currentScreen!.files.find(f=>f.path===file.sourcePath)!;const bytes=await resolve(source);if(bytes.length!==source.byteLength||await authoringContentDigestV2(bytes)!==source.digest)fail('pinned source corrupt/missing');let content:string;try{content=new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(bytes);}catch{fail('source is not UTF8');}if(file.path==='manifest.json'&&source.path!==file.path)checkAuthoringManifestScreenData(content!,request.context.currentScreen?.files.find(f=>f.path==='manifest.json')?.content,canonicalJSON(request.runtime)===canonicalJSON(authoringRuntime(true)));files.push({path:file.path,content:content!});}
  return validateAuthoringScreen({title:result.screen.title,entry:result.screen.entry,files});
 }

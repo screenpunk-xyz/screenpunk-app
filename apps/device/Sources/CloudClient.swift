@@ -129,7 +129,7 @@ struct AgentStatus: Decodable {
         guard var value = session, value.profileID != profileID else { return }
         value.profileID = profileID; try SessionKeychain.save(value); session = value
     }
-    func call<T: Decodable>(_ path: String, method: String = "GET", body: Any? = nil, authenticated: Bool = true, authorizationToken: String? = nil, authoringVersion: Int = 1, idempotencyKey: String? = nil, timelineRequestID: String? = nil) async throws -> T {
+    func call<T: Decodable>(_ path: String, method: String = "GET", body: Any? = nil, authenticated: Bool = true, authorizationToken: String? = nil, authoringVersion: Int = 1, idempotencyKey: String? = nil, timelineRequestID: String? = nil, screenDataProtocol: Bool = false) async throws -> T {
 #if DEBUG
         let timeline: (start: RequestTimeline.Event, end: RequestTimeline.Event, id: String?, operation: RequestTimeline.Operation)?
         if path == "api/device/status" && method == "GET" {
@@ -157,6 +157,7 @@ struct AgentStatus: Decodable {
         request.httpMethod = method
         request.timeoutInterval = 25
         request.setValue(String(authoringVersion), forHTTPHeaderField: "X-Screenpunk-Authoring-Version")
+        if screenDataProtocol { request.setValue("1", forHTTPHeaderField: "X-Screenpunk-Screen-Data-Protocol") }
         if authenticated {
             guard let token = authorizationToken ?? session?.accessToken else { throw DeviceError.message("Sign in to Screenpunk to continue.") }
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -164,7 +165,7 @@ struct AgentStatus: Decodable {
         if let idempotencyKey { request.setValue(idempotencyKey, forHTTPHeaderField: "Idempotency-Key") }
         if let body {
             let bytes = try JSONSerialization.data(withJSONObject: body)
-            guard bytes.count <= 768 * 1024 else { throw DeviceError.message("Request exceeded the device limit.") }
+            guard bytes.count <= (screenDataProtocol && path == "api/device/screens" ? 2 * 1024 * 1024 : 768 * 1024) else { throw DeviceError.message("Request exceeded the device limit.") }
             request.httpBody = bytes
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         }
@@ -197,6 +198,53 @@ struct AgentStatus: Decodable {
             try DeviceAuthoringWire.validateResponse(data.isEmpty ? Data("{}".utf8) : data)
         }
         return try JSONDecoder().decode(T.self, from: data.isEmpty ? Data("{}".utf8) : data)
+    }
+
+    func queryScreenData(readerID: String, revision: String, generation: String, alias: String, socketID: String, token: String) async throws -> ScreenDataSnapshot {
+        let bytes = try JSONEncoder().encode([
+            "readerScreenId": readerID, "readerRevision": revision, "readerGeneration": generation,
+            "alias": alias, "screenDataSocketId": socketID
+        ])
+        let (status, data) = try await screenDataRequest("api/device/screen-data/query", bytes: bytes, token: token)
+        guard status == 200 else { throw ScreenDataError.unavailable }
+        let reply = try JSONDecoder().decode(DeviceScreenDataWire.Reply.self, from: data)
+        return try reply.snapshot()
+    }
+
+    func replyToScreenDataQuery(id: String, reply: DeviceScreenDataWire.Reply, token: String) async throws -> Bool {
+        guard UUID(uuidString: id) != nil else { throw ScreenDataError.invalidRequest }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.withoutEscapingSlashes]
+        let (status, _) = try await screenDataRequest("api/device/screen-data/queries/\(id)/reply", bytes: encoder.encode(reply), token: token)
+        return status == 204
+    }
+
+    private func screenDataRequest(_ path: String, bytes: Data, token: String) async throws -> (Int, Data) {
+        guard bytes.count <= DeviceScreenDataWire.replyLimit else { throw ScreenDataError.invalidRequest }
+        var request = URLRequest(url: Self.origin.appendingPathComponent(path))
+        request.httpMethod = "POST"
+        request.httpBody = bytes
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 12
+        configuration.timeoutIntervalForResource = 12
+        let transport = URLSession(configuration: configuration, delegate: NoRedirects(), delegateQueue: nil)
+        defer { transport.invalidateAndCancel() }
+        do {
+            let (stream, response) = try await transport.bytes(for: request)
+            guard let http = response as? HTTPURLResponse,
+                  response.expectedContentLength <= DeviceScreenDataWire.replyLimit else { throw ScreenDataError.unavailable }
+            var data = Data()
+            for try await byte in stream {
+                guard data.count < DeviceScreenDataWire.replyLimit else { throw ScreenDataError.unavailable }
+                data.append(byte)
+            }
+            return (http.statusCode, data)
+        } catch let error as URLError where error.code == .timedOut {
+            throw ScreenDataError.timeout
+        }
     }
 
     struct CatalogHTTPError: LocalizedError {
@@ -456,6 +504,7 @@ private final class NoRedirects: NSObject, URLSessionTaskDelegate {
                 let transportLimit: TimeInterval = 365 * 24 * 60 * 60
                 request.timeoutInterval = transportLimit
                 request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+                request.setValue("1", forHTTPHeaderField: "X-Screenpunk-Screen-Data-Protocol")
                 let configuration = URLSessionConfiguration.ephemeral
                 configuration.timeoutIntervalForRequest = transportLimit
                 configuration.timeoutIntervalForResource = transportLimit

@@ -106,13 +106,23 @@ enum DeviceCloudNotice: Equatable {
     case statusChanged
     case preferenceUpdated(profileID: String)
     case catalogUpdated
+    case screenDataConnected(socketID: String)
+    case screenDataQuery(DeviceScreenDataNotice)
 
-    private struct Wire: Decodable { let type: String; let profileID: String? }
+    private struct Wire: Decodable { let type: String; let profileID: String?; let screenDataSocketId: String? }
 
     static func decode(_ data: Data) -> Self? {
         guard data.count <= 4096, let wire = try? JSONDecoder().decode(Wire.self, from: data) else { return nil }
         switch wire.type {
-        case "status_changed": return .statusChanged
+        case "status_changed":
+            if let socketID = wire.screenDataSocketId {
+                guard UUID(uuidString: socketID) != nil else { return nil }
+                return .screenDataConnected(socketID: socketID)
+            }
+            return .statusChanged
+        case "screen_data_query":
+            guard let query = try? JSONDecoder().decode(DeviceScreenDataNotice.self, from: data), query.valid else { return nil }
+            return .screenDataQuery(query)
         case "preference.updated":
             guard let profileID = wire.profileID, !profileID.isEmpty else { return nil }
             return .preferenceUpdated(profileID: profileID)
