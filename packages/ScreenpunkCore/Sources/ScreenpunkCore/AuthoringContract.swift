@@ -22,6 +22,14 @@ public enum AuthoringContract {
     }()
     public static let designGuidance = definition.designGuidance
     public static let runtime = definition.runtime
+    public static var browserRuntime: AuthoringRuntimeV1 {
+        guard let value = definition.browser?.runtime else { preconditionFailure("Bundled browser runtime missing") }
+        return value
+    }
+    public static var browserDesignGuidance: AuthoringDesignGuidanceV1 {
+        guard let value = definition.browser?.designGuidance else { preconditionFailure("Bundled browser guidance missing") }
+        return value
+    }
     public static let serviceCatalog = definition.serviceCatalog
     public static let screenAuthoringGuidance = definition.designGuidance.rules
     public static let resultMetadataBytes = 131072
@@ -60,8 +68,12 @@ public enum AuthoringContract {
         let request = try JSONDecoder().decode(AuthoringRequestV1.self, from: data)
         guard request.deadlineAt > request.createdAt else { throw AuthoringContractError("deadline must follow creation") }
         let screenData = request.runtime == runtime(supportsScreenData: true)
-        guard request.runtime == runtime(supportsScreenData: screenData),
-              request.designGuidance == designGuidance(supportsScreenData: screenData) else { throw AuthoringContractError("unsupported guidance/runtime definition") }
+        let browser = request.runtime == browserRuntime
+        guard request.runtime == (browser ? browserRuntime : runtime(supportsScreenData: screenData)),
+              request.designGuidance == (browser ? browserDesignGuidance : designGuidance(supportsScreenData: screenData)) else { throw AuthoringContractError("unsupported guidance/runtime definition") }
+        if browser, !request.services.isEmpty || !request.preferences.isEmpty {
+            throw AuthoringContractError("browser runtime requires empty services and preferences")
+        }
         var services = Set<String>()
         for service in request.services {
             guard services.insert(service.id).inserted,
@@ -113,6 +125,9 @@ public enum AuthoringContract {
         }
         if let request {
             _ = try validateRequest(JSONEncoder().encode(request))
+            if request.runtime == browserRuntime, !mutations.isEmpty {
+                throw AuthoringContractError("browser runtime does not support preference mutations")
+            }
             if let manifest = result.screen?.files.first(where: { $0.path == "manifest.json" }) {
                 try ScreenDataContract.validateManifestDeclaration(manifest.content,
                     previous: request.context.currentScreen?.files.first(where: { $0.path == "manifest.json" })?.content,

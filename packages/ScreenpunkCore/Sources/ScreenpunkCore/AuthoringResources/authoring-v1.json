@@ -1,5 +1,29 @@
 {
   "schemaVersion": 1,
+  "browser": {
+    "designGuidance": {
+      "version": "1",
+      "rules": [
+        "Author for the actual responsive browser viewport in this request. This is an opaque-origin sandbox rendering a UTF-8 HTML/CSS/JavaScript package, not a native device runtime.",
+        "Use index.html with bundled CSS, classic JavaScript, SVG, and local JSON assets. Keep all assets within the package and its existing file/path/byte limits. Do not use JavaScript modules, external scripts, external styles, external fonts, external images, network requests, sockets, workers, nested HTML documents, or frames.",
+        "There is no window.screenpunk or native bridge in this browser profile. Do not call or simulate native services, device connections, Home Assistant, Calendar, Maps, cameras, microphones, native navigation, or screen-data APIs. Advertise unavailable capabilities honestly; never invent APIs, credentials, permissions, or live data.",
+        "Browser requests contain no services or preferences. Do not propose durable preference mutations or screen-data declarations. No persistent storage API is advertised by this runtime.",
+        "Use only the capabilities in this exact runtime snapshot. Local interactions and calculations may use ordinary classic JavaScript and packaged assets; actions requiring unavailable capabilities must show a clear unavailable state rather than fake success.",
+        "When editing, preserve the existing screen and behavior except for requested changes. Return a valid result bound to the request ID, input digest, and base revision. Keep all package metadata and asset hashes accurate; any manifest connections must be empty. A package sdkVersion field is format metadata and does not imply a native SDK is available."
+      ]
+    },
+    "runtime": {
+      "version": "1",
+      "packageFormat": "utf8-files-v1",
+      "features": ["html", "css", "javascript", "bundled-classic-scripts", "bundled-local-assets"],
+      "limits": {
+        "metadataBytes": 131072,
+        "requestBytes": 393216,
+        "screenBytes": 204800,
+        "screenFiles": 20
+      }
+    }
+  },
   "screenData": {
     "version": 1,
     "features": ["data.publish", "data.remove", "data.query"],
