@@ -152,6 +152,22 @@ public final class LocalProfileRepository: @unchecked Sendable {
             state.profiles[index] = profile; try file.save(state)
         }
     }
+    /// Remove only descriptors owned by the confirmed deleted Cloud account.
+    /// A linked local library is part of that account; independent local profiles remain.
+    public func removeAccountProfiles(accountID: String) throws {
+        guard !accountID.isEmpty, !accountID.hasPrefix("local:") else {
+            throw LocalPersistenceError.invalid("A Cloud account is required for deletion.")
+        }
+        try lock.locallyLocked {
+            var state = try load()
+            let removed = Set(state.profiles.filter { $0.cloudAccountID == accountID }.map(\.id))
+            guard !removed.isEmpty else { return }
+            state.profiles.removeAll { removed.contains($0.id) }
+            if let active = state.activeProfileID, removed.contains(active) { state.activeProfileID = nil }
+            try file.save(state)
+        }
+    }
+
     public func signOut() throws {
         _ = try activateLocalProfile()
     }

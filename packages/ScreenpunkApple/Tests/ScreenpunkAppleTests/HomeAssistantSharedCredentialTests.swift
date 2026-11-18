@@ -70,4 +70,15 @@ final class HomeAssistantSharedCredentialTests: XCTestCase {
         try vault.revokeCredential(owner: "user")
         XCTAssertNil(HomeAssistantDeviceVault(store: store).credentialStatus(owner: "user"))
     }
+    func testDeletedOwnerCleanupPreservesOtherOwnersCredentials() throws {
+        let vault = HomeAssistantDeviceVault(store: MemoryCredentialStore())
+        try vault.saveCredential(owner: "deleted-account", origin: "https://home.example", token: "deleted-secret")
+        try vault.saveCredential(owner: "retained-account", origin: "https://other.example", token: "retained-secret")
+        try vault.removeOwner("deleted-account")
+        XCTAssertNil(vault.credentialStatus(owner: "deleted-account"))
+        XCTAssertEqual(vault.credentialStatus(owner: "retained-account")?.origin, "https://other.example")
+        try vault.removeOwner("deleted-account")
+        XCTAssertNotNil(vault.credentialStatus(owner: "retained-account"))
+    }
+
 }

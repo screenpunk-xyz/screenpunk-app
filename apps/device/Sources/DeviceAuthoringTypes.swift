@@ -385,3 +385,161 @@ enum AuthoringRefreshPolicy {
         }
     }
 }
+
+/// Stored in the origin-scoped Keychain. A deletion capability is never a normal login credential.
+struct DeviceAccountDeletionIntent: Codable, Equatable {
+    let origin: String
+    let accountID: String
+    let serverAccountID: String
+    let operationID: String
+    let profiles: [LocalProfileDescriptor]
+    let preferenceKeys: [String]
+    var preferenceDashboardIDs: Set<String> = []
+    let billingJournalOwner: String?
+    var deletionToken: String?
+    var appleRevocationConsent: String?
+    var lastFailure: DeviceAccountDeletionDiagnostic?
+    var serverConfirmed = false
+    var manualAppleRevocationRequired = false
+    var appleRevocationHelpURL: String?
+}
+
+/// Optional support metadata is restricted to known values; never retain arbitrary response text.
+struct DeviceAccountDeletionDiagnostic: Codable, Equatable {
+    enum Stage: String, Codable, CaseIterable {
+        case receiptCheck = "receipt_check", billingPreflight = "billing_preflight", appleStatus = "apple_status"
+        case intentMetadata = "intent_metadata", intentStart = "intent_start", accountFence = "account_fence"
+        case appleRevocation = "apple_revocation", catalogPlan = "catalog_plan", authCleanup = "auth_cleanup"
+        case billingCleanup = "billing_cleanup", catalogCleanup = "catalog_cleanup"
+        case accountFinalize = "account_finalize", receiptFinalize = "receipt_finalize"
+    }
+    enum Category: String, Codable, CaseIterable {
+        case authorization, invalidRequest = "invalid_request", timeout, typeError = "type_error"
+        case storageSchema = "storage_schema", requestLimit = "request_limit"
+        case providerRecoveryRequired = "provider_recovery_required", providerUnavailable = "provider_unavailable"
+        case storageUnavailable = "storage_unavailable", operationFailed = "operation_failed"
+        case billingUnavailable = "billing_deletion_unavailable", appleConsent = "apple_revocation_consent_required"
+        case authPending = "auth_deletion_pending", applePending = "apple_revocation_pending"
+        case billingPending = "billing_deletion_pending", catalogPending = "catalog_deletion_pending"
+        case incomplete = "deletion_incomplete"
+    }
+    let stage: Stage?
+    let category: Category?
+    init?(stage: String?, category: String?) {
+        self.stage = stage.flatMap(Stage.init(rawValue:))
+        self.category = category.flatMap(Category.init(rawValue:))
+        if self.stage == nil && self.category == nil { return nil }
+    }
+    var supportCode: String { [stage?.rawValue, category?.rawValue].compactMap { $0 }.joined(separator: " / ") }
+}
+
+/// Only allowlisted server categories become user-visible; response capabilities never enter error text.
+enum DeviceAccountDeletionFailure: LocalizedError, Equatable {
+    enum Pending: String, Decodable, CaseIterable {
+        case billingUnavailable = "billing_deletion_unavailable"
+        case appleConsent = "apple_revocation_consent_required"
+        case auth = "auth_deletion_pending"
+        case apple = "apple_revocation_pending"
+        case billing = "billing_deletion_pending"
+        case catalog = "catalog_deletion_pending"
+        case incomplete = "deletion_incomplete"
+    }
+    case pending(Pending, diagnostic: DeviceAccountDeletionDiagnostic? = nil)
+    case http(Int)
+    case invalidResponse
+
+    var errorDescription: String? {
+        switch self {
+        case .pending(.billingUnavailable, _): return "Account deletion is waiting for the billing service. Your recovery information is saved on this iPad."
+        case .pending(.appleConsent, _): return "Apple authorization still needs confirmation. Your recovery information is saved on this iPad."
+        case .pending(.auth, _): return "Screenpunk has not finished removing account sign-in access. Your recovery information is saved on this iPad."
+        case .pending(.apple, _): return "Screenpunk has not finished disconnecting Apple sign-in. Your recovery information is saved on this iPad."
+        case .pending(.billing, _): return "Screenpunk has not finished removing account billing data. Your recovery information is saved on this iPad."
+        case .pending(.catalog, _): return "Screenpunk has not finished removing account screens and settings. Your recovery information is saved on this iPad."
+        case .pending(.incomplete, _), .invalidResponse: return "Screenpunk has not confirmed that account deletion finished. Your recovery information is saved on this iPad."
+        case .http(let status): return "Screenpunk could not complete the deletion request (\(status)). Your recovery information is saved on this iPad."
+        }
+    }
+}
+
+/// Persistence must complete before the destructive request. A failed/lost response keeps the same retry capability.
+enum DeviceAccountDeletionTransaction {
+    static let appleAuthorizationWarning = "If you use Sign in with Apple, deletion also disconnects it for Screenpunk. You may need to sign in again in other Screenpunk environments; their data will not be deleted."
+    struct Preparation: Decodable {
+        let operationID: String
+        let deletionToken: String
+        var appleRevocationConsentRequired = false
+        var appleAuthorizationWarning: String?
+    }
+    struct Result: Decodable {
+        let deleted: Bool
+        let operationID: String
+        let manualAppleRevocationRequired: Bool?
+        let appleRevocationHelpURL: String?
+    }
+
+    /// A partial response describes a pending operation, never successful deletion.
+    static func validateHTTPResponse(_ data: Data, status: Int, operationID: String) throws {
+        if status == 200 { return }
+        if status == 503 {
+            struct Partial: Decodable {
+                let deleted: Bool
+                let retryable: Bool
+                let operationID: String
+                let error: DeviceAccountDeletionFailure.Pending
+                let stage: String?
+                let category: String?
+            }
+            guard let partial = try? JSONDecoder().decode(Partial.self, from: data),
+                  !partial.deleted, partial.retryable, partial.operationID == operationID else {
+                throw DeviceAccountDeletionFailure.invalidResponse
+            }
+            throw DeviceAccountDeletionFailure.pending(partial.error, diagnostic: .init(stage: partial.stage, category: partial.category))
+        }
+        throw DeviceAccountDeletionFailure.http(status)
+    }
+
+    @MainActor static func perform(
+        _ captured: DeviceAccountDeletionIntent,
+        prepare: () async throws -> Preparation,
+        execute: (DeviceAccountDeletionIntent, Bool) async throws -> Result,
+        persist: (DeviceAccountDeletionIntent) throws -> Void
+    ) async throws -> DeviceAccountDeletionIntent {
+        if captured.serverConfirmed { return captured }
+        guard captured.appleRevocationConsent == "REVOKE" else {
+            throw DeviceError.message("Review the Apple authorization warning and confirm account deletion again.")
+        }
+        var intent = captured
+        let retrying = intent.deletionToken != nil
+        if intent.deletionToken == nil {
+            let preparation = try await prepare()
+            guard preparation.operationID == intent.operationID, !preparation.deletionToken.isEmpty else {
+                throw DeviceError.message("Account deletion could not be prepared.")
+            }
+            if preparation.appleRevocationConsentRequired, preparation.appleAuthorizationWarning != appleAuthorizationWarning {
+                throw DeviceError.message("The Apple authorization warning changed. Update Screenpunk before deleting this account.")
+            }
+            intent.deletionToken = preparation.deletionToken
+            try persist(intent)
+        }
+        let response: Result
+        do { response = try await execute(intent, retrying) }
+        catch let failure as DeviceAccountDeletionFailure {
+            if case .pending(_, let diagnostic) = failure {
+                intent.lastFailure = diagnostic
+                try persist(intent)
+            }
+            throw failure
+        }
+        guard response.operationID == intent.operationID, response.deleted else {
+            throw DeviceError.message("Account deletion is incomplete. Retry when you are online.")
+        }
+        intent.serverConfirmed = true
+        intent.manualAppleRevocationRequired = response.manualAppleRevocationRequired ?? false
+        if response.appleRevocationHelpURL == "https://support.apple.com/en-us/102571" {
+            intent.appleRevocationHelpURL = response.appleRevocationHelpURL
+        }
+        try persist(intent)
+        return intent
+    }
+}

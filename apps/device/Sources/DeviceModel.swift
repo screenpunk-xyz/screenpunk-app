@@ -6,12 +6,47 @@ import ScreenpunkLocalAuthoring
 import ScreenpunkLocalTransport
 
 @MainActor final class DeviceModel: ObservableObject {
+    @Published var choosingSignInProvider = false
+    @Published var accountCreationEmail: String?
+    private var accountCreationContinuation: CheckedContinuation<Bool, Never>?
+    func resolveAccountCreation(_ create: Bool) {
+        let continuation = accountCreationContinuation
+        accountCreationContinuation = nil
+        accountCreationEmail = nil
+        continuation?.resume(returning: create)
+    }
+    private func confirmAccountCreation(email: String) async -> Bool {
+        accountStatusCaption = "Confirm account creation"
+        let create = await withCheckedContinuation { continuation in
+            accountCreationContinuation = continuation
+            accountCreationEmail = email
+        }
+        accountStatusCaption = create ? "Creating your account…" : "Cancelling sign-in…"
+        return create
+    }
+    @Published var deletedAccountAppleHelpURL: URL?
+    @Published private(set) var accountDeletionInProgress = false
+    @Published private(set) var accountDeletionStatus: String?
+    @Published private(set) var accountDeletionError: String?
+    @Published private var accountDeletionIntent: DeviceAccountDeletionIntent?
+    var accountDeletionTargetID: String? { accountDeletionIntent?.accountID ?? cloud.localAccountID }
+    var accountDeletionNeedsRetry: Bool { accountDeletionIntent != nil }
+    var accountDeletionDiagnosticCode: String? { accountDeletionIntent?.lastFailure?.supportCode }
+    var accountDeletionRequiresConfirmation: Bool {
+        guard let intent = accountDeletionIntent else { return true }
+        return !intent.serverConfirmed && intent.appleRevocationConsent != "REVOKE"
+    }
+    var accountDeletionRetryTitle: String {
+        accountDeletionIntent?.serverConfirmed == true ? "Finish Removing Local Data" : "Retry Account Deletion"
+    }
+
     @Published var email: String?
     @Published private(set) var displayName = "Screenpunk"
     @Published private(set) var deviceNameSyncStatus: String?
     @Published var agentReady = false
     @Published var busy = false
     @Published var accountOperationInProgress = false
+    @Published private(set) var accountStatusCaption: String?
     @Published var message: String? {
         didSet { statusMessagePresentation.update(message) }
     }
@@ -223,7 +258,7 @@ import ScreenpunkLocalTransport
     var hasProfile: Bool { activeProfile != nil }
     var canUseCloudRoute: Bool { cloudBindingMatches }
     var canSelectCloudRoute: Bool { cloudAccountMatches }
-    var routeChangeBlocked: Bool { busy || pendingID != nil || library?.state.submissionKey != nil }
+    var routeChangeBlocked: Bool { accountDeletionIntent != nil || busy || pendingID != nil || library?.state.submissionKey != nil }
     private var currentRequestRoute: AuthoringRoute {
         if let id = pendingID ?? library?.state.submissionKey {
             if let route = library?.authoringRequestV2(id: id)?.delivery.route { return AuthoringRoute(rawValue: route) ?? selectedRoute }
@@ -322,13 +357,26 @@ import ScreenpunkLocalTransport
                 do { localSettings = try LocalAgentSettingsModel(configurationRepository: configurationRepository, ledger: localLedger, vault: localVault, profileID: { [weak self] in self?.activeProfile?.id }, changed: { [weak self] in self?.reloadLocalAgent() }) }
                 catch { message = "Local setup could not open: " + error.localizedDescription }
             }
-            try openLibrary()
+            accountDeletionIntent = try cloud.pendingAccountDeletion()
+            if let intent = accountDeletionIntent {
+                accountOperationInProgress = true
+                accountDeletionStatus = intent.serverConfirmed ? "Your account was deleted. Finish removing its data from this iPad." : "Account deletion is incomplete. Your recovery information is saved on this iPad."
+                if intent.lastFailure != nil { accountDeletionError = "Account deletion is incomplete. The last server report is saved below." }
+                message = accountDeletionStatus
+                settingsPage = .account
+                settingsOpen = true
+            } else {
+                try openLibrary()
+            }
         } catch { message = "Could not open saved screens: \(error.localizedDescription)" }
     }
-    func signIn(fromCloudOnboarding: Bool = false) async {
-        guard !accountOperationInProgress else { return }
+    func signIn(provider: CloudSignInProvider? = nil, fromCloudOnboarding: Bool = false) async {
+        guard !accountOperationInProgress, accountDeletionIntent == nil else { return }
+        guard let provider else { choosingSignInProvider = true; return }
         guard !routeChangeBlocked else { message = "Finish or cancel the current request before changing accounts."; return }
-        accountOperationInProgress = true; defer { accountOperationInProgress = false; startConnection() }
+        accountStatusCaption = provider == .apple ? "Signing in with Apple…" : "Signing in with Google…"
+        accountOperationInProgress = true
+        defer { accountOperationInProgress = false; accountStatusCaption = nil; startConnection() }
         stopConnection()
         library?.setCatalogBackupScope(nil)
         var signedIn = false
@@ -340,7 +388,11 @@ import ScreenpunkLocalTransport
             }
         }
         do {
-            let authenticated = try await cloud.signIn()
+            let authenticated = try await cloud.signIn(provider: provider) { [weak self] email in
+                guard let self else { return false }
+                return await self.confirmAccountCreation(email: email)
+            }
+            accountStatusCaption = "Finishing sign-in…"
             detachAccountLibrary()
             _ = try profileRepository?.activateAccountProfile(accountID: CloudClient.originScope.localAccountID(serverUserID: authenticated.user.id), deviceID: authenticated.deviceId)
             email = authenticated.user.email; message = nil
@@ -354,7 +406,7 @@ import ScreenpunkLocalTransport
         catch { message = error.localizedDescription }
     }
     func signOut(accountID: String, deleteScreens: Bool) async {
-        guard !accountOperationInProgress, cloud.localAccountID == accountID else { return }
+        guard !accountOperationInProgress, accountDeletionIntent == nil, cloud.localAccountID == accountID else { return }
         guard !routeChangeBlocked else { message = "Finish or cancel the current request before changing accounts."; return }
         var deletionProfile: LocalProfileDescriptor?
         if deleteScreens {
@@ -366,7 +418,9 @@ import ScreenpunkLocalTransport
                 return
             }
         }
-        accountOperationInProgress = true; defer { accountOperationInProgress = false; startConnection() }
+        accountStatusCaption = "Signing out…"
+        accountOperationInProgress = true
+        defer { accountOperationInProgress = false; accountStatusCaption = nil; startConnection() }
         stopConnection()
         library?.setCatalogBackupScope(nil)
         detachAccountLibrary()
@@ -394,6 +448,116 @@ import ScreenpunkLocalTransport
         message = notices.joined(separator: "\n")
         settingsOpen = false
     }
+    func deleteAccount(accountID: String, approvedAppleRevocation: Bool = false) async {
+        guard !accountDeletionInProgress, !accountOperationInProgress || accountDeletionIntent != nil else { return }
+        guard accountDeletionIntent != nil || !routeChangeBlocked else {
+            accountDeletionError = "Finish or cancel the current screen request before deleting your account."
+            return
+        }
+        accountDeletionError = nil
+        do {
+            var intent: DeviceAccountDeletionIntent
+            if let pending = accountDeletionIntent {
+                guard pending.accountID == accountID else { throw DeviceError.message("A different account deletion is pending.") }
+                intent = pending
+            } else {
+                guard let session = cloud.session, cloud.localAccountID == accountID, let profileRepository else {
+                    throw DeviceError.message("The signed-in account changed. Open Account settings again.")
+                }
+                let allProfiles = try profileRepository.snapshot().profiles
+                let profiles = allProfiles.filter { $0.cloudAccountID == accountID }
+                let ownDashboards = try profiles.reduce(into: Set<String>()) { $0.formUnion(try ScreenLibrary.dashboardIDs(profile: $1)) }
+                let retainedDashboards = try allProfiles.filter { $0.cloudAccountID != accountID }.reduce(into: Set<String>()) {
+                    $0.formUnion(try ScreenLibrary.dashboardIDs(profile: $1))
+                }
+                let owners = Set(profiles.map(\.permissionOwner))
+                var keys = UserDefaults.standard.dictionaryRepresentation().keys.filter { key in
+                    owners.contains { key.hasPrefix("screenpunk.publicReads." + $0 + ".") }
+                }
+                for profile in profiles {
+                    if let binding = profile.cloudBinding {
+                        let catalog = ScreenLibrary.CatalogBinding(origin: CloudClient.origin.absoluteString,
+                            accountID: accountID, userID: session.user.id, deviceID: binding.deviceID, libraryID: profile.libraryOwner)
+                        keys.append(catalog.preferenceKey)
+                    }
+                }
+                var prepared = DeviceAccountDeletionIntent(origin: CloudClient.origin.absoluteString, accountID: accountID,
+                    serverAccountID: session.user.id, operationID: UUID().uuidString, profiles: profiles,
+                    preferenceKeys: keys, billingJournalOwner: billing.deletionJournalOwner(for: cloud))
+                prepared.preferenceDashboardIDs = ownDashboards.subtracting(retainedDashboards)
+                intent = prepared
+                try cloud.saveAccountDeletion(intent)
+                accountDeletionIntent = intent
+            }
+            if approvedAppleRevocation {
+                intent.appleRevocationConsent = "REVOKE"
+                try cloud.saveAccountDeletion(intent)
+                accountDeletionIntent = intent
+            }
+            accountDeletionInProgress = true
+            accountOperationInProgress = true
+            accountStatusCaption = intent.serverConfirmed ? "Removing deleted account data…" : "Deleting your account…"
+            accountDeletionStatus = accountStatusCaption
+            defer {
+                accountDeletionInProgress = false
+                accountOperationInProgress = accountDeletionIntent != nil
+                accountStatusCaption = nil
+            }
+            stopConnection()
+            library?.setCatalogBackupScope(nil)
+            let confirmed = try await cloud.requestAccountDeletion(intent)
+            accountDeletionIntent = confirmed
+            accountDeletionStatus = "Your account was deleted. Removing its data from this iPad…"
+            try removeDeletedAccountData(confirmed)
+            if confirmed.manualAppleRevocationRequired {
+                deletedAccountAppleHelpURL = URL(string: "https://support.apple.com/en-us/102571")
+            }
+            accountDeletionIntent = nil
+            accountDeletionStatus = nil
+            message = "Your Screenpunk account has been deleted."
+            settingsOpen = false
+        } catch {
+            // Reload the durable prepare/completion receipt after an interrupted request.
+            if let saved = try? cloud.pendingAccountDeletion() { accountDeletionIntent = saved }
+            accountDeletionStatus = accountDeletionIntent?.serverConfirmed == true
+                ? "Your account was deleted. Some data still needs to be removed from this iPad."
+                : "Account deletion is incomplete. Your recovery information is saved on this iPad."
+            if accountDeletionIntent == nil {
+                accountDeletionError = "Could not prepare deletion on this iPad. No deletion request was sent. Unlock the iPad and try again."
+            } else if let failure = error as? DeviceAccountDeletionFailure {
+                accountDeletionError = failure.errorDescription
+            } else {
+                accountDeletionError = "Could not finish account deletion. Your recovery information is saved on this iPad. Try again when it is unlocked and online."
+            }
+            message = accountDeletionStatus
+        }
+    }
+
+    private func removeDeletedAccountData(_ intent: DeviceAccountDeletionIntent) throws {
+        guard intent.serverConfirmed else { throw DeviceError.message("The server has not confirmed account deletion.") }
+        guard intent.origin == CloudClient.origin.absoluteString else { throw DeviceError.message("The deletion receipt belongs to a different server.") }
+        guard let profileRepository, let localLedger else { throw DeviceError.message("The account was deleted, but local storage is unavailable. Reopen Screenpunk to finish removing its data.") }
+        detachAccountLibrary()
+        billing.removeDeletedAccount(origin: intent.origin, accountID: intent.accountID, activeJournalOwner: intent.billingJournalOwner)
+        for profile in intent.profiles {
+            guard profile.cloudAccountID == intent.accountID else { throw DeviceError.message("A saved profile belongs to another account.") }
+            try localLedger.removeProfile(profileID: profile.id)
+            try HomeAssistantDeviceVault().removeOwner(profile.permissionOwner)
+            try GenericConnectionDeviceVault().removeOwner(profile.permissionOwner)
+            try ScreenLibrary.deleteAccountScreens(accountID: intent.accountID, profile: profile)
+        }
+        if intent.profiles.isEmpty { try ScreenLibrary.deleteAccountScreens(accountID: intent.accountID, profile: nil) }
+        try ScreenPreferenceStore.shared.remove(dashboardIDs: intent.preferenceDashboardIDs)
+        for key in intent.preferenceKeys { UserDefaults.standard.removeObject(forKey: key) }
+        try profileRepository.removeAccountProfiles(accountID: intent.accountID)
+        try cloud.clearDeletedAccountSession(accountID: intent.accountID)
+        email = nil
+        try openLibrary()
+        try cloud.finishAccountDeletion()
+        accountDeletionIntent = nil
+        startConnection()
+    }
+
     /// Runs independently of Cloud I/O, including when outbound requests are stalled.
     func reconcileTemporary() {
         _ = settleAcknowledgedPending()
@@ -544,6 +708,7 @@ import ScreenpunkLocalTransport
     /// Resolve a new request before sealing source or preparing delivery. A prepared
     /// request never enters this resolver again, including after a send failure.
     func send(_ text: String) async {
+        guard accountDeletionIntent == nil else { return }
         // First Cloud linking can change the wire profile while keeping the same
         // native descriptor. Rebind idle adapters before capturing any new request.
         if !busy, pendingID == nil, library?.state.submissionKey == nil, localAgent != nil,
@@ -1297,6 +1462,7 @@ import ScreenpunkLocalTransport
         if active { startConnection() } else { stopConnection() }
     }
     private func startConnection() {
+        guard accountDeletionIntent == nil else { return }
         guard foreground, !connectionActive, !accountOperationInProgress else { return }
         connectionActive = true
         refreshCatalogScope()

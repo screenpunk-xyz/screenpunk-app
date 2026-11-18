@@ -327,4 +327,27 @@ final class DeviceBillingWireTests: XCTestCase {
         XCTAssertFalse(reopened.contains(owner: "A-staging", transactionID: "7", operationID: "op_1"))
         XCTAssertEqual(reopened.operationID(owner: "A-staging", transactionID: "7", proofDigest: updated), "op_2")
     }
+    func testDeletedAccountJournalRetiresOnlyKnownOwnersAndFencesLateWrites() throws {
+        let suite = "screenpunk-deletion-journal-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let journal = DeviceBillingOperationJournal(preferences: defaults)
+        let origin = "https://staging.screenpunk.xyz"
+        let target = origin + "\u{0}A\u{0}old-account-token"
+        let other = origin + "\u{0}B\u{0}other-token"
+        let fresh = origin + "\u{0}A\u{0}new-account-token"
+        let unknownKey = "screenpunk.billing.operation.v1.unknown"
+        defaults.set(["proof": "legacy-unknown"], forKey: unknownKey)
+        journal.record(id: "op_1", owner: target, transactionID: "1", proofDigest: "proof")
+        journal.record(id: "op_2", owner: other, transactionID: "2", proofDigest: "proof")
+        journal.removeAccount(origin: origin, accountID: "A", activeOwner: target)
+        XCTAssertFalse(journal.contains(owner: target, transactionID: "1"))
+        XCTAssertTrue(journal.contains(owner: other, transactionID: "2"))
+        XCTAssertNotNil(defaults.dictionary(forKey: unknownKey))
+        journal.record(id: "op_late", owner: target, transactionID: "3", proofDigest: "proof")
+        XCTAssertFalse(journal.contains(owner: target, transactionID: "3"))
+        journal.record(id: "op_fresh", owner: fresh, transactionID: "4", proofDigest: "proof")
+        XCTAssertTrue(journal.contains(owner: fresh, transactionID: "4"))
+    }
+
 }

@@ -47,6 +47,12 @@ public final class GenericConnectionDeviceVault: @unchecked Sendable {
             }
         }
     }
+    public func removeOwner(_ owner: String) throws {
+        guard !owner.isEmpty else { throw ConnectionFailure.validationFailed }
+        lock.lock(); defer { lock.unlock() }
+        let records = try load().filter { $0.owner != owner }
+        try store.put(JSONEncoder().encode(records), for: account)
+    }
     public func revoke() throws {
         lock.lock(); defer { lock.unlock() }
         try store.delete(account)

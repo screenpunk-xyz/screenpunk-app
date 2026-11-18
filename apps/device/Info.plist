@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
+<key>UIAppFonts</key><array><string>OnboardingAssets/GoogleSans-Medium.ttf</string></array>
 <key>ScreenpunkAPIOrigin</key><string>$(SCREENPUNK_API_ORIGIN)</string>
 <key>ScreenpunkGoogleCalendarClientID</key><string>$(SCREENPUNK_GOOGLE_CALENDAR_CLIENT_ID)</string>
 <key>CFBundleURLTypes</key><array><dict><key>CFBundleURLSchemes</key><array><string>screenpunk-one</string></array></dict><dict><key>CFBundleURLSchemes</key><array><string>$(SCREENPUNK_GOOGLE_CALENDAR_CALLBACK_SCHEME)</string></array></dict></array>

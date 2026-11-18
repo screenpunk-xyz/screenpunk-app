@@ -48,6 +48,14 @@ public final class ScreenPreferenceStore {
             if archive.screens[dashboard]?.isEmpty == true { archive.screens.removeValue(forKey: dashboard) }
         }
     }
+    /// Remove only known, account-exclusive dashboard state while preserving shared dashboard identities.
+    public func remove(dashboardIDs: Set<String>) throws {
+        for dashboard in dashboardIDs { try validate(dashboard) }
+        try access(write: true) { archive in
+            archive.generation = UUID()
+            for dashboard in dashboardIDs { archive.screens.removeValue(forKey: dashboard) }
+        }
+    }
     /// Confirmed device disconnect resets all screen preferences and invalidates
     /// existing bridge leases, so a retiring WebView cannot restore old data.
     public func erase() throws {

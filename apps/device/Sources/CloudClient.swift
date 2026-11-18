@@ -12,6 +12,8 @@ struct DeviceSession: Codable {
     var profileID: String?
     struct User: Codable { let id: String; let email: String; let name: String? }
 }
+enum CloudSignInProvider: String { case apple, google }
+
 enum CloudSignOutError: Error { case secureCredentialsNotCleared }
 struct AgentStatus: Decodable {
     let agentReady: Bool
@@ -24,7 +26,7 @@ struct AgentStatus: Decodable {
     struct Command: Decodable { let id: String; let type: String; let screenID: String?; let activationID: String?; let expiresAt: Double }
     struct Summary: Decodable { let id: String; let status: String }
 }
-@MainActor final class CloudClient: NSObject, ASWebAuthenticationPresentationContextProviding {
+@MainActor final class CloudClient: NSObject, ASWebAuthenticationPresentationContextProviding, ASAuthorizationControllerDelegate, ASAuthorizationControllerPresentationContextProviding {
     static let originScope: CloudOriginScope = {
         let configured = Bundle.main.object(forInfoDictionaryKey: "ScreenpunkAPIOrigin") as? String
         let value = configured.flatMap { $0.isEmpty || $0.hasPrefix("$(") ? nil : $0 }
@@ -35,6 +37,8 @@ struct AgentStatus: Decodable {
         return scope
     }()
     static var origin: URL { originScope.url }
+    private var appleController: ASAuthorizationController?
+    private var appleContinuation: CheckedContinuation<ASAuthorizationAppleIDCredential, Error>?
     private var authSession: ASWebAuthenticationSession?
     private var enrolledToken: String?
     private let deviceNameWrites = DeviceNameWriteQueue()
@@ -44,7 +48,7 @@ struct AgentStatus: Decodable {
     func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
         UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap(\.windows).first(where: \.isKeyWindow) ?? ASPresentationAnchor()
     }
-    func signIn() async throws -> DeviceSession {
+    func signIn(provider: CloudSignInProvider? = nil, confirmCreation: @escaping @MainActor (String) async -> Bool) async throws -> DeviceSession {
         // Enroll a still-valid legacy session before rotating its credentials so the
         // installation keeps the same account-scoped Cloud device identity.
         if session != nil {
@@ -55,26 +59,56 @@ struct AgentStatus: Decodable {
         let verifier = try Self.randomToken()
         let state = try Self.randomToken()
         let challenge = Data(SHA256.hash(data: Data(verifier.utf8))).base64URL
-        var url = URLComponents(url: Self.origin.appendingPathComponent("auth/device/authorize"), resolvingAgainstBaseURL: false)!
-        url.queryItems = [.init(name: "code_challenge", value: challenge), .init(name: "code_challenge_method", value: "S256"), .init(name: "state", value: state)]
-        defer { authSession = nil }
-        let callback: URL = try await withCheckedThrowingContinuation { continuation in
-            let flow = ASWebAuthenticationSession(url: url.url!, callbackURLScheme: "screenpunk-one") { callback, error in
-                if let error = error as? ASWebAuthenticationSessionError, error.code == .canceledLogin { continuation.resume(throwing: CancellationError()) }
-                else if let error { continuation.resume(throwing: error) }
-                else if let callback { continuation.resume(returning: callback) }
-                else { continuation.resume(throwing: DeviceError.message("Sign-in did not return a response.")) }
+        let code: String
+        if provider == .apple {
+            let challengeResponse: AppleChallenge = try await call(
+                "auth/device/apple/challenge", method: "POST",
+                body: ["codeChallenge": challenge, "codeChallengeMethod": "S256",
+                       "state": state, "installationKey": installationKey], authenticated: false)
+            guard challengeResponse.state == state else { throw DeviceError.message("Sign-in response could not be verified.") }
+            let credential = try await authorizeApple(nonce: challengeResponse.nonce, state: state)
+            guard credential.state == state,
+                  let identityData = credential.identityToken, let identityToken = String(data: identityData, encoding: .utf8),
+                  let codeData = credential.authorizationCode, let authorizationCode = String(data: codeData, encoding: .utf8) else {
+                throw DeviceError.message("Apple sign-in did not return a verified response.")
             }
-            flow.presentationContextProvider = self
-            self.authSession = flow
-            if !flow.start() { continuation.resume(throwing: DeviceError.message("Could not open sign-in.")) }
+            let response: DeviceSignInCompletion = try await call(
+                "auth/device/apple/complete", method: "POST",
+                body: ["challengeToken": challengeResponse.challengeToken, "identityToken": identityToken,
+                       "authorizationCode": authorizationCode, "codeVerifier": verifier,
+                       "state": state, "installationKey": installationKey], authenticated: false)
+            guard response.state == state else { throw DeviceError.message("Sign-in response could not be verified.") }
+            code = try await resolveDeviceSignInCompletion(response, verifier: verifier, installationKey: installationKey, state: state, confirmCreation: confirmCreation)
+        } else {
+            var url = URLComponents(url: Self.origin.appendingPathComponent("auth/device/authorize"), resolvingAgainstBaseURL: false)!
+            url.queryItems = [.init(name: "code_challenge", value: challenge), .init(name: "code_challenge_method", value: "S256"), .init(name: "state", value: state)]
+            if let provider { url.queryItems?.append(.init(name: "provider", value: provider.rawValue)) }
+            defer { authSession = nil }
+            let callback: URL = try await withCheckedThrowingContinuation { continuation in
+                let flow = ASWebAuthenticationSession(url: url.url!, callbackURLScheme: "screenpunk-one") { callback, error in
+                    if let error = error as? ASWebAuthenticationSessionError, error.code == .canceledLogin { continuation.resume(throwing: CancellationError()) }
+                    else if let error { continuation.resume(throwing: error) }
+                    else if let callback { continuation.resume(returning: callback) }
+                    else { continuation.resume(throwing: DeviceError.message("Sign-in did not return a response.")) }
+                }
+                flow.presentationContextProvider = self
+                self.authSession = flow
+                if !flow.start() { continuation.resume(throwing: DeviceError.message("Could not open sign-in.")) }
+            }
+            let items = URLComponents(url: callback, resolvingAgainstBaseURL: false)?.queryItems ?? []
+            guard callback.host == "auth", callback.path == "/callback", items.filter({ $0.name == "state" }).count == 1,
+                  items.first(where: { $0.name == "state" })?.value == state else { throw DeviceError.message("Sign-in response could not be verified.") }
+            if items.first(where: { $0.name == "error" })?.value == "access_denied" { throw CancellationError() }
+            let codes = items.filter { $0.name == "code" }
+            let confirmations = items.filter { $0.name == "confirmationToken" }
+            let emails = items.filter { $0.name == "email" }
+            guard codes.count <= 1, confirmations.count <= 1, emails.count <= 1,
+                  (codes.count == 1) != (confirmations.count == 1) else {
+                throw DeviceError.message("Sign-in response could not be verified.")
+            }
+            let response = DeviceSignInCompletion(code: codes.first?.value, state: state, confirmationToken: confirmations.first?.value, email: emails.first?.value)
+            code = try await resolveDeviceSignInCompletion(response, verifier: verifier, installationKey: installationKey, state: state, confirmCreation: confirmCreation)
         }
-        let items = URLComponents(url: callback, resolvingAgainstBaseURL: false)?.queryItems ?? []
-        guard callback.host == "auth", callback.path == "/callback", items.filter({ $0.name == "state" }).count == 1,
-              items.first(where: { $0.name == "state" })?.value == state else { throw DeviceError.message("Sign-in response could not be verified.") }
-        if items.first(where: { $0.name == "error" })?.value == "access_denied" { throw CancellationError() }
-        guard items.filter({ $0.name == "code" }).count == 1,
-              let code = items.first(where: { $0.name == "code" })?.value else { throw DeviceError.message("Sign-in response could not be verified.") }
         let value: DeviceSession = try await call("auth/device/token", method: "POST", body: ["code": code, "codeVerifier": verifier, "installationKey": installationKey], authenticated: false)
         let registered = try await registerSession(value)
         // Publish credentials only after enrollment succeeds. An interrupted account
@@ -83,6 +117,72 @@ struct AgentStatus: Decodable {
         session = registered; enrolledToken = registered.accessToken
         return registered
     }
+    private struct CancelledAccountCreation: Decodable {
+        let cancelled: Bool
+        let state: String
+    }
+    private struct AppleChallenge: Decodable {
+        let challengeToken: String
+        let nonce: String
+        let state: String
+    }
+    private struct DeviceSignInCompletion: Decodable {
+        let code: String?
+        let state: String
+        let confirmationToken: String?
+        let email: String?
+    }
+
+    private func resolveDeviceSignInCompletion(_ response: DeviceSignInCompletion, verifier: String, installationKey: String, state: String,
+                                               confirmCreation: @MainActor (String) async -> Bool) async throws -> String {
+        guard response.state == state else { throw DeviceError.message("Sign-in response could not be verified.") }
+        if let code = response.code, !code.isEmpty, response.confirmationToken == nil { return code }
+        guard response.code == nil, let token = response.confirmationToken, !token.isEmpty,
+              let email = response.email, !email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw DeviceError.message("Sign-in did not provide a verified account email. Try signing in again.")
+        }
+        let create = await confirmCreation(email)
+        if !create {
+            let _: CancelledAccountCreation? = try? await call("auth/device/account/confirm", method: "POST", body: ["confirmationToken": token, "codeVerifier": verifier, "installationKey": installationKey, "state": state, "action": "cancel"], authenticated: false)
+            throw CancellationError()
+        }
+        let result: DeviceSignInCompletion = try await call("auth/device/account/confirm", method: "POST", body: ["confirmationToken": token, "codeVerifier": verifier, "installationKey": installationKey, "state": state, "action": "create"], authenticated: false)
+        guard result.state == state, result.confirmationToken == nil, let code = result.code, !code.isEmpty else { throw DeviceError.message("Account creation could not be verified. Try signing in again.") }
+        return code
+    }
+
+    private func authorizeApple(nonce: String, state: String) async throws -> ASAuthorizationAppleIDCredential {
+        defer { appleController = nil; appleContinuation = nil }
+        return try await withCheckedThrowingContinuation { continuation in
+            appleContinuation = continuation
+            let request = ASAuthorizationAppleIDProvider().createRequest()
+            request.requestedScopes = [.email, .fullName]
+            request.nonce = nonce
+            request.state = state
+            let controller = ASAuthorizationController(authorizationRequests: [request])
+            controller.delegate = self
+            controller.presentationContextProvider = self
+            appleController = controller
+            controller.performRequests()
+        }
+    }
+
+    func presentationAnchor(for controller: ASAuthorizationController) -> ASPresentationAnchor {
+        UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap(\.windows).first(where: \.isKeyWindow) ?? ASPresentationAnchor()
+    }
+    func authorizationController(controller: ASAuthorizationController, didCompleteWithAuthorization authorization: ASAuthorization) {
+        guard let continuation = appleContinuation else { return }
+        appleContinuation = nil
+        if let credential = authorization.credential as? ASAuthorizationAppleIDCredential { continuation.resume(returning: credential) }
+        else { continuation.resume(throwing: DeviceError.message("Apple sign-in returned an unsupported response.")) }
+    }
+    func authorizationController(controller: ASAuthorizationController, didCompleteWithError error: Error) {
+        guard let continuation = appleContinuation else { return }
+        appleContinuation = nil
+        if (error as? ASAuthorizationError)?.code == .canceled { continuation.resume(throwing: CancellationError()) }
+        else { continuation.resume(throwing: error) }
+    }
+
     func enrollInstallation() async throws {
         guard let value = session else { throw DeviceError.message("Sign in to Screenpunk to continue.") }
         guard enrolledToken != value.accessToken else { return }
@@ -129,7 +229,7 @@ struct AgentStatus: Decodable {
         guard var value = session, value.profileID != profileID else { return }
         value.profileID = profileID; try SessionKeychain.save(value); session = value
     }
-    func call<T: Decodable>(_ path: String, method: String = "GET", body: Any? = nil, authenticated: Bool = true, authorizationToken: String? = nil, authoringVersion: Int = 1, idempotencyKey: String? = nil, timelineRequestID: String? = nil, screenDataProtocol: Bool = false) async throws -> T {
+    func call<T: Decodable>(_ path: String, method: String = "GET", body: Any? = nil, authenticated: Bool = true, authorizationToken: String? = nil, authoringVersion: Int = 1, idempotencyKey: String? = nil, timelineRequestID: String? = nil, screenDataProtocol: Bool = false, requiredStatus: Int? = nil) async throws -> T {
 #if DEBUG
         let timeline: (start: RequestTimeline.Event, end: RequestTimeline.Event, id: String?, operation: RequestTimeline.Operation)?
         if path == "api/device/status" && method == "GET" {
@@ -190,9 +290,16 @@ struct AgentStatus: Decodable {
         }
         guard data.count <= 768 * 1024 else { throw DeviceError.message("Cloud response exceeded the device limit.") }
         guard let http = response as? HTTPURLResponse else { throw DeviceError.message("Cloud did not respond.") }
+        if ["api/device/account/delete", "auth/account/delete/retry"].contains(path),
+           let fields = body as? [String: String], let operationID = fields["operationID"] {
+            try DeviceAccountDeletionTransaction.validateHTTPResponse(data, status: http.statusCode, operationID: operationID)
+        }
         if http.statusCode == 401 { throw DeviceError.http(401, "Your connection has expired. Sign in again from Settings.") }
         guard (200..<300).contains(http.statusCode) else {
             throw DeviceError.http(http.statusCode, "Screenpunk could not complete this request (\(http.statusCode)). Try again shortly.")
+        }
+        if let requiredStatus, http.statusCode != requiredStatus {
+            throw DeviceError.http(http.statusCode, "The server has not confirmed completion. Try again shortly.")
         }
         if path.hasPrefix("api/device/requests") || path == "api/device/preferences/sync" {
             try DeviceAuthoringWire.validateResponse(data.isEmpty ? Data("{}".utf8) : data)
@@ -295,6 +402,44 @@ struct AgentStatus: Decodable {
             return capability
         } catch let error as CatalogHTTPError where error.status == 404 || error.status == 405 { return nil }
     }
+    func pendingAccountDeletion() throws -> DeviceAccountDeletionIntent? {
+        guard let data = try CloudKeychainVault().read(service: Self.originScope.keychainService, account: "account-deletion") else { return nil }
+        let intent = try JSONDecoder().decode(DeviceAccountDeletionIntent.self, from: data)
+        guard intent.origin == Self.origin.absoluteString else { throw DeviceError.message("Account deletion belongs to a different server.") }
+        return intent
+    }
+
+    func saveAccountDeletion(_ intent: DeviceAccountDeletionIntent) throws {
+        guard intent.origin == Self.origin.absoluteString else { throw DeviceError.message("Account deletion belongs to a different server.") }
+        try CloudKeychainVault().write(JSONEncoder().encode(intent), service: Self.originScope.keychainService, account: "account-deletion")
+    }
+
+    func requestAccountDeletion(_ captured: DeviceAccountDeletionIntent) async throws -> DeviceAccountDeletionIntent {
+        guard captured.origin == Self.origin.absoluteString else { throw DeviceError.message("Account deletion belongs to a different server.") }
+        return try await DeviceAccountDeletionTransaction.perform(captured, prepare: {
+            guard self.localAccountID == captured.accountID, self.session?.user.id == captured.serverAccountID else {
+                throw DeviceError.message("Sign in to this account to prepare deletion.")
+            }
+            return try await self.call("api/device/account/delete/prepare", method: "POST", body: ["operationID": captured.operationID], requiredStatus: 200)
+        }, execute: { intent, retrying in
+            guard let token = intent.deletionToken else { throw DeviceError.message("Account deletion could not be prepared.") }
+            return try await self.call(
+                retrying ? "auth/account/delete/retry" : "api/device/account/delete", method: "POST",
+                body: ["operationID": intent.operationID, "deletionToken": token, "confirmation": "DELETE", "appleRevocationConsent": intent.appleRevocationConsent ?? ""], authenticated: !retrying, requiredStatus: 200)
+        }, persist: saveAccountDeletion)
+    }
+
+    func clearDeletedAccountSession(accountID: String) throws {
+        guard localAccountID == nil || localAccountID == accountID else { throw DeviceError.message("A different account is signed in.") }
+        try SessionKeychain.clear()
+        session = nil
+        enrolledToken = nil
+    }
+
+    func finishAccountDeletion() throws {
+        try CloudKeychainVault().delete(service: Self.originScope.keychainService, account: "account-deletion")
+    }
+
     func signOut() async throws {
         defer { session = nil; enrolledToken = nil }
         var revocationError: Error?
