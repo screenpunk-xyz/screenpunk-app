@@ -308,6 +308,34 @@ struct DeviceBillingOperationJournal {
     private let preferences: UserDefaults
     init(preferences: UserDefaults = .standard) { self.preferences = preferences }
 
+    private let ownersKey = "screenpunk.billing.operation.owners.v2"
+    private let retiredOwnersKey = "screenpunk.billing.operation.retired.v2"
+
+    private func ownerRetired(_ owner: String) -> Bool {
+        (preferences.dictionary(forKey: retiredOwnersKey)?[Self.digest(owner)] as? Bool) == true
+    }
+
+    private func rememberOwner(_ owner: String, key: String) {
+        var owners = preferences.dictionary(forKey: ownersKey) as? [String: String] ?? [:]
+        owners[key] = owner
+        preferences.set(owners, forKey: ownersKey)
+    }
+
+    /// Unknown legacy hashes remain untouched. Only accessed or newly written records have proven ownership.
+    func removeAccount(origin: String, accountID: String, activeOwner: String?) {
+        let prefix = origin + "\u{0}" + accountID + "\u{0}"
+        var owners = preferences.dictionary(forKey: ownersKey) as? [String: String] ?? [:]
+        var retired = preferences.dictionary(forKey: retiredOwnersKey) as? [String: Bool] ?? [:]
+        let matches = owners.filter { $0.value.hasPrefix(prefix) }
+        for owner in Set(matches.values).union(activeOwner.map { [$0] } ?? []) where owner.hasPrefix(prefix) {
+            retired[Self.digest(owner)] = true
+        }
+        // Persist the fence before removing records so late purchase responses cannot recreate them.
+        preferences.set(retired, forKey: retiredOwnersKey)
+        for key in matches.keys { preferences.removeObject(forKey: key); owners.removeValue(forKey: key) }
+        preferences.set(owners, forKey: ownersKey)
+    }
+
     private func key(owner: String, transactionID: String) -> String {
         "screenpunk.billing.operation.v1." + Self.digest(owner + "\u{0}" + transactionID)
     }
@@ -317,22 +345,26 @@ struct DeviceBillingOperationJournal {
     }
 
     func operationID(owner: String, transactionID: String, proofDigest: String) -> String? {
-        guard let record = preferences.dictionary(forKey: key(owner: owner, transactionID: transactionID)),
+        guard !ownerRetired(owner), let record = preferences.dictionary(forKey: key(owner: owner, transactionID: transactionID)),
               let id = record[proofDigest] as? String,
               DeviceBillingOperationResponse.Operation.validID(id) else { return nil }
+        rememberOwner(owner, key: key(owner: owner, transactionID: transactionID))
         return id
     }
 
     func contains(owner: String, transactionID: String, operationID: String? = nil) -> Bool {
-        guard let record = preferences.dictionary(forKey: key(owner: owner, transactionID: transactionID)) else { return false }
+        guard !ownerRetired(owner), let record = preferences.dictionary(forKey: key(owner: owner, transactionID: transactionID)) else { return false }
+        rememberOwner(owner, key: key(owner: owner, transactionID: transactionID))
         return operationID.map { id in record.values.contains { ($0 as? String) == id } } ?? true
     }
 
     func record(id: String, owner: String, transactionID: String, proofDigest: String) {
+        guard !ownerRetired(owner) else { return }
         let key = key(owner: owner, transactionID: transactionID)
         var record = preferences.dictionary(forKey: key) ?? [:]
         record[proofDigest] = id
         preferences.set(record, forKey: key)
+        rememberOwner(owner, key: key)
     }
 
     func clear(owner: String, transactionID: String, proofDigest: String) {

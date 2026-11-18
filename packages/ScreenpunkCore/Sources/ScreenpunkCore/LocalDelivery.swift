@@ -157,6 +157,16 @@ public final class LocalDeliveryLedger: @unchecked Sendable {
             try file.save(state)
         }
     }
+    /// Confirmed account deletion retires all cached deliveries for its exact profile.
+    public func removeProfile(profileID: String) throws {
+        guard !profileID.isEmpty else { throw LocalPersistenceError.invalid("A profile is required for deletion.") }
+        try lock.locallyLocked {
+            var state = try file.load() ?? .init()
+            state.records = state.records.filter { $0.value.profileID != profileID }
+            try file.save(state)
+        }
+    }
+
     private func sameBinding(_ a: LocalDeliveryRecord, _ b: LocalDeliveryRecord) -> Bool {
         a.contractVersion == b.contractVersion && a.requestID == b.requestID && a.inputDigest == b.inputDigest && a.connectionID == b.connectionID && a.profileID == b.profileID && a.hostKeySHA256 == b.hostKeySHA256 && a.baseRevision == b.baseRevision && a.deadlineAt == b.deadlineAt
     }

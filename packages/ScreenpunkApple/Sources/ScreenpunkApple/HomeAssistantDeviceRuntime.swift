@@ -68,6 +68,14 @@ public final class HomeAssistantDeviceVault: @unchecked Sendable {
         for key in Array(sets.keys) { sets[key]?.removeAll { $0.owner == owner } }
         try store.put(JSONEncoder().encode(sets), for: setsAccount)
     }
+    public func removeOwner(_ owner: String) throws {
+        guard !owner.isEmpty else { throw ConnectionFailure.validationFailed }
+        try revokeCredential(owner: owner)
+        lock.lock(); defer { lock.unlock() }
+        var sets = try publicSets()
+        for key in Array(sets.keys) { sets[key]?.removeAll { $0.owner == owner } }
+        try store.put(JSONEncoder().encode(sets), for: publicAccount)
+    }
     public func approve(manifest: DashboardManifest, owner: String) throws {
         lock.lock(); defer { lock.unlock() }
         var values = try sharedAccounts()

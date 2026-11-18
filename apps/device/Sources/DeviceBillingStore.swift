@@ -172,6 +172,17 @@ final class DeviceBillingStore: ObservableObject {
         }
     }
 
+    func deletionJournalOwner(for cloud: CloudClient) -> String? {
+        guard let context = currentContext(cloud), let token = context.snapshot?.apple?.accountToken else { return nil }
+        return journalOwner(context.session, token)
+    }
+
+    func removeDeletedAccount(origin: String, accountID: String, activeJournalOwner: String?) {
+        // Changing-account state already invalidates in-flight StoreKit UI work.
+        // The journal also rejects delayed backend responses for retired owner tokens.
+        backend.removeDeletedAccount(origin: origin, accountID: accountID, activeOwner: activeJournalOwner)
+    }
+
     func snapshot(for cloud: CloudClient) -> DeviceBillingSnapshot? { currentContext(cloud)?.snapshot }
     func backupAccess(for cloud: CloudClient) -> DeviceBackupAccess {
         currentContext(cloud)?.backupAccess.current(at: Date()) ?? .unknown

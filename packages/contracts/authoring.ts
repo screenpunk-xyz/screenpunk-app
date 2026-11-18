@@ -16,7 +16,7 @@ export interface DurablePreferenceAuthorizationV1 { requestID: string; quote: st
 export interface AuthoringRequestV1 { schemaVersion: 1; requestID: string; createdAt: number; deadlineAt: number; designGuidance: AuthoringDesignGuidanceV1; runtime: AuthoringRuntimeV1; services: AuthoringServiceV1[]; preferences: PreferenceRecordV1[]; context: { profileID: string; deviceID: string; screenID: string; baseRevision: string | null; userRequest: string; currentScreen?: AuthoringScreen; viewport: { width: number; height: number; scale: number; orientation: "portrait" | "landscape" } }; delivery: { route: "cloud" | "fixture" | "local"; contractVersion: "1"; snapshotDigest: string } }
 export interface AuthoringResultV1 { schemaVersion: 1; requestID: string; inputDigest: string; baseRevision: string | null; preferenceRevisions: Record<string, number>; operationID: string; screen?: AuthoringScreen; answer?: string; preferenceMutations?: PreferenceMutationV1[]; durablePreferenceAuthorization?: DurablePreferenceAuthorizationV1 }
 export interface ApplicationReceiptV1 { schemaVersion: 1; requestID: string; operationID: string; inputDigest: string; status: "applied" | "conflict" | "rejected"; appliedAt: number; message?: string }
-export interface AuthoringDefinitionV1 { schemaVersion: 1; designGuidance: AuthoringDesignGuidanceV1; runtime: AuthoringRuntimeV1; serviceCatalog: AuthoringServiceDefinitionV1[]; schemas: Record<"Request" | "Result" | "Preference" | "Receipt", JSONSchema>; screenData: { version: 1; features: string[]; rules: string[]; manifestSchema: JSONSchema } }
+export interface AuthoringDefinitionV1 { schemaVersion: 1; designGuidance: AuthoringDesignGuidanceV1; runtime: AuthoringRuntimeV1; browser: {designGuidance: AuthoringDesignGuidanceV1; runtime: AuthoringRuntimeV1}; serviceCatalog: AuthoringServiceDefinitionV1[]; schemas: Record<"Request" | "Result" | "Preference" | "Receipt", JSONSchema>; screenData: { version: 1; features: string[]; rules: string[]; manifestSchema: JSONSchema } }
 const baseDefinition = definition as unknown as AuthoringDefinitionV1;
 function deepFreeze<T>(value: T): T {
   if (value !== null && typeof value === "object") { for (const item of Object.values(value)) deepFreeze(item); Object.freeze(value); }
@@ -24,6 +24,15 @@ function deepFreeze<T>(value: T): T {
 }
 export const AUTHORING_DEFINITION = deepFreeze({ ...baseDefinition, schemas: { ...baseDefinition.schemas, request: baseDefinition.schemas.Request, result: baseDefinition.schemas.Result, preference: baseDefinition.schemas.Preference, receipt: baseDefinition.schemas.Receipt } });
 export const SCREEN_AUTHORING_GUIDANCE: readonly string[] = AUTHORING_DEFINITION.designGuidance.rules;
+export function browserAuthoringRuntime(): AuthoringRuntimeV1 {
+  return structuredClone(AUTHORING_DEFINITION.browser.runtime);
+}
+export function browserAuthoringDesignGuidance(): AuthoringDesignGuidanceV1 {
+  return structuredClone(AUTHORING_DEFINITION.browser.designGuidance);
+}
+function isBrowserRuntime(runtime: AuthoringRuntimeV1): boolean {
+  return canonicalJSON(runtime) === canonicalJSON(AUTHORING_DEFINITION.browser.runtime);
+}
 export function authoringRuntime(supportsScreenData: boolean): AuthoringRuntimeV1 {
   const { runtime, screenData } = AUTHORING_DEFINITION;
   return { ...runtime, features: [...runtime.features, ...(supportsScreenData ? screenData.features : [])] };
@@ -136,7 +145,11 @@ export function validateAuthoringRequest(value: unknown): AuthoringRequestV1 {
   if (request.deadlineAt <= request.createdAt) fail("deadline must follow creation");
   const runtime = canonicalJSON(request.runtime);
   const screenData = runtime === canonicalJSON(authoringRuntime(true));
-  if (runtime !== canonicalJSON(authoringRuntime(screenData)) || canonicalJSON(request.designGuidance) !== canonicalJSON(authoringDesignGuidance(screenData))) fail("unsupported guidance/runtime definition");
+  const browser = isBrowserRuntime(request.runtime);
+  const expectedRuntime = browser ? browserAuthoringRuntime() : authoringRuntime(screenData);
+  const expectedGuidance = browser ? browserAuthoringDesignGuidance() : authoringDesignGuidance(screenData);
+  if (runtime !== canonicalJSON(expectedRuntime) || canonicalJSON(request.designGuidance) !== canonicalJSON(expectedGuidance)) fail("unsupported guidance/runtime definition");
+  if (browser && (request.services.length || request.preferences.length)) fail("browser runtime requires empty services and preferences");
   const seen = new Set<string>();
   for (const service of request.services) {
     if (seen.has(service.id)) fail("duplicate service id"); seen.add(service.id);
@@ -173,6 +186,7 @@ export function validateAuthoringResult(value: unknown, request?: AuthoringReque
   }
   if (request) {
     validateAuthoringRequest(request);
+    if (isBrowserRuntime(request.runtime) && mutations.length) fail("browser runtime does not support preference mutations");
     const manifest = result.screen?.files.find(f => f.path === "manifest.json");
     if (manifest) checkAuthoringManifestScreenData(manifest.content, request.context.currentScreen?.files.find(f => f.path === "manifest.json")?.content,
       canonicalJSON(request.runtime) === canonicalJSON(authoringRuntime(true)));

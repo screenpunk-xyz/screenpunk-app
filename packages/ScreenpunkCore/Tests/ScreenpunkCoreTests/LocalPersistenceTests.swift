@@ -176,4 +176,45 @@ final class LocalPersistenceTests: XCTestCase {
         XCTAssertEqual(try reopened.record(requestID: target.requestID)?.status, .cancelled)
         XCTAssertThrowsError(try reopened.update(target))
     }
+    func testConfirmedAccountRemovalPreservesOtherAccountsAndLocalProfile() throws {
+        let root = directory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let repository = try LocalProfileRepository(rootDirectory: root)
+        let local = try repository.createLocalProfile()
+        let first = try repository.activateCloudProfile(accountID: "A", profileID: "cloud-A", deviceID: "device-A")
+        let other = try repository.activateCloudProfile(accountID: "B", profileID: "cloud-B", deviceID: "device-B")
+        try repository.removeAccountProfiles(accountID: "A")
+        let restart = try LocalProfileRepository(rootDirectory: root)
+        XCTAssertNil(try restart.accountProfile(accountID: "A"))
+        XCTAssertEqual(try restart.snapshot().activeProfile, other)
+        XCTAssertTrue(try restart.snapshot().profiles.contains(local))
+        XCTAssertFalse(try restart.snapshot().profiles.contains(first))
+        try restart.removeAccountProfiles(accountID: "A")
+        XCTAssertThrowsError(try restart.removeAccountProfiles(accountID: local.libraryOwner))
+        try restart.removeAccountProfiles(accountID: "B")
+        XCTAssertNil(try restart.snapshot().activeProfile)
+        XCTAssertEqual(try restart.activateLocalProfile(), local)
+    }
+
+    func testConfirmedProfileRemovalDeletesOnlyItsDeliveryRecords() throws {
+        let root = directory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let ledger = try LocalDeliveryLedger(rootDirectory: root)
+        let target = binding()
+        var other = binding()
+        other.requestID = "other-request"
+        other.profileID = "other-profile"
+        try ledger.prepare(target)
+        var cancelled = target
+        cancelled.status = .cancelled
+        try ledger.update(cancelled)
+        try ledger.prepare(other)
+        try ledger.removeProfile(profileID: target.profileID)
+        let restart = try LocalDeliveryLedger(rootDirectory: root)
+        XCTAssertNil(try restart.record(requestID: target.requestID))
+        XCTAssertEqual(try restart.record(requestID: other.requestID), other)
+        XCTAssertThrowsError(try restart.update(target))
+        try restart.removeProfile(profileID: target.profileID)
+    }
+
 }

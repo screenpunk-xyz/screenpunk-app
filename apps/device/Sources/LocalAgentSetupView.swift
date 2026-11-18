@@ -54,6 +54,7 @@ struct DeviceAccountSettings: View {
                 }.disabled(device.routeChangeBlocked || model.testing)
                 Text(device.routeChangeBlocked ? "Finish or cancel the current request before changing agents." : "Automatic checks the paired computer first. If it is unavailable, a new request may go to your configured Cloud agent. A request keeps its chosen agent after delivery is prepared.").font(.caption).foregroundStyle(.secondary)
             }
+            DeviceAccountDeletionSection(device: device)
         }
         .sheet(item: $setup) { sheet in
             switch sheet {
@@ -340,5 +341,55 @@ private struct LocalAgentAddressRecoveryView: View {
         .interactiveDismissDisabled(model.testing)
         .onAppear { host = model.configuration?.host ?? ""; port = String(model.configuration?.sshPort ?? 22) }
         .onDisappear { discovery.stop() }
+    }
+}
+
+struct DeviceAccountDeletionSection: View {
+    @ObservedObject var device: DeviceModel
+    @State private var confirmationAccountID: String?
+
+    var body: some View {
+        if let accountID = device.accountDeletionTargetID {
+            Section {
+                if device.accountDeletionInProgress {
+                    ProgressView(device.accountDeletionStatus ?? "Deleting account…")
+                } else if device.accountDeletionNeedsRetry {
+                    Text(device.accountDeletionStatus ?? "Account deletion needs attention.")
+                        .font(.callout).foregroundStyle(.secondary)
+                    Button(device.accountDeletionRetryTitle, role: .destructive) {
+                        if device.accountDeletionRequiresConfirmation {
+                            confirmationAccountID = accountID
+                        } else {
+                            Task { await device.deleteAccount(accountID: accountID) }
+                        }
+                    }
+                } else {
+                    Button("Delete This Account", role: .destructive) { confirmationAccountID = accountID }
+                        .disabled(device.accountOperationInProgress || device.routeChangeBlocked)
+                }
+                if let failure = device.accountDeletionError {
+                    Text(failure).font(.callout).foregroundStyle(.red)
+                    if let code = device.accountDeletionDiagnosticCode {
+                        Text("Last server report: \(code)")
+                            .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                    }
+                }
+                Text("Deleting your Screenpunk account does not cancel an App Store subscription.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Link("Manage App Store Subscriptions", destination: URL(string: "https://apps.apple.com/account/subscriptions")!)
+            }
+            .alert("Delete this Screenpunk account?", isPresented: Binding(
+                get: { confirmationAccountID != nil },
+                set: { if !$0 { confirmationAccountID = nil } }
+            ), presenting: confirmationAccountID) { capturedAccountID in
+                Button("Delete", role: .destructive) {
+                    confirmationAccountID = nil
+                    Task { await device.deleteAccount(accountID: capturedAccountID, approvedAppleRevocation: true) }
+                }
+                Button("Cancel", role: .cancel) { confirmationAccountID = nil }
+            } message: { _ in
+                Text("Your account, screens and settings will be permanently deleted. This cannot be undone.\n\n\(DeviceAccountDeletionTransaction.appleAuthorizationWarning)\n\nSome security and purchase records remain to prevent old requests or purchases restoring the account. Deleting your account does not cancel an Apple subscription.")
+            }
+        }
     }
 }

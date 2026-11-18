@@ -87,9 +87,11 @@ struct DeviceRootView: View {
     @State private var onboardingHelp: OnboardingHelp?
     // The item becomes nil when dismissal starts. Wait for onDismiss before presenting again.
     @State private var onboardingHelpInFlight = false
+    @State private var pluginSetupProgress = CloudPluginSetupProgress()
     @State private var recordingBackdropScope: RecordingBackdropScope?
     @State private var dashboardSnapshot = DashboardSnapshotSource()
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.openURL) private var openURL
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var swipeID: UUID?
     @State private var swipeStartContext: SwipeContext?
@@ -169,6 +171,16 @@ struct DeviceRootView: View {
             DeviceSettingsView(model: model, display: display)
                 .onAppear { settingsCoverPresented = true }
         }
+        .alert("Screenpunk account deleted", isPresented: Binding(
+            get: { model.deletedAccountAppleHelpURL != nil },
+            set: { if !$0 { model.deletedAccountAppleHelpURL = nil } }
+        ), presenting: model.deletedAccountAppleHelpURL) { url in
+            Button("Manage Apple Access") { openURL(url); model.deletedAccountAppleHelpURL = nil }
+            Button("Done", role: .cancel) { model.deletedAccountAppleHelpURL = nil }
+        } message: { _ in
+            Text("You can also manage Screenpunk’s Apple sign-in access in your Apple Account settings.")
+        }
+        .modifier(AccountCreationAlert(model: model, isHost: !model.settingsOpen))
         .sheet(item: $onboardingHelp, onDismiss: {
             onboardingHelpInFlight = false
             advanceOnboarding()
@@ -205,7 +217,18 @@ struct DeviceRootView: View {
         } message: { _ in
             Text("Weather starts in Ann Arbor. Choose a U.S. location, or keep it for now. Use my location asks permission for a single lookup; it does not track you.")
         }
-        .onAppear(perform: advanceOnboarding)
+        .onAppear { updatePluginSetupProgress(); advanceOnboarding() }
+        .onChange(of: pluginSetupInput) { _ in updatePluginSetupProgress() }
+        .task(id: pluginSetupProgress.wakeDeadline) {
+            guard let deadline = pluginSetupProgress.wakeDeadline else { return }
+            let scope = pluginSetupProgress.scope
+            do {
+                try await Task.sleep(nanoseconds: UInt64(max(0, deadline.timeIntervalSinceNow) * 1_000_000_000))
+            } catch { return }
+            guard !Task.isCancelled, pluginSetupProgress.scope == scope,
+                  pluginSetupProgress.wakeDeadline == deadline else { return }
+            updatePluginSetupProgress()
+        }
         .onChange(of: onboardingHelpContext) { _ in advanceOnboarding() }
         .onChange(of: model.canFinishAgentSetup) { _ in advanceOnboarding() }
         .onChange(of: model.galleryIntroOwner) { _ in advanceOnboarding() }
@@ -259,12 +282,34 @@ struct DeviceRootView: View {
 
     private var onboardingHelpContext: OnboardingHelpContext? {
         guard showsCloudOnboarding, !model.accountOperationInProgress else { return nil }
-        let stage: CloudSetupStage = model.showsCloudPluginConnection ? .plugin : .listener
+        let stage: CloudSetupStage = showsPluginInstructions ? .plugin : .listener
         return OnboardingHelpContext(
             identity: AgentPluginIdentity(origin: CloudClient.originScope.canonicalOrigin,
                                           account: model.cloud.localAccountID, owner: model.permissionOwner),
             stage: stage
         )
+    }
+
+    private var pluginSetupInput: CloudPluginSetupProgress.Input {
+        let session = model.cloud.session
+        let eligible = !model.accountOperationInProgress && model.needsAgentSetup &&
+            (showsCloudOnboarding || model.canFinishAgentSetup)
+        let scope: CloudPluginSetupProgress.Scope?
+        if eligible, let account = model.cloud.localAccountID, let session {
+            scope = .init(origin: CloudClient.originScope.canonicalOrigin, account: account,
+                          device: session.deviceId, owner: model.permissionOwner)
+        } else { scope = nil }
+        return .init(scope: scope, pluginConnected: model.onboardingCloudPluginConnected,
+                     listenerReady: model.canFinishAgentSetup)
+    }
+
+    private func updatePluginSetupProgress() {
+        pluginSetupProgress.update(pluginSetupInput, now: Date())
+        advanceOnboarding()
+    }
+
+    private var showsPluginInstructions: Bool {
+        pluginSetupProgress.presentsPluginInstructions(for: pluginSetupInput)
     }
 
     private func openOnboardingHelp(_ stage: CloudSetupStage) {
@@ -447,7 +492,9 @@ struct DeviceRootView: View {
     }
 
     @ViewBuilder private var screenContent: some View {
-        if let screen = model.screen, let assets = model.assets {
+        if model.requiresAccountOnboarding {
+            OnboardingAgentConnection(model: model)
+        } else if let screen = model.screen, let assets = model.assets {
             // The isolated WebView coordinator owns an immutable package and bridge scope.
             // A new local revision must create a new renderer, including on rollback/swipe.
             let rendererID = screen.revision + model.publicReadSessionKey + model.screenDataRendererKey
@@ -466,7 +513,7 @@ struct DeviceRootView: View {
                     model.settingsPage = .screens
                     model.settingsOpen = true
                 }
-        } else if model.showsCloudPluginConnection {
+        } else if showsCloudOnboarding && showsPluginInstructions {
             let scope = CloudClient.originScope
             OnboardingAgentPlugin { openOnboardingHelp(.plugin) }
                 .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -475,7 +522,8 @@ struct DeviceRootView: View {
                             if speech.error != nil || model.presentedStatusMessage != nil {
                                 RequestStatusPill(model: model, speechError: speech.error, maximumTextHeight: 160)
                             } else {
-                                PluginConnectionStatusPill(connected: model.onboardingCloudPluginConnected)
+                                PluginConnectionStatusPill(connected: model.onboardingCloudPluginConnected,
+                                                          lookingForListener: pluginSetupProgress.phase == .looking)
                             }
                         }
                         .padding(24)
@@ -483,7 +531,7 @@ struct DeviceRootView: View {
                     }
                 }
                 .id(AgentPluginIdentity(origin: scope.canonicalOrigin, account: model.cloud.localAccountID, owner: model.permissionOwner))
-        } else if model.showsCloudListenerSetup {
+        } else if showsCloudOnboarding {
             let scope = CloudClient.originScope
             CloudListenerSetupView(scope: scope, email: model.email, isPlaceholder: true)
                 .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -501,12 +549,7 @@ struct DeviceRootView: View {
                 }
                 .id(AgentPluginIdentity(origin: scope.canonicalOrigin, account: model.cloud.localAccountID, owner: model.permissionOwner))
         } else if model.needsAgentSetup {
-            OnboardingAgentConnection(isSigningIn: model.accountOperationInProgress) {
-                Task { await model.signIn(fromCloudOnboarding: true) }
-            } openSettings: {
-                model.settingsPage = .account
-                model.settingsOpen = true
-            }
+            OnboardingAgentConnection(model: model)
         } else {
             CreationPlaceholder(
                 canHide: model.canHideInstructions && !model.hiddenScreenIDs.contains(ScreenLibrary.instructionsID),
@@ -558,75 +601,104 @@ private struct CenteredOnboardingPage<Content: View>: View {
 }
 
 private struct OnboardingAgentConnection: View {
-    let isSigningIn: Bool
-    let signIn: () -> Void
-    let openSettings: () -> Void
-    @State private var showsDetails = false
+    @ObservedObject var model: DeviceModel
+    var body: some View { accountOnboarding }
+    @ScaledMetric(relativeTo: .body) private var signInScale = 1.0
 
-    private let title = "Connect an agent"
-    private let caption = "Screenpunk works with your AI agent to create screens."
-    private let detail = "Sign in to connect a cloud agent, or configure a local agent in settings."
-
-    var body: some View {
-        CenteredOnboardingPage {
-            ViewThatFits(in: .vertical) {
-                VStack(spacing: 16) {
-                    OnboardingTypography.wordmark
-                    Text(title).font(OnboardingTypography.title).accessibilityAddTraits(.isHeader)
-                    descriptions
-                    VStack(spacing: 24) {
-                        signInButton
-                        settingsButton
-                    }
-                    .padding(.top, 16)
-                }
-                VStack(spacing: 6) {
-                    Text(title).font(OnboardingTypography.compactTitle).accessibilityAddTraits(.isHeader)
-                    descriptions
-                    VStack(spacing: 16) {
-                        signInButton
-                        settingsButton
-                    }
-                    .padding(.top, 8)
-                }
-                VStack(spacing: 4) {
-                    Text(title).font(OnboardingTypography.condensedTitle).accessibilityAddTraits(.isHeader)
-                    signInButton
-                        .padding(.bottom, 8)
-                    HStack {
-                        settingsButton
-                        Button("How to") { showsDetails = true }.buttonStyle(.bordered)
-                    }
-                }
+    private var accountOnboarding: some View {
+        let secondaryText = Color(red: 175/255, green: 186/255, blue: 194/255)
+        let signIn = VStack(spacing: 24) {
+            onboardingArtwork("screenpunk-lockup.png")
+                .resizable().scaledToFit().frame(maxWidth: 340)
+                .accessibilityLabel("Screenpunk")
+            Text("To start making your own screens on this device,\nsign in or create an account.")
+                .font(.title3).foregroundStyle(secondaryText)
+            VStack(spacing: 12) {
+                providerButton("Continue with Apple", provider: .apple)
+                providerButton("Continue with Google", provider: .google)
             }
-            .multilineTextAlignment(.center)
+            .frame(maxWidth: min(660, 360 * signInScale))
         }
-        .alert(title, isPresented: $showsDetails) {
-            Button("Done", role: .cancel) {}
-        } message: {
-            Text(caption + "\n\n" + detail)
-        }
-    }
+        .multilineTextAlignment(.center)
+        .frame(maxWidth: 660)
+        .padding(32)
+        .fixedSize(horizontal: false, vertical: true)
 
-    private var descriptions: some View {
-        VStack(spacing: 4) {
-            Text(caption)
-            Text(detail)
-        }
-        .font(OnboardingTypography.caption)
-        .foregroundStyle(.secondary)
-    }
-
-    private var signInButton: some View {
-        Button("Continue with Screenpunk Cloud", action: signIn)
-            .buttonStyle(.borderedProminent)
-            .disabled(isSigningIn)
-    }
-
-    private var settingsButton: some View {
-        Button("Open Settings", action: openSettings)
+        let localSetup = VStack(spacing: 16) {
+            Text("Alternatively, advanced users can use Screenpunk without an account by connecting to their agent locally using Codex server in Settings.")
+                .font(.callout).foregroundStyle(secondaryText)
+            Button("Open Settings") {
+                model.settingsPage = .account
+                model.settingsOpen = true
+            }
             .buttonStyle(.bordered)
+        }
+        .multilineTextAlignment(.center)
+        .padding(24)
+        .frame(maxWidth: 660)
+        .background(Color(red: 32/255, green: 39/255, blue: 44/255), in: RoundedRectangle(cornerRadius: 20))
+        .padding(24)
+        .fixedSize(horizontal: false, vertical: true)
+
+        return ViewThatFits(in: .vertical) {
+            VStack(spacing: 0) {
+                signIn.frame(maxWidth: .infinity, maxHeight: .infinity)
+                localSetup
+            }
+            ScrollView {
+                VStack(spacing: 0) {
+                    signIn
+                    localSetup
+                }
+                .frame(maxWidth: .infinity)
+            }
+        }
+        .background(Color(red: 21/255, green: 25/255, blue: 28/255).ignoresSafeArea())
     }
+
+    private func onboardingArtwork(_ filename: String) -> Image {
+        let path = Bundle.main.path(forResource: filename, ofType: nil, inDirectory: "OnboardingAssets")
+        return Image(uiImage: path.flatMap(UIImage.init(contentsOfFile:)) ?? UIImage())
+    }
+
+    private func providerButton(_ title: String, provider: CloudSignInProvider) -> some View {
+        let isApple = provider == .apple
+        let height = 56 * signInScale
+        let foreground = isApple ? Color.white : Color(white: 227/255)
+        let fill = Color(red: 19/255, green: 19/255, blue: 20/255)
+        let shape = RoundedRectangle(cornerRadius: 16)
+        return Button {
+            Task { await model.signIn(provider: provider, fromCloudOnboarding: true) }
+        } label: {
+            HStack(spacing: (isApple ? 5 : 15) * signInScale) {
+                if isApple {
+                    onboardingArtwork("apple-sign-in-white.png")
+                        .resizable().scaledToFit().frame(width: height * 39 / 44, height: height)
+                        .blendMode(.screen)
+                        .accessibilityHidden(true)
+                } else {
+                    onboardingArtwork("google-g.png")
+                        .resizable().scaledToFit().frame(width: 25.5 * signInScale, height: 25.5 * signInScale)
+                        .accessibilityHidden(true)
+                }
+                Text(title)
+                    .font(.custom("GoogleSans-Medium", fixedSize: 18 * signInScale))
+                    .foregroundStyle(foreground)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, max(0, (signInScale - 1) * 6))
+            .frame(maxWidth: .infinity, minHeight: height)
+            .background(fill, in: shape)
+            .overlay(shape.strokeBorder(Color(red: 99/255, green: 111/255, blue: 119/255), lineWidth: 1))
+            .contentShape(shape)
+        }
+        .buttonStyle(.plain)
+        .disabled(model.accountOperationInProgress || model.routeChangeBlocked)
+        .accessibilityIdentifier("onboarding.signIn.\(provider.rawValue)")
+    }
+
 }
 
 private struct AgentPluginIdentity: Hashable {
@@ -810,20 +882,11 @@ struct CloudListenerSetupView: View {
     private let listenerTitle = "Activate the listener"
     private let listenerCaption = "Open a new task in ChatGPT or your Dot, and send this prompt to activate its Screenpunk listener."
 
-    private var pluginName: String { scope.permitsLegacyMigration ? "Screenpunk Staging" : "Screenpunk Production" }
-
-    private var pluginURL: URL? {
-        switch scope.canonicalOrigin {
-        case "https://staging.screenpunk.xyz": return URL(string: "https://chatgpt.com/plugins/plugin_asdk_app_6ad8cebcf03481918fa9078644568bee")
-        case "https://api.screenpunk.xyz": return URL(string: "https://chatgpt.com/plugins/plugin_asdk_app_6ae3926704588191b0eee33944373ddc")
-        default: return nil
-        }
-    }
+    private var pluginName: String { scope.permitsLegacyMigration ? "Screenpunk Staging" : "Screenpunk" }
 
     private var setupRequest: String {
-        let account = email.map { "Confirm you’re connected as \($0). Stop if the account differs." }
-            ?? "Confirm your Screenpunk account matches my iPad."
-        return "Use @\(pluginName). \(account) Subscribe to screenpunk.request.created, keep listening, and handle my device requests. Confirm when the subscription is active. If subscriptions aren’t available, tell me to use Work + Cloud or a dot."
+        let account = "Use the same Screenpunk account and sign-in option as my iPad. If it uses Apple, use the same Apple ID; relay or display email differences alone do not mean a different account. Stop if a different Screenpunk account is connected."
+        return "Use @\(pluginName) in the same Screenpunk environment as my iPad. \(account) Subscribe to screenpunk.request.created, keep listening, and handle my device requests. Confirm when the subscription is active. If subscriptions aren’t available, tell me to use Work + Cloud or a dot."
     }
 
     var body: some View {
@@ -897,12 +960,11 @@ struct CloudListenerSetupView: View {
                 OnboardingTypography.wordmark
                 Text(stage.sheetTitle).font(OnboardingTypography.title).accessibilityAddTraits(.isHeader)
                 if stage != .listener {
-                    step(1, "Open the plugin in ChatGPT", "Open the Screenpunk plugin using your invited ChatGPT account.")
-                    pluginButton
-                    step(2, "Connect your Screenpunk account", email.map { "Choose Connect, then sign in as \($0) using the same sign-in option you used on this device." } ?? "Choose Connect, then use the same account and sign-in option as this device.")
+                    step(1, "Install the Screenpunk plugin in ChatGPT", "Open ChatGPT Plugins, search for Screenpunk, and install the plugin.")
+                    step(2, "Connect your Screenpunk account", "Choose Connect, then use the same sign-in option you used on this device.")
                 }
                 if stage == .plugin {
-                    step(3, "Return to Screenpunk", "The app will advance to listener setup once it sees the connection.")
+                    step(3, "Set up the Screenpunk plugin", "After connecting your Screenpunk account, click Set up Screenpunk in ChatGPT.")
                 } else {
                     step(stage == .listener ? 1 : 3, "Open a persistent ChatGPT session", "Open Work → Cloud or your dot and select @\(pluginName).")
                     step(stage == .listener ? 2 : 4, "Send the listener request", "Copy the request below, paste it into the session, and send it.")
@@ -918,15 +980,6 @@ struct CloudListenerSetupView: View {
 
     private func heading(_ font: Font) -> some View {
         Text(listenerTitle).font(font).accessibilityAddTraits(.isHeader)
-    }
-
-    @ViewBuilder private var pluginButton: some View {
-        if let pluginURL {
-            Link("Open \(pluginName) in ChatGPT", destination: pluginURL)
-                .buttonStyle(.borderedProminent)
-        } else {
-            Text("Use the plugin link from your Screenpunk provider.").font(.callout)
-        }
     }
 
     private var copyButton: some View {
@@ -1134,6 +1187,7 @@ struct DeviceSettingsView: View {
             }
         }
         .navigationSplitViewStyle(.balanced)
+        .modifier(AccountCreationAlert(model: model, isHost: model.settingsOpen))
         .modifier(ScreenDataConsentAlert(model: model, isHost: model.settingsOpen && sheet == nil && screenToRemove == nil))
         .modifier(BackupUpgradeAlert(model: model, billing: model.billing,
                                      isHost: model.settingsOpen && sheet == nil && screenToRemove == nil))
@@ -1210,6 +1264,7 @@ struct DeviceSettingsView: View {
                     DeviceCloudAccountSection(device: model, showListenerSetup: { sheet = .cloudListener })
                     DeviceBillingSection(device: model)
                     Section("Local agent") { Text("Local agent storage could not be opened.") }
+                    DeviceAccountDeletionSection(device: model)
                 }
             }
         case .screenData:
@@ -1300,6 +1355,30 @@ struct DeviceSettingsView: View {
         }
     }
 
+}
+
+private struct AccountCreationAlert: ViewModifier {
+    @ObservedObject var model: DeviceModel
+    let isHost: Bool
+    func body(content: Content) -> some View {
+        content.confirmationDialog("Continue to Screenpunk", isPresented: Binding(
+            get: { isHost && model.choosingSignInProvider },
+            set: { if isHost { model.choosingSignInProvider = $0 } }
+        ), titleVisibility: .visible) {
+            Button("Continue with Apple") { Task { await model.signIn(provider: .apple) } }
+            Button("Continue with Google") { Task { await model.signIn(provider: .google) } }
+            Button("Cancel", role: .cancel) { model.choosingSignInProvider = false }
+        }
+        .alert("Create a new Screenpunk account?", isPresented: Binding(
+            get: { isHost && model.accountCreationEmail != nil },
+            set: { _ in }
+        )) {
+            Button("Create New Account") { model.resolveAccountCreation(true) }
+            Button("Cancel", role: .cancel) { model.resolveAccountCreation(false) }
+        } message: {
+            Text("Create a new Screenpunk account with \(model.accountCreationEmail ?? "this Apple Account")?")
+        }
+    }
 }
 
 private struct BackupUpgradeAlert: ViewModifier {
@@ -1422,8 +1501,10 @@ private struct ListenerConnectionStatusPill: View {
 
 private struct PluginConnectionStatusPill: View {
     let connected: Bool?
+    var lookingForListener = false
     private var caption: String {
-        connected == false ? "Waiting for plugin connection…" : "Checking plugin connection…"
+        if lookingForListener { return "Looking for ChatGPT plugin listener…" }
+        return connected == false ? "Waiting for plugin connection…" : "Checking plugin connection…"
     }
 
     var body: some View {
@@ -1448,7 +1529,9 @@ private struct RequestStatusPill: View {
         let message = model.presentedStatusMessage
         let dismissible = speechError == nil && model.canDismissStatusMessage
         VStack(spacing: 12) {
-            if !model.accountOperationInProgress && (model.requestPending || model.busy) {
+            if let accountStatus = model.accountStatusCaption {
+                ShimmeringStatusCaption(caption: accountStatus)
+            } else if !model.accountOperationInProgress && (model.requestPending || model.busy) {
                 if let agent = model.resolvedAgentName { Text(agent).font(.caption).foregroundStyle(.secondary) }
                 ShimmeringStatusCaption(caption: model.takingLonger ? "Taking longer than expected" : model.progressCaption)
                 HStack(spacing: 20) {

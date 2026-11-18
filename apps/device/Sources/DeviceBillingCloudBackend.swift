@@ -62,6 +62,10 @@ struct DeviceBillingBackend {
         }
     }
 
+    func removeDeletedAccount(origin: String, accountID: String, activeOwner: String?) {
+        journal.removeAccount(origin: origin, accountID: accountID, activeOwner: activeOwner)
+    }
+
     func tracks(owner: String, transactionID: String, operationID: String? = nil) -> Bool {
         journal.contains(owner: owner, transactionID: transactionID, operationID: operationID)
     }

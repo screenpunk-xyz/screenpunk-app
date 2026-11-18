@@ -9,6 +9,11 @@ import ScreenpunkCore
     enum Onboarding: String, Codable {
         case connectAgent, gallery, complete
 
+        /// Old guide completion is not proof that a signed-out device has an agent.
+        static func requiresAccountSignIn(hasCloudSession: Bool, localAgent: LocalAgentConfiguration?) -> Bool {
+            !hasCloudSession && localAgent?.lastSuccessfulConnectionAt == nil
+        }
+
         static func agentIsReady(route: AuthoringRoutePreference, verifiedLocal: Bool, cloudListenerConnected: Bool) -> Bool {
             switch route {
             case .local: return verifiedLocal
@@ -130,6 +135,19 @@ import ScreenpunkCore
         catch let error as CocoaError where error.code == .fileNoSuchFile || error.code == .fileReadNoSuchFile {}
     }
 
+    /// Read the committed manifest identities without opening or modifying another profile's library.
+    static func dashboardIDs(profile: LocalProfileDescriptor) throws -> Set<String> {
+        let root = try directory(for: profile.libraryOwner)
+        let file = root.appendingPathComponent("library.json")
+        guard FileManager.default.fileExists(atPath: file.path) else { return [] }
+        let state = try decodeState(Data(contentsOf: file))
+        let screens = state.screens + (state.previous.map { [$0] } ?? [])
+        return try Set(screens.compactMap { screen in
+            guard let manifest = screen.artifact.files.first(where: { $0.path == "manifest.json" }) else { return nil }
+            return try JSONDecoder().decode(DashboardManifest.self, from: Data(manifest.content.utf8)).dashboardId
+        })
+    }
+
     static func deleteAccountScreens(accountID: String, profile: LocalProfileDescriptor?, librariesDirectory: URL? = nil, approvalDefaults: UserDefaults = .standard) throws {
         let owner = profile?.libraryOwner ?? accountID
         guard !accountID.isEmpty, !accountID.hasPrefix("local:"), !owner.isEmpty,
@@ -221,6 +239,10 @@ import ScreenpunkCore
     var selected: Saved? {
         guard !needsAgentSetup || hasTemporaryScreen else { return nil }
         return state.screens.first { $0.id == state.selectedID }
+    }
+
+    func selectedForPresentation(hasCloudSession: Bool, localAgent: LocalAgentConfiguration?) -> Saved? {
+        Onboarding.requiresAccountSignIn(hasCloudSession: hasCloudSession, localAgent: localAgent) ? nil : selected
     }
 
     func finishAgentSetup() throws {

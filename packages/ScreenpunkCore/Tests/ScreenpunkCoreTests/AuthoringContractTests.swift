@@ -2,6 +2,52 @@ import XCTest
 @testable import ScreenpunkCore
 
 final class AuthoringContractTests: XCTestCase {
+    func testCanonicalBrowserProfileSealsWithoutChangingNativeSnapshot() throws {
+        let f = try fixtures()
+        let native = try AuthoringContract.validateRequest(data(f["request"]!))
+        var browser = native
+        browser.runtime = AuthoringContract.browserRuntime
+        browser.designGuidance = AuthoringContract.browserDesignGuidance
+        browser.services = []
+        browser.preferences = []
+        browser = try AuthoringContract.seal(browser)
+        XCTAssertEqual(try AuthoringContract.validateRequest(JSONEncoder().encode(browser)), browser)
+        XCTAssertEqual(browser.runtime.features, ["html", "css", "javascript", "bundled-classic-scripts", "bundled-local-assets"])
+        XCTAssertEqual(browser.runtime.limits, native.runtime.limits)
+        XCTAssertEqual(try AuthoringContract.seal(native), native)
+        XCTAssertNotEqual(browser.delivery.snapshotDigest, native.delivery.snapshotDigest)
+        var result = try JSONDecoder().decode(AuthoringResultV1.self, from: data(f["preferenceResult"]!))
+        result.inputDigest = browser.delivery.snapshotDigest
+        result.preferenceRevisions = [:]
+        XCTAssertThrowsError(try AuthoringContract.validateResult(JSONEncoder().encode(result), request: browser))
+        result.preferenceMutations = []
+        result.screen = nil
+        result.answer = "Browser result"
+        XCTAssertNoThrow(try AuthoringContract.validateResult(JSONEncoder().encode(result), request: browser))
+    }
+
+    func testBrowserRejectsMixedGuidanceNativeFeaturesServicesAndPreferences() throws {
+        let f = try fixtures()
+        let native = try AuthoringContract.validateRequest(data(f["request"]!))
+        var browser = native
+        browser.runtime = AuthoringContract.browserRuntime
+        browser.designGuidance = AuthoringContract.browserDesignGuidance
+        browser.services = []
+        browser.preferences = []
+        var mixed = browser
+        mixed.designGuidance = native.designGuidance
+        XCTAssertThrowsError(try AuthoringContract.seal(mixed))
+        mixed = browser
+        mixed.runtime.features.append("runtime.ready")
+        XCTAssertThrowsError(try AuthoringContract.seal(mixed))
+        mixed = browser
+        mixed.services = native.services
+        XCTAssertThrowsError(try AuthoringContract.seal(mixed))
+        mixed = browser
+        mixed.preferences = native.preferences
+        XCTAssertThrowsError(try AuthoringContract.seal(mixed))
+    }
+
     func testCalendarConfigurationFactsRoundTripThroughLocalAndCloudEdits() throws {
         let f = try fixtures()
         let original = try AuthoringContract.validateRequest(data(f["request"]!))

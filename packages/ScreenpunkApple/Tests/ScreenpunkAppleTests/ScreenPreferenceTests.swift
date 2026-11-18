@@ -98,4 +98,18 @@ final class ScreenPreferenceTests: XCTestCase {
         withExtendedLifetime([bridgeOne, bridgeTwo, bridgeOther]) {}
     }
     #endif
+    @MainActor func testAccountExclusiveDashboardRemovalPreservesOtherDashboardStateAndRejectsLateWrites() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ScreenPreferenceStore(root: root)
+        let oldLease = try store.generation()
+        try store.set(dashboard: "deleted-dashboard", key: "value", value: "remove", generation: oldLease)
+        try store.set(dashboard: "retained-dashboard", key: "value", value: "keep", generation: oldLease)
+        try store.remove(dashboardIDs: ["deleted-dashboard"])
+        XCTAssertThrowsError(try store.set(dashboard: "deleted-dashboard", key: "value", value: "late", generation: oldLease))
+        let freshLease = try store.generation()
+        XCTAssertTrue(try store.get(dashboard: "deleted-dashboard", key: "value", generation: freshLease) is NSNull)
+        XCTAssertEqual(try store.get(dashboard: "retained-dashboard", key: "value", generation: freshLease) as? String, "keep")
+    }
+
 }
