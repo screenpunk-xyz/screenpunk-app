@@ -1,4 +1,5 @@
 import Foundation
+import ScreenpunkCore
 import XCTest
 @testable import DeviceAuthoring
 
@@ -9,6 +10,45 @@ final class DeviceAccountDeletionTests: XCTestCase {
         value.appleRevocationConsent = "REVOKE"
         return value
     }
+    @MainActor func testSignedOutAfterDeletionGatesExistingCompletedLocalLibraryWithoutChangingScreens() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = try ScreenLibrary(accountID: "local", rootDirectory: root, onboardNewLibrary: true)
+        try library.finishAgentSetup()
+        try library.dismissGalleryIntro()
+        for id in ["weather", "nasa"] {
+            try library.install(.init(title: id, files: [.init(path: "index.html", content: "<html>demo</html>")]), requestID: UUID().uuidString, replacing: id)
+        }
+        XCTAssertEqual(library.state.onboarding, .complete)
+        let selectedID = library.selected?.id
+        XCTAssertNotNil(library.selectedForPresentation(hasCloudSession: true, localAgent: nil))
+        let reopened = try ScreenLibrary(accountID: "local", rootDirectory: root, onboardNewLibrary: true)
+        XCTAssertTrue(ScreenLibrary.Onboarding.requiresAccountSignIn(hasCloudSession: false, localAgent: nil))
+        XCTAssertNil(reopened.selectedForPresentation(hasCloudSession: false, localAgent: nil))
+        XCTAssertEqual(reopened.selected?.id, selectedID)
+        XCTAssertEqual(reopened.state.screens.count, 2)
+        XCTAssertEqual(reopened.state.onboarding, .complete)
+    }
+
+    @MainActor func testVerifiedLocalCodexSetupRemainsAvailableWithoutCloudAccount() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = try ScreenLibrary(accountID: "local", rootDirectory: root)
+        try library.install(.init(title: "Local screen", files: [.init(path: "index.html", content: "<html>local</html>")]), requestID: "local-request", replacing: "local-screen")
+        let configured = LocalAgentConfiguration(host: "synthetic.local", username: "fixture", hostKeySHA256: "fixture-key",
+            macWorkspace: "/fixture", credentialReference: "synthetic-reference", lastSuccessfulConnectionAt: 1000)
+        XCTAssertFalse(ScreenLibrary.Onboarding.requiresAccountSignIn(hasCloudSession: false, localAgent: configured))
+        XCTAssertEqual(library.selectedForPresentation(hasCloudSession: false, localAgent: configured)?.id, "local-screen")
+    }
+
+    func testUnverifiedLocalPlaceholderDoesNotBypassOAuthAndSignedInFlowIsUnchanged() {
+        let placeholder = LocalAgentConfiguration(host: "synthetic.local", username: "fixture", hostKeySHA256: "fixture-key",
+            macWorkspace: "/fixture", credentialReference: "synthetic-reference")
+        XCTAssertTrue(ScreenLibrary.Onboarding.requiresAccountSignIn(hasCloudSession: false, localAgent: placeholder))
+        XCTAssertFalse(ScreenLibrary.Onboarding.requiresAccountSignIn(hasCloudSession: true, localAgent: nil))
+        XCTAssertFalse(ScreenLibrary.Onboarding.requiresAccountSignIn(hasCloudSession: true, localAgent: placeholder))
+    }
+
     private enum Failure: Error { case interrupted }
 
     @MainActor func testSafeServerDiagnosticSurvivesRestartWithoutRetryOrTokenExposure() async throws {

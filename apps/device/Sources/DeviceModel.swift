@@ -185,7 +185,10 @@ import ScreenpunkLocalTransport
     private var shouldRestartGuideForTesting = ProcessInfo.processInfo.arguments.contains("--screenpunk-test-restart-guide")
     #endif
     @Published private(set) var onboarding: ScreenLibrary.Onboarding?
-    var needsAgentSetup: Bool { onboarding == .connectAgent }
+    var requiresAccountOnboarding: Bool {
+        ScreenLibrary.Onboarding.requiresAccountSignIn(hasCloudSession: cloud.session != nil, localAgent: localAgent)
+    }
+    var needsAgentSetup: Bool { requiresAccountOnboarding || onboarding == .connectAgent }
     private var onboardingCloudListenerReady: Bool {
         cloudBindingMatches && cloudListenerStatus == .connected &&
             cloudListenerObservation?.canCompleteCloudSetup == true &&
@@ -1961,7 +1964,7 @@ import ScreenpunkLocalTransport
             let vault = HomeAssistantDeviceVault()
             for installed in installedManifests { _ = vault.synchronize(manifest: installed, owner: owner) }
         }
-        screen = library?.selected; canRollback = library?.state.previous != nil
+        screen = library?.selectedForPresentation(hasCloudSession: cloud.session != nil, localAgent: localAgent); canRollback = library?.state.previous != nil
         do {
             assets = try screen.flatMap { try library?.store(for: $0) }
             if let data = assets?.assets["manifest.json"]?.data,

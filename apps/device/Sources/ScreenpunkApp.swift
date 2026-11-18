@@ -458,7 +458,9 @@ struct DeviceRootView: View {
     }
 
     @ViewBuilder private var screenContent: some View {
-        if let screen = model.screen, let assets = model.assets {
+        if model.requiresAccountOnboarding {
+            OnboardingAgentConnection(model: model)
+        } else if let screen = model.screen, let assets = model.assets {
             // The isolated WebView coordinator owns an immutable package and bridge scope.
             // A new local revision must create a new renderer, including on rollback/swipe.
             let rendererID = screen.revision + model.publicReadSessionKey + model.screenDataRendererKey

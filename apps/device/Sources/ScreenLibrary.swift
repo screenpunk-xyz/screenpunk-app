@@ -9,6 +9,11 @@ import ScreenpunkCore
     enum Onboarding: String, Codable {
         case connectAgent, gallery, complete
 
+        /// Old guide completion is not proof that a signed-out device has an agent.
+        static func requiresAccountSignIn(hasCloudSession: Bool, localAgent: LocalAgentConfiguration?) -> Bool {
+            !hasCloudSession && localAgent?.lastSuccessfulConnectionAt == nil
+        }
+
         static func agentIsReady(route: AuthoringRoutePreference, verifiedLocal: Bool, cloudListenerConnected: Bool) -> Bool {
             switch route {
             case .local: return verifiedLocal
@@ -234,6 +239,10 @@ import ScreenpunkCore
     var selected: Saved? {
         guard !needsAgentSetup || hasTemporaryScreen else { return nil }
         return state.screens.first { $0.id == state.selectedID }
+    }
+
+    func selectedForPresentation(hasCloudSession: Bool, localAgent: LocalAgentConfiguration?) -> Saved? {
+        Onboarding.requiresAccountSignIn(hasCloudSession: hasCloudSession, localAgent: localAgent) ? nil : selected
     }
 
     func finishAgentSetup() throws {
