@@ -933,7 +933,7 @@ struct CloudListenerSetupView: View {
                 OnboardingTypography.wordmark
                 Text(stage.sheetTitle).font(OnboardingTypography.title).accessibilityAddTraits(.isHeader)
                 if stage != .listener {
-                    step(1, "Open the plugin in ChatGPT", "Open the Screenpunk plugin using your invited ChatGPT account.")
+                    step(1, "Open ChatGPT Plugins and search for Screenpunk.")
                     pluginButton
                     step(2, "Connect your Screenpunk account", "Choose Connect, then use the same sign-in option you used on this device.\n\nApple: Use the same Apple ID to sign in.\nGoogle: Use the same Google account.\n\nIf Screenpunk shows a different account, choose Use another account. This signs in to Screenpunk; your ChatGPT account can use any sign-in method.")
                 }
@@ -973,14 +973,16 @@ struct CloudListenerSetupView: View {
         .buttonStyle(.borderedProminent)
     }
 
-    private func step(_ number: Int, _ title: String, _ detail: String) -> some View {
+    private func step(_ number: Int, _ title: String, _ detail: String = "") -> some View {
         HStack(alignment: .top, spacing: 14) {
             Text(String(number)).font(.headline).foregroundStyle(.orange)
                 .padding(8).background(.orange.opacity(0.15), in: Circle())
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 5) {
                 Text(title).font(.headline).accessibilityAddTraits(.isHeader)
-                Text(detail).font(OnboardingTypography.caption).foregroundStyle(.secondary)
+                if !detail.isEmpty {
+                    Text(detail).font(OnboardingTypography.caption).foregroundStyle(.secondary)
+                }
             }
         }
     }
