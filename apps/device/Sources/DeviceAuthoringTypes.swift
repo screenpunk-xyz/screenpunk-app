@@ -100,6 +100,62 @@ struct CloudListenerObservations {
     }
 }
 
+/// Presentation timing only: authenticated server observations still decide
+/// connection and readiness. A grace expiry offers help, never installation failure.
+struct CloudPluginSetupProgress: Equatable {
+    struct Scope: Equatable {
+        let origin: String
+        let account: String
+        let device: String
+        let owner: String
+    }
+    struct Input: Equatable {
+        let scope: Scope?
+        let pluginConnected: Bool?
+        let listenerReady: Bool
+    }
+    enum Phase: Equatable { case plugin, looking, manualListener, ready }
+    private(set) var phase: Phase = .plugin
+    private(set) var scope: Scope?
+    private(set) var firstConnectionDeadline: Date?
+    var wakeDeadline: Date? { phase == .looking ? firstConnectionDeadline : nil }
+
+    func presentsPluginInstructions(for input: Input) -> Bool {
+        guard input.scope != nil, !input.listenerReady else { return false }
+        // The first connected render must retain the existing instructions,
+        // even before SwiftUI's observation callback starts the grace clock.
+        if scope == input.scope, firstConnectionDeadline != nil, input.pluginConnected != false {
+            return phase != .manualListener
+        }
+        return true
+    }
+
+    mutating func update(_ input: Input, now: Date) {
+        if input.scope != scope {
+            scope = input.scope
+            firstConnectionDeadline = nil
+        }
+        guard scope != nil else {
+            phase = .plugin
+            firstConnectionDeadline = nil
+            return
+        }
+        if input.listenerReady { phase = .ready; return }
+        // Explicit revocation ends this connection generation. Unknown reads
+        // preserve its clock; repeated connected reads never restart it.
+        if input.pluginConnected == false {
+            phase = .plugin
+            firstConnectionDeadline = nil
+            return
+        }
+        if input.pluginConnected == true, firstConnectionDeadline == nil {
+            firstConnectionDeadline = now.addingTimeInterval(30)
+        }
+        guard let deadline = firstConnectionDeadline else { phase = .plugin; return }
+        phase = now < deadline ? .looking : .manualListener
+    }
+}
+
 /// Socket messages are invalidations only. Unknown or incomplete frames cannot
 /// wake an account sync, and durable values always come from authenticated HTTP.
 enum DeviceCloudNotice: Equatable {

@@ -87,6 +87,7 @@ struct DeviceRootView: View {
     @State private var onboardingHelp: OnboardingHelp?
     // The item becomes nil when dismissal starts. Wait for onDismiss before presenting again.
     @State private var onboardingHelpInFlight = false
+    @State private var pluginSetupProgress = CloudPluginSetupProgress()
     @State private var recordingBackdropScope: RecordingBackdropScope?
     @State private var dashboardSnapshot = DashboardSnapshotSource()
     @Environment(\.scenePhase) private var scenePhase
@@ -216,7 +217,18 @@ struct DeviceRootView: View {
         } message: { _ in
             Text("Weather starts in Ann Arbor. Choose a U.S. location, or keep it for now. Use my location asks permission for a single lookup; it does not track you.")
         }
-        .onAppear(perform: advanceOnboarding)
+        .onAppear { updatePluginSetupProgress(); advanceOnboarding() }
+        .onChange(of: pluginSetupInput) { _ in updatePluginSetupProgress() }
+        .task(id: pluginSetupProgress.wakeDeadline) {
+            guard let deadline = pluginSetupProgress.wakeDeadline else { return }
+            let scope = pluginSetupProgress.scope
+            do {
+                try await Task.sleep(nanoseconds: UInt64(max(0, deadline.timeIntervalSinceNow) * 1_000_000_000))
+            } catch { return }
+            guard !Task.isCancelled, pluginSetupProgress.scope == scope,
+                  pluginSetupProgress.wakeDeadline == deadline else { return }
+            updatePluginSetupProgress()
+        }
         .onChange(of: onboardingHelpContext) { _ in advanceOnboarding() }
         .onChange(of: model.canFinishAgentSetup) { _ in advanceOnboarding() }
         .onChange(of: model.galleryIntroOwner) { _ in advanceOnboarding() }
@@ -270,12 +282,34 @@ struct DeviceRootView: View {
 
     private var onboardingHelpContext: OnboardingHelpContext? {
         guard showsCloudOnboarding, !model.accountOperationInProgress else { return nil }
-        let stage: CloudSetupStage = model.showsCloudPluginConnection ? .plugin : .listener
+        let stage: CloudSetupStage = showsPluginInstructions ? .plugin : .listener
         return OnboardingHelpContext(
             identity: AgentPluginIdentity(origin: CloudClient.originScope.canonicalOrigin,
                                           account: model.cloud.localAccountID, owner: model.permissionOwner),
             stage: stage
         )
+    }
+
+    private var pluginSetupInput: CloudPluginSetupProgress.Input {
+        let session = model.cloud.session
+        let eligible = !model.accountOperationInProgress && model.needsAgentSetup &&
+            (showsCloudOnboarding || model.canFinishAgentSetup)
+        let scope: CloudPluginSetupProgress.Scope?
+        if eligible, let account = model.cloud.localAccountID, let session {
+            scope = .init(origin: CloudClient.originScope.canonicalOrigin, account: account,
+                          device: session.deviceId, owner: model.permissionOwner)
+        } else { scope = nil }
+        return .init(scope: scope, pluginConnected: model.onboardingCloudPluginConnected,
+                     listenerReady: model.canFinishAgentSetup)
+    }
+
+    private func updatePluginSetupProgress() {
+        pluginSetupProgress.update(pluginSetupInput, now: Date())
+        advanceOnboarding()
+    }
+
+    private var showsPluginInstructions: Bool {
+        pluginSetupProgress.presentsPluginInstructions(for: pluginSetupInput)
     }
 
     private func openOnboardingHelp(_ stage: CloudSetupStage) {
@@ -479,7 +513,7 @@ struct DeviceRootView: View {
                     model.settingsPage = .screens
                     model.settingsOpen = true
                 }
-        } else if model.showsCloudPluginConnection {
+        } else if showsCloudOnboarding && showsPluginInstructions {
             let scope = CloudClient.originScope
             OnboardingAgentPlugin { openOnboardingHelp(.plugin) }
                 .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -488,7 +522,8 @@ struct DeviceRootView: View {
                             if speech.error != nil || model.presentedStatusMessage != nil {
                                 RequestStatusPill(model: model, speechError: speech.error, maximumTextHeight: 160)
                             } else {
-                                PluginConnectionStatusPill(connected: model.onboardingCloudPluginConnected)
+                                PluginConnectionStatusPill(connected: model.onboardingCloudPluginConnected,
+                                                          lookingForListener: pluginSetupProgress.phase == .looking)
                             }
                         }
                         .padding(24)
@@ -496,7 +531,7 @@ struct DeviceRootView: View {
                     }
                 }
                 .id(AgentPluginIdentity(origin: scope.canonicalOrigin, account: model.cloud.localAccountID, owner: model.permissionOwner))
-        } else if model.showsCloudListenerSetup {
+        } else if showsCloudOnboarding {
             let scope = CloudClient.originScope
             CloudListenerSetupView(scope: scope, email: model.email, isPlaceholder: true)
                 .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -849,14 +884,6 @@ struct CloudListenerSetupView: View {
 
     private var pluginName: String { scope.permitsLegacyMigration ? "Screenpunk Staging" : "Screenpunk Production" }
 
-    private var pluginURL: URL? {
-        switch scope.canonicalOrigin {
-        case "https://staging.screenpunk.xyz": return URL(string: "https://chatgpt.com/plugins/plugin_asdk_app_6ad8cebcf03481918fa9078644568bee")
-        case "https://api.screenpunk.xyz": return URL(string: "https://chatgpt.com/plugins/plugin_asdk_app_6ae3926704588191b0eee33944373ddc")
-        default: return nil
-        }
-    }
-
     private var setupRequest: String {
         let account = "Use the same Screenpunk account and sign-in option as my iPad. If it uses Apple, use the same Apple ID; relay or display email differences alone do not mean a different account. Stop if a different Screenpunk account is connected."
         return "Use @\(pluginName) in the same Screenpunk environment as my iPad. \(account) Subscribe to screenpunk.request.created, keep listening, and handle my device requests. Confirm when the subscription is active. If subscriptions aren’t available, tell me to use Work + Cloud or a dot."
@@ -933,12 +960,11 @@ struct CloudListenerSetupView: View {
                 OnboardingTypography.wordmark
                 Text(stage.sheetTitle).font(OnboardingTypography.title).accessibilityAddTraits(.isHeader)
                 if stage != .listener {
-                    step(1, "Open ChatGPT Plugins and search for Screenpunk.")
-                    pluginButton
-                    step(2, "Connect your Screenpunk account", "Choose Connect, then use the same sign-in option you used on this device.\n\nApple: Use the same Apple ID to sign in.\nGoogle: Use the same Google account.\n\nIf Screenpunk shows a different account, choose Use another account. This signs in to Screenpunk; your ChatGPT account can use any sign-in method.")
+                    step(1, "Install the Screenpunk plugin in ChatGPT", "Open ChatGPT Plugins, search for Screenpunk, and install the plugin.")
+                    step(2, "Connect your Screenpunk account", "Choose Connect, then use the same sign-in option you used on this device.")
                 }
                 if stage == .plugin {
-                    step(3, "Return to Screenpunk", "The app will advance to listener setup once it sees the connection.")
+                    step(3, "Set up the Screenpunk plugin", "After connecting your Screenpunk account, click Set up Screenpunk in ChatGPT.")
                 } else {
                     step(stage == .listener ? 1 : 3, "Open a persistent ChatGPT session", "Open Work → Cloud or your dot and select @\(pluginName).")
                     step(stage == .listener ? 2 : 4, "Send the listener request", "Copy the request below, paste it into the session, and send it.")
@@ -956,15 +982,6 @@ struct CloudListenerSetupView: View {
         Text(listenerTitle).font(font).accessibilityAddTraits(.isHeader)
     }
 
-    @ViewBuilder private var pluginButton: some View {
-        if let pluginURL {
-            Link("Open \(pluginName) in ChatGPT", destination: pluginURL)
-                .buttonStyle(.borderedProminent)
-        } else {
-            Text("Use the plugin link from your Screenpunk provider.").font(.callout)
-        }
-    }
-
     private var copyButton: some View {
         Button(copied ? "Copied" : "Copy listener request") {
             UIPasteboard.general.string = setupRequest
@@ -973,16 +990,14 @@ struct CloudListenerSetupView: View {
         .buttonStyle(.borderedProminent)
     }
 
-    private func step(_ number: Int, _ title: String, _ detail: String = "") -> some View {
+    private func step(_ number: Int, _ title: String, _ detail: String) -> some View {
         HStack(alignment: .top, spacing: 14) {
             Text(String(number)).font(.headline).foregroundStyle(.orange)
                 .padding(8).background(.orange.opacity(0.15), in: Circle())
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 5) {
                 Text(title).font(.headline).accessibilityAddTraits(.isHeader)
-                if !detail.isEmpty {
-                    Text(detail).font(OnboardingTypography.caption).foregroundStyle(.secondary)
-                }
+                Text(detail).font(OnboardingTypography.caption).foregroundStyle(.secondary)
             }
         }
     }
@@ -1486,8 +1501,10 @@ private struct ListenerConnectionStatusPill: View {
 
 private struct PluginConnectionStatusPill: View {
     let connected: Bool?
+    var lookingForListener = false
     private var caption: String {
-        connected == false ? "Waiting for plugin connection…" : "Checking plugin connection…"
+        if lookingForListener { return "Looking for ChatGPT plugin listener…" }
+        return connected == false ? "Waiting for plugin connection…" : "Checking plugin connection…"
     }
 
     var body: some View {
