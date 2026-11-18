@@ -882,7 +882,7 @@ struct CloudListenerSetupView: View {
     private let listenerTitle = "Activate the listener"
     private let listenerCaption = "Open a new task in ChatGPT or your Dot, and send this prompt to activate its Screenpunk listener."
 
-    private var pluginName: String { scope.permitsLegacyMigration ? "Screenpunk Staging" : "Screenpunk Production" }
+    private var pluginName: String { scope.permitsLegacyMigration ? "Screenpunk Staging" : "Screenpunk" }
 
     private var setupRequest: String {
         let account = "Use the same Screenpunk account and sign-in option as my iPad. If it uses Apple, use the same Apple ID; relay or display email differences alone do not mean a different account. Stop if a different Screenpunk account is connected."
