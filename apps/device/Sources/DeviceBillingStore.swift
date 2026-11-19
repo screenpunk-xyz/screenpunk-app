@@ -132,8 +132,16 @@ final class DeviceBillingStore: ObservableObject {
         let session: Session
         var snapshot: DeviceBillingSnapshot?
         var offers: [DeviceBillingOffer.Kind: DeviceBillingOffer] = [:]
-        var notice: String?
-        var restoreNotice: String?
+        var noticePresentation = StatusMessagePresentationState()
+        var restorePresentation = StatusMessagePresentationState()
+        var notice: String? {
+            get { noticePresentation.message?.text }
+            set { if newValue != notice { noticePresentation.update(newValue) } }
+        }
+        var restoreNotice: String? {
+            get { restorePresentation.message?.text }
+            set { if newValue != restoreNotice { restorePresentation.update(newValue) } }
+        }
         var subscriptionDate: SubscriptionDate?
         var storeLookupFailed = false
         var backupAccess: DeviceBackupAccess = .unknown
@@ -244,6 +252,17 @@ final class DeviceBillingStore: ObservableObject {
     }
     func notice(for cloud: CloudClient) -> String? { currentContext(cloud)?.notice }
     func restoreNotice(for cloud: CloudClient) -> String? { currentContext(cloud)?.restoreNotice }
+    func presentedNotices(for cloud: CloudClient) -> [StatusMessagePresentationState.Message] {
+        guard let context = currentContext(cloud) else { return [] }
+        return [context.noticePresentation.presentedMessage, context.restorePresentation.presentedMessage].compactMap { $0 }
+    }
+    func dismissNotice(id: UUID, cloud: CloudClient) {
+        guard let current = currentContext(cloud), context?.session == current.session else { return }
+        context?.noticePresentation.dismiss(id: id, busy: false, requestPending: false,
+                                           routeChangeBlocked: false, canRetry: false, canCancelRequest: false)
+        context?.restorePresentation.dismiss(id: id, busy: false, requestPending: false,
+                                            routeChangeBlocked: false, canRetry: false, canCancelRequest: false)
+    }
     func subscriptionDate(for cloud: CloudClient) -> SubscriptionDate? {
         currentContext(cloud)?.subscriptionDate
     }

@@ -10,6 +10,7 @@ public struct DeviceGoogleTVSettings: View {
     @StateObject private var developer = GoogleTVADBSetup()
     @State private var refresh = UUID()
     @State private var confirmForget = false
+    @State private var invalidPortDismissed: String?
     @AppStorage("screenpunk.googleTV.addressDraft") private var addressDraft = ""
     @AppStorage("screenpunk.googleTV.portDraft") private var portDraft = ""
     @Environment(\.scenePhase) private var scenePhase
@@ -60,7 +61,7 @@ public struct DeviceGoogleTVSettings: View {
                     TextField("Six-character TV code", text: $basic.code).textInputAutocapitalization(.characters).autocorrectionDisabled()
                     Button("Confirm code", action: basic.finish).disabled(busy || basic.code.trimmingCharacters(in: .whitespacesAndNewlines).count != 6)
                 }
-                if !basic.message.isEmpty { Text(basic.message).font(.footnote).accessibilityIdentifier("basicConnectionResult") }
+                if let message = basic.presentedMessage { ConnectionFeedback(message) { basic.dismissMessage(message) }.font(.footnote).accessibilityIdentifier("basicConnectionResult") }
             }
             Section {
                 DisclosureGroup("1. Enable Developer options on your TV") {
@@ -74,7 +75,7 @@ public struct DeviceGoogleTVSettings: View {
                     field("Pairing port", placeholder: "For new pairing", text: $developer.pairingPort)
                 }.disabled(busy)
                 Text("Connection port: on the main Wireless debugging page. Pairing port: in ‘Pair device with pairing code’; only needed when pairing.").font(.footnote).foregroundStyle(.secondary)
-                if !validPort { Text("Enter a Connection port from 1–65535.").font(.footnote).foregroundStyle(.red) }
+                if !validPort && invalidPortDismissed != developer.connectionPort { ConnectionFeedback("Enter a Connection port from 1–65535.") { invalidPortDismissed = developer.connectionPort }.font(.footnote) }
                 if developerPaired && (basic.host != GoogleTVADBConfiguration.load().host || developer.connectionPort != String(GoogleTVADBConfiguration.load().port)) {
                     Text("Connection edited · not saved").font(.footnote).foregroundStyle(.secondary)
                 }
@@ -100,7 +101,7 @@ public struct DeviceGoogleTVSettings: View {
                     }.buttonStyle(.borderless).frame(minWidth: 100, alignment: .leading)
                     Spacer(minLength: 0)
                 }.disabled(busy)
-                if !developer.message.isEmpty { Text(developer.message).font(.footnote).accessibilityIdentifier("developerConnectionResult") }
+                if let message = developer.presentedMessage { ConnectionFeedback(message) { developer.dismissMessage(message) }.font(.footnote).accessibilityIdentifier("developerConnectionResult") }
                 if busy { ProgressView(); Button("Cancel") { basic.stop(); developer.stop() } }
             } header: { Text("Channels and power") } footer: {
                 Text("Wireless debugging grants this iPad debugging access to the TV. Screenpunk uses it for the channels and power controls defined by your screens.")

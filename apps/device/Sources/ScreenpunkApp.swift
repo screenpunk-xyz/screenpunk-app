@@ -135,7 +135,7 @@ struct DeviceRootView: View {
                 GeometryReader { geometry in
                     VStack {
                         Spacer()
-                        RequestStatusPill(model: model, speechError: speech.error, maximumTextHeight: max(80, geometry.size.height * 0.45))
+                        RequestStatusPill(model: model, speech: speech, maximumTextHeight: max(80, geometry.size.height * 0.45))
                             .padding(24)
                     }.frame(maxWidth: .infinity)
                 }
@@ -520,7 +520,7 @@ struct DeviceRootView: View {
                     if !speech.recording && !model.settingsOpen && !model.accountOperationInProgress {
                         Group {
                             if speech.error != nil || model.presentedStatusMessage != nil {
-                                RequestStatusPill(model: model, speechError: speech.error, maximumTextHeight: 160)
+                                RequestStatusPill(model: model, speech: speech, maximumTextHeight: 160)
                             } else {
                                 PluginConnectionStatusPill(connected: model.onboardingCloudPluginConnected,
                                                           lookingForListener: pluginSetupProgress.phase == .looking)
@@ -538,7 +538,7 @@ struct DeviceRootView: View {
                     if !speech.recording && !model.settingsOpen && !model.accountOperationInProgress {
                         Group {
                             if speech.error != nil || model.presentedStatusMessage != nil {
-                                RequestStatusPill(model: model, speechError: speech.error, maximumTextHeight: 160)
+                                RequestStatusPill(model: model, speech: speech, maximumTextHeight: 160)
                             } else {
                                 ListenerConnectionStatusPill(status: model.cloudListenerStatus)
                             }
@@ -1146,7 +1146,7 @@ struct DeviceSettingsView: View {
     @State private var screenToRemove: ScreenLibrary.Saved?
     @State private var sheet: SettingsSheet?
     private enum SettingsSheet: String, Identifiable {
-        case cloudListener
+        case cloudListener, newKeyboardRequest, editKeyboardRequest
         var id: String { rawValue }
     }
     @State private var columns: NavigationSplitViewVisibility = .all
@@ -1196,6 +1196,8 @@ struct DeviceSettingsView: View {
         .sheet(item: $sheet) { destination in
             switch destination {
             case .cloudListener: CloudListenerSetupSheet(scope: CloudClient.originScope, email: model.email)
+            case .newKeyboardRequest: KeyboardRequestEditor(model: model, creatingNew: true)
+            case .editKeyboardRequest: KeyboardRequestEditor(model: model, creatingNew: false)
             }
         }
         .onAppear {
@@ -1273,6 +1275,12 @@ struct DeviceSettingsView: View {
             Form {
                 Section {
                     Button("Create another screen", action: model.newScreen).disabled(model.needsAgentSetup)
+                    Button("Create a screen with keyboard") { sheet = .newKeyboardRequest }
+                        .disabled(model.needsAgentSetup || model.routeChangeBlocked || model.accountOperationInProgress)
+                    if model.screen != nil {
+                        Button("Edit this screen with keyboard") { sheet = .editKeyboardRequest }
+                            .disabled(model.needsAgentSetup || model.routeChangeBlocked || model.accountOperationInProgress)
+                    }
                     Button("Restore previous version", action: model.rollback).disabled(model.needsAgentSetup || !model.canRollback)
                 }
                 DeviceCloudBackupsSection(model: model) {
@@ -1324,8 +1332,8 @@ struct DeviceSettingsView: View {
                             .accessibilityLabel("Show \(saved.artifact.title)")
                             .disabled(owner.isEmpty || model.accountOperationInProgress)
                         }
-                        if let issue = model.manifestIssues[saved.id] {
-                            Label(issue, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange)
+                        if let issue = model.presentedManifestIssue(saved) {
+                            DismissibleMessage(issue, color: .orange, onDismiss: { model.dismissManifestIssue(issue, saved: saved) }).id(saved.revision).font(.caption)
                         }
                     }
                 }
@@ -1424,11 +1432,11 @@ private struct DeviceCloudBackupsSection: View {
             .disabled(!model.catalogBackupsCanConfigure)
 
             if model.catalogBackupsEnabled {
-                if let status = model.catalogBackupStatus {
-                    Text(status).font(.footnote).foregroundStyle(.secondary)
+                if let status = model.presentedInlineMessage(.backup) {
+                    DismissibleMessage(status.text, onDismiss: { model.dismissInlineMessage(.backup, id: status.id) }).id(status.id).font(.footnote)
                 }
-                if let status = model.catalogPreviewStatus {
-                    Text(status).font(.footnote).foregroundStyle(.secondary)
+                if let status = model.presentedInlineMessage(.preview) {
+                    DismissibleMessage(status.text, onDismiss: { model.dismissInlineMessage(.preview, id: status.id) }).id(status.id).font(.footnote)
                 }
                 if model.catalogCanResume {
                     Button("Resume backups with current screens") { confirmResume = true }
@@ -1521,13 +1529,69 @@ private struct PluginConnectionStatusPill: View {
     }
 }
 
+private struct KeyboardRequestEditor: View {
+    @ObservedObject var model: DeviceModel
+    let creatingNew: Bool
+    let owner: String
+    let screenID: String?
+    let revision: String?
+    @Environment(\.dismiss) private var dismiss
+    @State private var text: String
+    @State private var submitted = false
+
+    init(model: DeviceModel, creatingNew: Bool) {
+        self.model = model; self.creatingNew = creatingNew
+        owner = model.keyboardRequestScope
+        screenID = creatingNew ? nil : model.screen?.id
+        revision = creatingNew ? nil : model.screen?.revision
+        _text = State(initialValue: model.keyboardDraft(owner: model.keyboardRequestScope, screenID: creatingNew ? nil : model.screen?.id))
+    }
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section(creatingNew ? "Describe a new screen" : "Describe your changes") {
+                    TextEditor(text: $text)
+                        .frame(minHeight: 200)
+                        .accessibilityLabel("Screen instructions")
+                        .accessibilityIdentifier("request.instructions")
+                    if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && KeyboardRequestText.normalized(text) == nil { DismissibleMessage("Please shorten your instructions. Your draft is kept.") }
+                }
+                if let message = model.presentedStatusMessage {
+                    DismissibleMessage(message.text, onDismiss: { model.dismissStatusMessage(id: message.id) }).id(message.id)
+                }
+                Section {
+                    Text(creatingNew ? "Creates a separate screen. Your existing screens stay saved." : "Sends these changes for the selected screen through your configured agent.")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle(creatingNew ? "New screen" : "Edit screen")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Send") {
+                        if model.submitKeyboardRequest(text, owner: owner, screenID: screenID, revision: revision, creatingNew: creatingNew) {
+                            submitted = true; dismiss()
+                        }
+                    }
+                    .disabled(submitted || KeyboardRequestText.normalized(text) == nil || model.busy || model.requestPending || model.routeChangeBlocked || model.accountOperationInProgress || model.keyboardRequestScope != owner)
+                    .accessibilityIdentifier("request.send")
+                }
+            }
+        }
+        .onChange(of: text) { model.saveKeyboardDraft($0, owner: owner, screenID: screenID) }
+        .onDisappear { model.persistKeyboardDraft(text, owner: owner, screenID: screenID) }
+    }
+}
+
 private struct RequestStatusPill: View {
     @ObservedObject var model: DeviceModel
-    let speechError: String?
+    @ObservedObject var speech: SpeechCapture
     let maximumTextHeight: CGFloat
     var body: some View {
         let message = model.presentedStatusMessage
-        let dismissible = speechError == nil && model.canDismissStatusMessage
+        let speechError = speech.presentedError
+        let presentationID = speechError?.id ?? message?.id
+        let dismissible = speechError != nil || model.canDismissStatusMessage
         VStack(spacing: 12) {
             if let accountStatus = model.accountStatusCaption {
                 ShimmeringStatusCaption(caption: accountStatus)
@@ -1539,19 +1603,19 @@ private struct RequestStatusPill: View {
                     if model.canCancelRequest { Button("Cancel", role: .cancel, action: model.cancelRequest) }
                 }.buttonStyle(.bordered)
             } else {
-                statusText(speechError ?? message?.text ?? "")
                 if model.canRetry { Button("Retry", action: model.retryRequest).buttonStyle(.bordered).disabled(model.busy) }
                 if model.canCancelRequest { Button("Cancel saved request", role: .cancel, action: model.cancelRequest).buttonStyle(.bordered) }
-                if dismissible, let id = message?.id {
-                    Button { model.dismissStatusMessage(id: id) } label: {
-                        Label("Dismiss", systemImage: "xmark").frame(minWidth: 80, minHeight: 44)
-                    }
-                        .id(id)
-                        .buttonStyle(.bordered)
-                        .keyboardShortcut(.cancelAction)
-                        .accessibilityLabel("Dismiss message")
-                        .accessibilityHint("Hides this message. Your screen stays unchanged.")
+            }
+            if let text = speechError?.text ?? message?.text { statusText(text) }
+            if dismissible, let id = presentationID {
+                Button { dismissMessage(id: id) } label: {
+                    Label("Dismiss", systemImage: "xmark").frame(minWidth: 80, minHeight: 44)
                 }
+                .id(id)
+                .buttonStyle(.bordered)
+                .keyboardShortcut(.cancelAction)
+                .accessibilityLabel("Dismiss message")
+                .accessibilityHint("Hides this message. Your screen stays unchanged.")
             }
         }
         .modifier(StatusPillAppearance())
@@ -1559,11 +1623,15 @@ private struct RequestStatusPill: View {
         // the screen below; only a deliberate swipe or Dismiss action hides it.
         .contentShape(Rectangle())
         .simultaneousGesture(TapGesture().onEnded { })
-        .background(DeviceStatusInteractionRegion(presentationID: message?.id, dismissalEnabled: dismissible, onDismiss: model.dismissStatusMessage))
+        .background(DeviceStatusInteractionRegion(presentationID: presentationID, dismissalEnabled: dismissible, onDismiss: dismissMessage))
         .accessibilityElement(children: .contain)
         .accessibilityAction(.escape) {
-            if dismissible, let id = message?.id { model.dismissStatusMessage(id: id) }
+            if dismissible, let id = presentationID { dismissMessage(id: id) }
         }
+    }
+    private func dismissMessage(id: UUID) {
+        if speech.presentedError != nil { speech.dismissError(id: id) }
+        else { model.dismissStatusMessage(id: id) }
     }
     private func statusText(_ value: String) -> some View {
         ViewThatFits(in: .vertical) {
@@ -1574,6 +1642,39 @@ private struct RequestStatusPill: View {
         }
         .font(.callout).multilineTextAlignment(.center)
         .frame(maxHeight: maximumTextHeight)
+    }
+}
+
+/// Acknowledgement is local presentation state. It never changes the failed
+/// operation, account, permission, purchase, saved draft or recovery controls.
+struct DismissibleMessage: View {
+    let text: String
+    let color: Color
+    let onDismiss: (() -> Void)?
+    @State private var presentation: StatusMessagePresentationState
+
+    init(_ text: String, color: Color = .secondary, onDismiss: (() -> Void)? = nil) {
+        self.text = text; self.color = color; self.onDismiss = onDismiss
+        var state = StatusMessagePresentationState(); state.update(text)
+        _presentation = State(initialValue: state)
+    }
+    var body: some View {
+        Group {
+            if let message = presentation.presentedMessage {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(message.text).foregroundStyle(color).textSelection(.enabled)
+                    Button("Dismiss") { dismiss(message.id) }
+                        .accessibilityLabel("Dismiss message")
+                }
+                .accessibilityElement(children: .contain)
+                .accessibilityAction(.escape) { dismiss(message.id) }
+            }
+        }
+        .onChange(of: text) { presentation.update($0) }
+    }
+    private func dismiss(_ id: UUID) {
+        if presentation.dismiss(id: id, busy: false, requestPending: false,
+                                routeChangeBlocked: false, canRetry: false, canCancelRequest: false) { onDismiss?() }
     }
 }
 @available(iOS 17, *)

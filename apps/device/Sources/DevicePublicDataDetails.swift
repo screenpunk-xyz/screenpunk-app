@@ -30,7 +30,7 @@ struct DevicePublicDataDetails: View {
                 if let weather { weatherSection(weather) }
                 sourceSections(manifest)
             } else {
-                Text("Public data settings are unavailable. Go back and reopen this screen’s settings.")
+                DismissibleMessage("Public data settings are unavailable. Go back and reopen this screen’s settings.")
                     .foregroundStyle(.secondary)
             }
         }
@@ -85,8 +85,8 @@ struct DevicePublicDataDetails: View {
                                 }
                             }.disabled(locationService.busy)
                         }
-                        if let error = locationService.error { Text(error).foregroundStyle(.secondary) }
-                        if let status { Text(status).foregroundStyle(.secondary) }
+                        if let error = locationService.error { DismissibleMessage(error) }
+                        if let status { DismissibleMessage(status) }
                     } header: {
                         Text("Location")
                     } footer: {

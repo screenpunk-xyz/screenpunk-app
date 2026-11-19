@@ -144,6 +144,19 @@ final class StatusMessagePresentationStateTests: XCTestCase {
     private func dismiss(_ state: inout StatusMessagePresentationState, id: UUID, busy: Bool = false, requestPending: Bool = false, routeChangeBlocked: Bool = false, canRetry: Bool = false, canCancelRequest: Bool = false) -> Bool {
         state.dismiss(id: id, busy: busy, requestPending: requestPending, routeChangeBlocked: routeChangeBlocked, canRetry: canRetry, canCancelRequest: canCancelRequest)
     }
+    func testRepeatedObservationDoesNotReopenAcknowledgedErrorButNewAttemptDoes() throws {
+        var state = StatusMessagePresentationState()
+        state.updateIfChanged("Offline")
+        let original = try XCTUnwrap(state.presentedMessage)
+        XCTAssertTrue(dismiss(&state, id: original.id))
+        state.updateIfChanged("Offline")
+        XCTAssertNil(state.presentedMessage)
+        XCTAssertEqual(state.message, original)
+        state.updateIfChanged(nil)
+        state.updateIfChanged("Offline")
+        XCTAssertNotEqual(state.presentedMessage?.id, original.id)
+        XCTAssertEqual(state.presentedMessage?.text, "Offline")
+    }
     func testIdleDismissalPreservesOriginalMessageAndIsIdempotent() throws {
         var state = StatusMessagePresentationState()
         state.update("Background updated. The saved image is unchanged.")
@@ -167,17 +180,19 @@ final class StatusMessagePresentationStateTests: XCTestCase {
         XCTAssertFalse(dismiss(&state, id: next.id))
         XCTAssertEqual(state.presentedMessage, newest)
     }
-    func testAnyOutstandingWorkOrRecoveryControlPreventsDismissal() throws {
-        var state = StatusMessagePresentationState()
-        state.update("Delivery needs attention")
-        let message = try XCTUnwrap(state.presentedMessage)
-        XCTAssertFalse(dismiss(&state, id: message.id, busy: true))
-        XCTAssertFalse(dismiss(&state, id: message.id, requestPending: true))
-        XCTAssertFalse(dismiss(&state, id: message.id, routeChangeBlocked: true))
-        XCTAssertFalse(dismiss(&state, id: message.id, canRetry: true))
-        XCTAssertFalse(dismiss(&state, id: message.id, canCancelRequest: true))
-        XCTAssertEqual(state.presentedMessage, message)
-        XCTAssertTrue(dismiss(&state, id: message.id))
+    func testErrorAcknowledgementDoesNotRequireResolvingPendingWork() throws {
+        for flags in [(true,false,false,false,false), (false,true,false,false,false),
+                      (false,false,true,false,false), (false,false,false,true,false),
+                      (false,false,false,false,true), (true,true,true,true,true)] {
+            var state = StatusMessagePresentationState()
+            state.update("Delivery needs attention")
+            let message = try XCTUnwrap(state.presentedMessage)
+            XCTAssertTrue(dismiss(&state, id: message.id, busy: flags.0, requestPending: flags.1,
+                                  routeChangeBlocked: flags.2, canRetry: flags.3, canCancelRequest: flags.4))
+            XCTAssertNil(state.presentedMessage)
+            XCTAssertEqual(state.message, message, "Acknowledgement preserves the underlying failure")
+            XCTAssertFalse(dismiss(&state, id: message.id))
+        }
     }
     func testClearingOrReassigningInvalidatesDismissalIdentity() throws {
         var state = StatusMessagePresentationState()
@@ -192,5 +207,19 @@ final class StatusMessagePresentationStateTests: XCTestCase {
         XCTAssertNotEqual(next.id, original.id)
         XCTAssertFalse(dismiss(&state, id: original.id))
         XCTAssertEqual(state.presentedMessage, next)
+    }
+}
+
+final class KeyboardRequestTextTests: XCTestCase {
+    func testRejectsBlankInstructionsAndPreservesInternalFormatting() {
+        XCTAssertNil(KeyboardRequestText.normalized(" \n\t "))
+        XCTAssertEqual(KeyboardRequestText.normalized(" \nMake a clock\nwith a blue face. \n"), "Make a clock\nwith a blue face.")
+    }
+    func testTransportByteLimitDoesNotTruncateUnicodeDraft() {
+        let limit = String(repeating: "😀", count: 4_096)
+        XCTAssertEqual(KeyboardRequestText.normalized(limit), limit)
+        let oversized = limit + "😀"
+        XCTAssertNil(KeyboardRequestText.normalized(oversized))
+        XCTAssertEqual(oversized.utf16.count, 8_194)
     }
 }

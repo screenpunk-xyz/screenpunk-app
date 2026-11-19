@@ -63,7 +63,7 @@ struct DeviceDisplaySettings: View {
                     .disabled(device.accountOperationInProgress)
                     .accessibilityIdentifier("deviceName")
                 if deviceName != device.displayName, (try? DeviceNameStore.normalized(deviceName)) == nil {
-                    Text("Enter a valid device name.").foregroundStyle(.secondary)
+                    DismissibleMessage("Enter a valid device name.").id(deviceName)
                 }
             } header: {
                 Text("Device Name")
@@ -105,7 +105,7 @@ struct DeviceDisplaySettings: View {
                     } label: { Label("Add time", systemImage: "plus") }
                     .disabled(draft.schedule.count >= 48)
                     if duplicateTime {
-                        Text("Choose a different time for each brightness level.").foregroundStyle(.secondary)
+                        DismissibleMessage("Choose a different time for each brightness level.")
                     }
                 }
             }

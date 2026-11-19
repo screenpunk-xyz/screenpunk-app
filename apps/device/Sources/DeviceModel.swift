@@ -26,8 +26,26 @@ import ScreenpunkLocalTransport
     }
     @Published var deletedAccountAppleHelpURL: URL?
     @Published private(set) var accountDeletionInProgress = false
-    @Published private(set) var accountDeletionStatus: String?
-    @Published private(set) var accountDeletionError: String?
+    @Published private(set) var accountDeletionStatus: String? {
+        didSet { updateInlineMessage(.deletionStatus, text: accountDeletionStatus) }
+    }
+    @Published private(set) var accountDeletionError: String? {
+        didSet { updateInlineMessage(.deletionError, text: accountDeletionError) }
+    }
+    enum InlineMessage: Hashable { case deletionStatus, deletionError, backup, preview }
+    @Published private var inlineMessages: [InlineMessage: StatusMessagePresentationState] = [:]
+    private func updateInlineMessage(_ key: InlineMessage, text: String?) {
+        var state = inlineMessages[key] ?? StatusMessagePresentationState()
+        state.updateIfChanged(text)
+        inlineMessages[key] = state
+    }
+    func presentedInlineMessage(_ key: InlineMessage) -> StatusMessagePresentationState.Message? {
+        inlineMessages[key]?.presentedMessage
+    }
+    func dismissInlineMessage(_ key: InlineMessage, id: UUID) {
+        inlineMessages[key]?.dismiss(id: id, busy: false, requestPending: false,
+                                    routeChangeBlocked: false, canRetry: false, canCancelRequest: false)
+    }
     @Published private var accountDeletionIntent: DeviceAccountDeletionIntent?
     var accountDeletionTargetID: String? { accountDeletionIntent?.accountID ?? cloud.localAccountID }
     var accountDeletionNeedsRetry: Bool { accountDeletionIntent != nil }
@@ -48,7 +66,7 @@ import ScreenpunkLocalTransport
     @Published var accountOperationInProgress = false
     @Published private(set) var accountStatusCaption: String?
     @Published var message: String? {
-        didSet { statusMessagePresentation.update(message) }
+        didSet { statusMessagePresentation.updateIfChanged(message) }
     }
     @Published private var statusMessagePresentation = StatusMessagePresentationState()
     var presentedStatusMessage: StatusMessagePresentationState.Message? { statusMessagePresentation.presentedMessage }
@@ -73,12 +91,16 @@ import ScreenpunkLocalTransport
     @Published var inactiveDevicePreferences: [PreferenceRecordV1] = []
     @Published var preferenceConflicts: [AuthoringPreferenceConflict] = []
     @Published var preferenceSyncStatus: String?
-    @Published private(set) var catalogBackupStatus: String?
+    @Published private(set) var catalogBackupStatus: String? {
+        didSet { updateInlineMessage(.backup, text: catalogBackupStatus) }
+    }
     @Published private(set) var catalogCanResume = false
     private let catalogPump = CatalogWorkPump()
     private var catalogCatchUpNeeded = false
     private var catalogCapabilityRetry: Date?
-    @Published private(set) var catalogPreviewStatus: String?
+    @Published private(set) var catalogPreviewStatus: String? {
+        didSet { updateInlineMessage(.preview, text: catalogPreviewStatus) }
+    }
     private let previewPump = CatalogWorkPump()
     private var previewDiscoveryNeeded = false
     private var previewDiscoveryRetry: Date?
@@ -289,8 +311,70 @@ import ScreenpunkLocalTransport
         }
     }
     @Published var settingsPage: DeviceSettingsPage = .account
+    // Drafts belong to an account and target screen, never a sign-in provider's
+    // display email. Closing an error or editor must not discard typed work.
+    private var keyboardDrafts: [String: String] = [:]
+    var keyboardRequestScope: String { permissionOwner + "\n" + (activeProfile?.id ?? "") + "\n" + (activeProfile?.libraryOwner ?? "") }
+    private func keyboardDraftKey(owner: String, screenID: String?) -> String {
+        owner + "\n" + (screenID ?? "new")
+    }
+    func keyboardDraft(owner: String, screenID: String?) -> String {
+        keyboardDrafts[keyboardDraftKey(owner: owner, screenID: screenID)]
+            ?? (owner == keyboardRequestScope ? library?.keyboardDraft(screenID: screenID) : nil) ?? ""
+    }
+    func saveKeyboardDraft(_ text: String, owner: String, screenID: String?) {
+        keyboardDrafts[keyboardDraftKey(owner: owner, screenID: screenID)] = text
+    }
+    func persistKeyboardDraft(_ text: String, owner: String, screenID: String?) {
+        saveKeyboardDraft(text, owner: owner, screenID: screenID)
+        guard owner == keyboardRequestScope else { return }
+        do { try library?.saveKeyboardDraft(text, screenID: screenID) }
+        catch { message = "Your draft is kept for this session, but could not be saved: " + error.localizedDescription }
+    }
+    @discardableResult
+    func submitKeyboardRequest(_ text: String, owner: String, screenID: String?, revision: String?, creatingNew: Bool) -> Bool {
+        guard let normalized = KeyboardRequestText.normalized(text) else {
+            message = "Enter instructions that fit the request limit. Your draft is kept."; return false
+        }
+        guard owner == keyboardRequestScope, hasProfile, let library, !needsAgentSetup,
+              !accountOperationInProgress, !busy, !requestPending, !routeChangeBlocked else {
+            message = "The request context changed. Your draft is kept; reopen it when the device is ready."; return false
+        }
+        guard creatingNew || (screen?.id == screenID && screen?.revision == revision) else {
+            message = "The selected screen changed. Your draft is kept; reopen the intended screen before sending."; return false
+        }
+        saveKeyboardDraft(text, owner: owner, screenID: creatingNew ? nil : screenID)
+        do {
+            try library.saveKeyboardDraft(text, screenID: creatingNew ? nil : screenID)
+            if creatingNew {
+                try library.newScreen()
+                guard library.state.selectedID == nil else { throw DeviceError.message("A separate screen could not be prepared. Your existing screen is unchanged.") }
+                refreshScreen()
+            }
+            // The same sealed-snapshot, route and recovery flow as speech.
+            settingsOpen = false
+            Task {
+                guard self.keyboardRequestScope == owner,
+                      (creatingNew ? self.screen == nil : (self.screen?.id == screenID && self.screen?.revision == revision)) else { return }
+                await self.send(normalized)
+            }
+            return true
+        } catch { message = error.localizedDescription; return false }
+    }
     @Published var canRollback = false
     @Published var manifestIssues: [String: String] = [:]
+    @Published private var acknowledgedManifestIssues: [String: String] = [:]
+    private func manifestIssueKey(_ saved: ScreenLibrary.Saved) -> String {
+        keyboardRequestScope + "\n" + saved.id + "\n" + saved.revision
+    }
+    func presentedManifestIssue(_ saved: ScreenLibrary.Saved) -> String? {
+        guard let issue = manifestIssues[saved.id], acknowledgedManifestIssues[manifestIssueKey(saved)] != issue else { return nil }
+        return issue
+    }
+    func dismissManifestIssue(_ issue: String, saved: ScreenLibrary.Saved) {
+        guard installedScreens.contains(where: { $0.id == saved.id && $0.revision == saved.revision }), manifestIssues[saved.id] == issue else { return }
+        acknowledgedManifestIssues[manifestIssueKey(saved)] = issue
+    }
     @Published var installedManifests: [DashboardManifest] = []
     @Published var installedScreens: [ScreenLibrary.Saved] = []
     @Published private(set) var hiddenScreenIDs: Set<String> = []
@@ -546,6 +630,7 @@ import ScreenpunkLocalTransport
         billing.removeDeletedAccount(origin: intent.origin, accountID: intent.accountID, activeJournalOwner: intent.billingJournalOwner)
         for profile in intent.profiles {
             guard profile.cloudAccountID == intent.accountID else { throw DeviceError.message("A saved profile belongs to another account.") }
+            keyboardDrafts = keyboardDrafts.filter { !$0.key.hasPrefix(profile.permissionOwner + "\n") }
             try localLedger.removeProfile(profileID: profile.id)
             try HomeAssistantDeviceVault().removeOwner(profile.permissionOwner)
             try GenericConnectionDeviceVault().removeOwner(profile.permissionOwner)
@@ -686,7 +771,7 @@ import ScreenpunkLocalTransport
                     guard cloud.session?.accessToken == token, foreground, generation == connectionGeneration, !Task.isCancelled else { return true }
                 case .deliveryUncertain(let failure), .needsAttention(let failure):
                     agentWorkingRequestID = nil
-                    busy = true; requestPending = true; canCancelRequest = true; canRetry = false; progressCaption = failure
+                    busy = true; requestPending = true; canCancelRequest = true; canRetry = false; progressCaption = "Delivery needs attention"; message = failure
                 case .ended(let status, let failure):
                     try finishRequest(id, status: status, failure: failure)
                 case .pending(let progress):
@@ -963,7 +1048,7 @@ import ScreenpunkLocalTransport
                 if let updated = progress.updatedAt { progressTiming.lastProgressAt = Date(timeIntervalSince1970: updated / 1000) }
             case .deliveryUncertain(let failure), .needsAttention(let failure):
                 agentWorkingRequestID = nil
-                busy = true; requestPending = true; canCancelRequest = true; canRetry = false; progressCaption = failure
+                busy = true; requestPending = true; canCancelRequest = true; canRetry = false; progressCaption = "Delivery needs attention"; message = failure
             }
             return AuthoringRefreshPolicy.reconciliationSucceeded(delivery, route: snapshot.delivery.route)
         } catch {

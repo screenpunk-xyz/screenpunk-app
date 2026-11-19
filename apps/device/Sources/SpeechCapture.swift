@@ -5,7 +5,19 @@ import AVFoundation
 @MainActor final class SpeechCapture: NSObject, ObservableObject {
     @Published private(set) var recording = false
     @Published private(set) var transcript = ""
-    @Published var error: String?
+    @Published private var errorPresentation = StatusMessagePresentationState()
+    var error: String? {
+        get { errorPresentation.presentedMessage?.text }
+        set { errorPresentation.update(newValue) }
+    }
+    var presentedError: StatusMessagePresentationState.Message? { errorPresentation.presentedMessage }
+    func dismissError(id: UUID) {
+        guard errorPresentation.presentedMessage?.id == id else { return }
+        feedbackTask?.cancel()
+        cancel() // Invalidate late speech callbacks before acknowledging the error.
+        errorPresentation.dismiss(id: id, busy: false, requestPending: false,
+                                  routeChangeBlocked: false, canRetry: false, canCancelRequest: false)
+    }
     private let engine = AVAudioEngine()
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var recognition: SFSpeechRecognitionTask?

@@ -21,7 +21,15 @@ import ScreenpunkLocalTransport
     @Published private(set) var testing = false
     @Published private(set) var status = "Not connected"
     @Published private(set) var details: String?
-    @Published private(set) var error: String?
+    @Published private(set) var error: String? {
+        didSet { if error != oldValue { errorPresentation.update(error) } }
+    }
+    @Published private var errorPresentation = StatusMessagePresentationState()
+    var presentedError: StatusMessagePresentationState.Message? { errorPresentation.presentedMessage }
+    func dismissError(id: UUID) {
+        errorPresentation.dismiss(id: id, busy: false, requestPending: false,
+                                  routeChangeBlocked: false, canRetry: false, canCancelRequest: false)
+    }
     @Published private(set) var tested = false
     @Published private(set) var lastSuccess: Date?
     private let configurations: LocalAgentConfigurationRepository
