@@ -74,6 +74,27 @@ public struct OriginScopedCloudCredentials {
     }
 }
 
+/// A server-revoked credential must never be restored after restart, even if
+/// clearing its Keychain item was temporarily unavailable. Only scoped hashes
+/// are persisted; this journal contains no tokens or account content.
+public final class CloudSessionRevocationLedger {
+    private let file: LocalDurableFile<Set<String>>
+    public init(rootDirectory: URL? = nil) throws {
+        file = try .init(kind: "cloud-session-revocations", rootDirectory: rootDirectory)
+    }
+    private func key(origin: String, credential: String) -> String {
+        AuthoringContract.contentDigest(Data((origin + "\n" + credential).utf8))
+    }
+    public func contains(origin: String, credential: String) throws -> Bool {
+        try (file.load() ?? []).contains(key(origin: origin, credential: credential))
+    }
+    public func record(origin: String, credential: String) throws {
+        var revoked = try file.load() ?? []
+        revoked.insert(key(origin: origin, credential: credential))
+        try file.save(revoked)
+    }
+}
+
 /// Native secret storage. Implementations must not write secrets to packages, logs, or MCP.
 public protocol CredentialStore: Sendable {
     func secret(for authRef: String) throws -> Data?

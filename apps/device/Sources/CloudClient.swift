@@ -43,6 +43,22 @@ struct AgentStatus: Decodable {
     private var enrolledToken: String?
     private let deviceNameWrites = DeviceNameWriteQueue()
     var session: DeviceSession? = SessionKeychain.load()
+    var sessionRevoked: (() -> Void)?
+    var deviceNameChanged: ((String, String?) -> Void)?
+    private(set) var deviceNameSyncNotice: String?
+    private(set) var revocationPersistenceFailed = false
+    /// Captured credentials fence late responses from another sign-in or account.
+    @discardableResult func acceptRevocation(token: String, deviceID: String) -> Bool {
+        guard let current = session, current.accessToken == token, current.deviceId == deviceID else { return false }
+        // Persist before detaching the library; never delete user content here.
+        var recorded = false, cleared = false
+        do { try SessionKeychain.recordRevocation(current); recorded = true } catch { }
+        do { try SessionKeychain.clear(); cleared = true } catch { }
+        revocationPersistenceFailed = !recorded && !cleared
+        session = nil; enrolledToken = nil
+        sessionRevoked?()
+        return true
+    }
     /// Used only for local libraries, ownership, permissions and preference eligibility.
     var localAccountID: String? { session.map { Self.originScope.localAccountID(serverUserID: $0.user.id) } }
     func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
@@ -115,6 +131,7 @@ struct AgentStatus: Decodable {
         // switch must never drive the previous account's open library with a new token.
         try SessionKeychain.save(registered)
         session = registered; enrolledToken = registered.accessToken
+        try publishCloudName(registered)
         return registered
     }
     private struct CancelledAccountCreation: Decodable {
@@ -191,14 +208,11 @@ struct AgentStatus: Decodable {
         try SessionKeychain.save(registered); session = registered; enrolledToken = value.accessToken
     }
     static var installationDeviceNameKey: String? { (try? LocalProfileRepository().snapshot().installationID).map { "installation|" + $0 } }
-    static func deviceNameKey(accountID: String, deviceID: String) -> String { originScope.canonicalOrigin + "|" + accountID + "|" + deviceID }
-    private static let nameAcknowledgementsKey = "screenpunk.device.name-acknowledgements.v1"
     private func registerSession(_ value: DeviceSession) async throws -> DeviceSession {
         try await deviceNameWrites.perform { [self] in try await performRegisterSession(value) }
     }
     private func performRegisterSession(_ value: DeviceSession) async throws -> DeviceSession {
         let key = try InstallationIdentity.loadOrCreate()
-        let nameKey = Self.deviceNameKey(accountID: Self.originScope.localAccountID(serverUserID: value.user.id), deviceID: value.deviceId)
         let fallback = (try? DeviceNameStore.normalized(UIDevice.current.name)) ?? "Screenpunk"
         let desiredName = DeviceNameStore().name(for: Self.installationDeviceNameKey ?? "unavailable", fallback: fallback)
         let registration: DeviceRegistration
@@ -207,23 +221,60 @@ struct AgentStatus: Decodable {
             throw DeviceError.http(409, "This device has an earlier saved connection. Sign in again from Settings to restore it.")
         }
         guard registration.id == value.deviceId else { throw DeviceError.message("Your device connection changed. Sign in again to continue.") }
-        guard registration.name == nil || registration.name == desiredName else { throw DeviceError.message("Cloud did not confirm the device name. It will retry.") }
-        var names = UserDefaults.standard.dictionary(forKey: Self.nameAcknowledgementsKey) as? [String: String] ?? [:]
-        names[nameKey] = desiredName; UserDefaults.standard.set(names, forKey: Self.nameAcknowledgementsKey)
+        if let snapshot = registration.nameSnapshot {
+            try CloudDeviceNameRepository().observe(snapshot, key: Self.cloudNameKey(value))
+            if session?.accessToken == value.accessToken { try publishCloudName(value) }
+        }
         var next = value; next.profileID = registration.profileID
         return next
     }
-    /// Local name persistence is independent of transport; registration retries
-    /// only the exact captured account/enrollment and never reassigns a device.
+    private static func cloudNameKey(_ session: DeviceSession) -> String {
+        CloudDeviceNameRepository.key(origin: originScope.canonicalOrigin, accountID: session.user.id, deviceID: session.deviceId)
+    }
+    func queueDeviceName(_ name: String) throws {
+        guard let session else { return }
+        try CloudDeviceNameRepository().queue(name: name, key: Self.cloudNameKey(session))
+        deviceNameSyncNotice = nil
+    }
+    private func publishCloudName(_ captured: DeviceSession) throws {
+        guard session?.accessToken == captured.accessToken, session?.deviceId == captured.deviceId else { return }
+        let state = try CloudDeviceNameRepository().record(key: Self.cloudNameKey(captured))
+        guard let name = state.pending?.name ?? state.canonical?.name else { return }
+        if let key = Self.installationDeviceNameKey { _ = try DeviceNameStore().save(name, for: key) }
+        deviceNameSyncNotice = state.conflict ? "The device name changed in Cloud. The latest Cloud name has been kept." : nil
+        deviceNameChanged?(name, deviceNameSyncNotice)
+    }
+    func observeDeviceName(_ snapshot: CloudDeviceNameSnapshot, token: String) throws -> Bool {
+        guard let captured = session, captured.accessToken == token,
+              snapshot.valid, snapshot.deviceId == captured.deviceId else { return false }
+        let repository = try CloudDeviceNameRepository(), key = Self.cloudNameKey(captured)
+        guard try repository.record(key: key).canonical?.enrollmentRevision == snapshot.enrollmentRevision else { return false }
+        try repository.observe(snapshot, key: key)
+        try publishCloudName(captured)
+        return true
+    }
+    /// Only explicit edits use the revisioned mutation endpoint. Registration's
+    /// legacy name field is a seed and never a reconnect rename operation.
     func syncDeviceName() async throws {
         guard let captured = session else { return }
-        let key = Self.deviceNameKey(accountID: Self.originScope.localAccountID(serverUserID: captured.user.id), deviceID: captured.deviceId)
-        let name = DeviceNameStore().name(for: Self.installationDeviceNameKey ?? "unavailable", fallback: (try? DeviceNameStore.normalized(UIDevice.current.name)) ?? "Screenpunk")
-        let acknowledged = UserDefaults.standard.dictionary(forKey: Self.nameAcknowledgementsKey) as? [String: String] ?? [:]
-        guard acknowledged[key] != name else { return }
-        _ = try await registerSession(captured)
-        guard session?.accessToken == captured.accessToken, session?.deviceId == captured.deviceId, session?.user.id == captured.user.id,
-              DeviceNameStore().name(for: Self.installationDeviceNameKey ?? "unavailable", fallback: (try? DeviceNameStore.normalized(UIDevice.current.name)) ?? "Screenpunk") == name else { throw CancellationError() }
+        try await deviceNameWrites.perform { [self] in
+            guard session?.accessToken == captured.accessToken else { throw CancellationError() }
+            let repository = try CloudDeviceNameRepository(), key = Self.cloudNameKey(captured)
+            for _ in 0..<4 {
+                guard let edit = try repository.record(key: key).pending else { try publishCloudName(captured); return }
+                var conflict = false
+                let snapshot: CloudDeviceNameSnapshot
+                do {
+                    snapshot = try await call("api/device/name", method: "POST", body: ["name": edit.name, "expectedNameRevision": edit.expectedNameRevision, "operationID": edit.operationID] as [String: Any], authorizationToken: captured.accessToken)
+                } catch DeviceError.deviceNameConflict(let canonical) { snapshot = canonical; conflict = true }
+                guard session?.accessToken == captured.accessToken, session?.deviceId == captured.deviceId else { throw CancellationError() }
+                guard snapshot.valid, snapshot.deviceId == captured.deviceId else { throw DeviceError.message("Cloud returned a different device name identity.") }
+                guard conflict || snapshot.name == edit.name else { throw DeviceError.message("Cloud did not confirm the requested device name.") }
+                try repository.complete(edit, snapshot: snapshot, conflict: conflict, key: key)
+                try publishCloudName(captured)
+            }
+            if try repository.record(key: key).pending != nil { throw DeviceError.message("The latest device name is saved on this iPad and will retry.") }
+        }
     }
     func rememberProfile(_ profileID: String) throws {
         guard var value = session, value.profileID != profileID else { return }
@@ -254,6 +305,8 @@ struct AgentStatus: Decodable {
         }
 #endif
         var request = URLRequest(url: Self.origin.appendingPathComponent(path))
+        let capturedSession = session
+        let requestToken = authorizationToken ?? (authenticated ? capturedSession?.accessToken : nil)
         request.httpMethod = method
         request.timeoutInterval = 25
         request.setValue(String(authoringVersion), forHTTPHeaderField: "X-Screenpunk-Authoring-Version")
@@ -294,7 +347,17 @@ struct AgentStatus: Decodable {
            let fields = body as? [String: String], let operationID = fields["operationID"] {
             try DeviceAccountDeletionTransaction.validateHTTPResponse(data, status: http.statusCode, operationID: operationID)
         }
+        if let capturedSession, requestToken == capturedSession.accessToken,
+           CloudDeviceRevocationEvidence.matches(status: http.statusCode, data: data, deviceID: capturedSession.deviceId) {
+            guard acceptRevocation(token: capturedSession.accessToken, deviceID: capturedSession.deviceId) else { throw CancellationError() }
+            throw DeviceError.deviceRevoked
+        }
         if http.statusCode == 401 { throw DeviceError.http(401, "Your connection has expired. Sign in again from Settings.") }
+        if http.statusCode == 409, path == "api/device/name",
+           let fields = try? JSONSerialization.jsonObject(with: data) as? [String: Any], fields["error"] as? String == "device_name_conflict",
+           let snapshot = try? JSONDecoder().decode(CloudDeviceNameSnapshot.self, from: data), snapshot.valid {
+            throw DeviceError.deviceNameConflict(snapshot)
+        }
         guard (200..<300).contains(http.statusCode) else {
             throw DeviceError.http(http.statusCode, "Screenpunk could not complete this request (\(http.statusCode)). Try again shortly.")
         }
@@ -304,7 +367,14 @@ struct AgentStatus: Decodable {
         if path.hasPrefix("api/device/requests") || path == "api/device/preferences/sync" {
             try DeviceAuthoringWire.validateResponse(data.isEmpty ? Data("{}".utf8) : data)
         }
-        return try JSONDecoder().decode(T.self, from: data.isEmpty ? Data("{}".utf8) : data)
+        let decoded = try JSONDecoder().decode(T.self, from: data.isEmpty ? Data("{}".utf8) : data)
+        if path == "api/device/status", let capturedSession, requestToken == capturedSession.accessToken,
+           session?.accessToken == capturedSession.accessToken,
+           let snapshot = try? JSONDecoder().decode(CloudDeviceNameSnapshot.self, from: data), snapshot.valid, snapshot.deviceId == capturedSession.deviceId {
+            try CloudDeviceNameRepository().observe(snapshot, key: Self.cloudNameKey(capturedSession))
+            try publishCloudName(capturedSession)
+        }
+        return decoded
     }
 
     func queryScreenData(readerID: String, revision: String, generation: String, alias: String, socketID: String, token: String) async throws -> ScreenDataSnapshot {
@@ -456,7 +526,31 @@ struct AgentStatus: Decodable {
     }
 }
 struct EmptyResponse: Decodable {}
-private struct DeviceRegistration: Decodable { let id: String; let profileID: String; let name: String? }
+private struct DeviceRegistration: Decodable {
+    let id: String; let profileID: String; let name: String?; let nameRevision: Int?; let enrollmentRevision: Int?
+    enum CodingKeys: String, CodingKey { case id, deviceId, profileID, name, nameRevision, enrollmentRevision }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let legacyID = try c.decodeIfPresent(String.self, forKey: .id)
+        let canonicalID = try c.decodeIfPresent(String.self, forKey: .deviceId)
+        guard legacyID == nil || canonicalID == nil || legacyID == canonicalID else {
+            throw DecodingError.dataCorruptedError(forKey: .deviceId, in: c, debugDescription: "Registration device identities differ.")
+        }
+        id = try legacyID ?? c.decode(String.self, forKey: .deviceId)
+        profileID = try c.decode(String.self, forKey: .profileID)
+        name = try c.decodeIfPresent(String.self, forKey: .name)
+        nameRevision = try c.decodeIfPresent(Int.self, forKey: .nameRevision)
+        enrollmentRevision = try c.decodeIfPresent(Int.self, forKey: .enrollmentRevision)
+        if nameRevision != nil || enrollmentRevision != nil {
+            guard nameSnapshot != nil else { throw DecodingError.dataCorruptedError(forKey: .nameRevision, in: c, debugDescription: "Invalid canonical device name metadata.") }
+        }
+    }
+    var nameSnapshot: CloudDeviceNameSnapshot? {
+        guard let name, let nameRevision, let enrollmentRevision else { return nil }
+        let snapshot = CloudDeviceNameSnapshot(deviceId: id, name: name, nameRevision: nameRevision, enrollmentRevision: enrollmentRevision)
+        return snapshot.valid ? snapshot : nil
+    }
+}
 
 struct PreferenceSyncResponse: Decodable {
     struct Accepted: Decodable { let id: String; let revision: Int }
@@ -565,7 +659,13 @@ private extension Data { var base64URL: String { base64EncodedString().replacing
     private static var credentials: OriginScopedCloudCredentials { .init(scope: CloudClient.originScope) }
     static func load() -> DeviceSession? {
         guard let data = try? credentials.load(account: "session", vault: CloudKeychainVault()) else { return nil }
-        return try? JSONDecoder().decode(DeviceSession.self, from: data)
+        guard let session = try? JSONDecoder().decode(DeviceSession.self, from: data),
+              let revoked = try? CloudSessionRevocationLedger().contains(origin: CloudClient.origin.absoluteString, credential: session.accessToken),
+              !revoked else { return nil }
+        return session
+    }
+    static func recordRevocation(_ session: DeviceSession) throws {
+        try CloudSessionRevocationLedger().record(origin: CloudClient.origin.absoluteString, credential: session.accessToken)
     }
     static func save(_ session: DeviceSession) throws {
         try credentials.save(JSONEncoder().encode(session), account: "session", vault: CloudKeychainVault())

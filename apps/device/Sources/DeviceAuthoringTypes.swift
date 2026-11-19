@@ -7,13 +7,18 @@ typealias ScreenArtifact = AuthoringScreen
 enum DeviceError: LocalizedError {
     case message(String)
     case http(Int, String)
+    case deviceNameConflict(CloudDeviceNameSnapshot)
+    case deviceRevoked
     var authorizationRejected: Bool {
+        if case .deviceRevoked = self { return true }
         if case .http(401, _) = self { return true }
         return false
     }
     var errorDescription: String? {
         switch self {
         case .message(let value), .http(_, let value): return value
+        case .deviceNameConflict: return "The device name changed in Cloud. The latest Cloud name has been kept."
+        case .deviceRevoked: return "This device was removed from your Cloud account. Sign in again to reconnect it."
         }
     }
 }
@@ -159,17 +164,25 @@ struct CloudPluginSetupProgress: Equatable {
 /// Socket messages are invalidations only. Unknown or incomplete frames cannot
 /// wake an account sync, and durable values always come from authenticated HTTP.
 enum DeviceCloudNotice: Equatable {
+    case deviceRevoked(deviceID: String)
+    case deviceNameUpdated(CloudDeviceNameSnapshot)
     case statusChanged
     case preferenceUpdated(profileID: String)
     case catalogUpdated
     case screenDataConnected(socketID: String)
     case screenDataQuery(DeviceScreenDataNotice)
 
-    private struct Wire: Decodable { let type: String; let profileID: String?; let screenDataSocketId: String? }
+    private struct Wire: Decodable { let type: String; let profileID: String?; let screenDataSocketId: String?; let deviceId: String? }
 
     static func decode(_ data: Data) -> Self? {
         guard data.count <= 4096, let wire = try? JSONDecoder().decode(Wire.self, from: data) else { return nil }
         switch wire.type {
+        case "device_name_updated":
+            guard let snapshot = try? JSONDecoder().decode(CloudDeviceNameSnapshot.self, from: data), snapshot.valid else { return nil }
+            return .deviceNameUpdated(snapshot)
+        case "device_revoked":
+            guard let id = wire.deviceId, !id.isEmpty, id.utf8.count <= 128 else { return nil }
+            return .deviceRevoked(deviceID: id)
         case "status_changed":
             if let socketID = wire.screenDataSocketId {
                 guard UUID(uuidString: socketID) != nil else { return nil }
@@ -185,6 +198,18 @@ enum DeviceCloudNotice: Equatable {
         case "catalog.updated": return .catalogUpdated
         default: return nil
         }
+    }
+}
+
+/// Generic 401/403 responses, timeouts and server outages are not proof that an
+/// enrollment was removed. Only this explicit authenticated response revokes it.
+enum CloudDeviceRevocationEvidence {
+    static func matches(status: Int, data: Data, deviceID: String) -> Bool {
+        guard status == 401, data.count <= 4096,
+              let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              body["error"] as? String == "device_revoked",
+              body["deviceId"] as? String == deviceID else { return false }
+        return true
     }
 }
 
