@@ -24,6 +24,40 @@ final class ScreenLibraryAuthoringTests: XCTestCase {
               durablePreferenceAuthorization: .init(requestID: request.requestID, quote: request.context.userRequest))
     }
 
+    @MainActor func testKeyboardDraftSurvivesReopenAndNewScreenPreservesExistingPackages() throws {
+        let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
+        let library = try ScreenLibrary(accountID: "fixture-account", rootDirectory: root)
+        for id in ["weather", "nasa"] {
+            try library.install(artifact(id), requestID: "install-" + id, replacing: id)
+        }
+        let ids = library.state.screens.map(\.id)
+        let revisions = library.state.screens.map(\.revision)
+        let contents = library.state.screens.map { $0.artifact.files.map(\.content) }
+        var backupCommits = 0
+        library.onCatalogRevisionCommitted = { backupCommits += 1 }
+        try library.saveKeyboardDraft("Make a separate counter.", screenID: nil)
+        try library.saveKeyboardDraft("Keep this weather draft.", screenID: "weather")
+        XCTAssertEqual(backupCommits, 0, "Private drafts are not screen revisions or backup packages")
+        try library.newScreen()
+        let reopened = try ScreenLibrary(accountID: "fixture-account", rootDirectory: root)
+        XCTAssertNil(reopened.selected)
+        XCTAssertEqual(reopened.keyboardDraft(screenID: nil), "Make a separate counter.")
+        XCTAssertEqual(reopened.keyboardDraft(screenID: "weather"), "Keep this weather draft.")
+        XCTAssertEqual(reopened.state.screens.map(\.id), ids)
+        XCTAssertEqual(reopened.state.screens.map(\.revision), revisions)
+        XCTAssertEqual(reopened.state.screens.map { $0.artifact.files.map(\.content) }, contents)
+        let other = try ScreenLibrary(accountID: "other-account", rootDirectory: root.appendingPathComponent("other-account"))
+        XCTAssertNil(other.keyboardDraft(screenID: nil))
+    }
+
+    @MainActor func testOversizedKeyboardDraftCannotReplaceSavedDraft() throws {
+        let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
+        let library = try ScreenLibrary(accountID: "fixture-account", rootDirectory: root)
+        try library.saveKeyboardDraft("Saved instructions", screenID: nil)
+        XCTAssertThrowsError(try library.saveKeyboardDraft(String(repeating: "x", count: 65_537), screenID: nil))
+        XCTAssertEqual(library.keyboardDraft(screenID: nil), "Saved instructions")
+    }
+
     @MainActor func testCompletionRecoveryRequiresLocallyOwnedUnsettledSnapshot() throws {
         for version in [1, 2] {
             let root = directory(); defer { try? FileManager.default.removeItem(at: root) }

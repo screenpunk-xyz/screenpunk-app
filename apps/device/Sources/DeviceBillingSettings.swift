@@ -32,11 +32,11 @@ struct DeviceBillingSettings: View {
             if let financial = snapshot?.financial, financial.showsCredits {
                 creditsSection(financial)
             }
-            let notices = [billing.notice(for: device.cloud), billing.restoreNotice(for: device.cloud)].compactMap { $0 }
+            let notices = billing.presentedNotices(for: device.cloud)
             if !notices.isEmpty {
                 Section {
-                    ForEach(notices, id: \.self) { notice in
-                        Label(notice, systemImage: "info.circle").foregroundStyle(.secondary)
+                    ForEach(notices) { notice in
+                        DismissibleMessage(notice.text, onDismiss: { billing.dismissNotice(id: notice.id, cloud: device.cloud) }).id(notice.id)
                     }
                 }
             }
@@ -134,7 +134,7 @@ struct DeviceBillingSettings: View {
         } else if billing.loading {
             ProgressView("Checking App Store availability…")
         } else {
-            Text(billing.purchaseUnavailableMessage(for: device.cloud)).foregroundStyle(.secondary)
+            DismissibleMessage(billing.purchaseUnavailableMessage(for: device.cloud))
         }
     }
 

@@ -85,6 +85,13 @@ enum PreparedRequestRecoveryPolicy {
 
 /// Transient message presentation only. Delivery state and the original message
 /// remain outside this value, so dismissal cannot complete or cancel a request.
+enum KeyboardRequestText {
+    static func normalized(_ value: String) -> String? {
+        let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !text.isEmpty && text.utf16.count <= 16_000 && text.utf8.count <= 16_384 ? text : nil
+    }
+}
+
 struct StatusMessagePresentationState {
     struct Message: Identifiable, Equatable {
         let id: UUID
@@ -96,12 +103,20 @@ struct StatusMessagePresentationState {
         guard let message, message.id != dismissedID else { return nil }
         return message
     }
+    /// Repeated background observations are the same presentation. An explicit
+    /// new attempt can clear first, or use update(_:), to create a fresh event.
+    mutating func updateIfChanged(_ text: String?) {
+        guard text != message?.text else { return }
+        update(text)
+    }
     mutating func update(_ text: String?) {
         message = text.map { Message(id: UUID(), text: $0) }
         dismissedID = nil
     }
     func canDismiss(busy: Bool, requestPending: Bool, routeChangeBlocked: Bool, canRetry: Bool, canCancelRequest: Bool) -> Bool {
-        presentedMessage != nil && !busy && !requestPending && !routeChangeBlocked && !canRetry && !canCancelRequest
+        // Acknowledging a message never cancels work or resolves recovery state.
+        // Retry/Cancel and progress remain available independently of this text.
+        presentedMessage != nil
     }
     @discardableResult mutating func dismiss(id: UUID, busy: Bool, requestPending: Bool, routeChangeBlocked: Bool, canRetry: Bool, canCancelRequest: Bool) -> Bool {
         guard presentedMessage?.id == id,

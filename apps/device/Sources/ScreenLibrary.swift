@@ -31,7 +31,7 @@ import ScreenpunkCore
     func containsRotationScreen(_ id: String) -> Bool { id == Self.instructionsID || state.screens.contains { $0.id == id } }
 
     struct Saved: Codable, Identifiable { let id: String; let revision: String; let artifact: ScreenArtifact }
-    struct State: Codable { var screens: [Saved] = []; var selectedID: String?; var previous: Saved?; var lastRequest: String?; var pendingID: String?; var pendingScreenID: String?; var consumedID: String?; var cancelledRequests: [String]?; var cancelIntents: [String]?; var lastInstruction: String?; var submissionKey: String?; var submissionText: String?; var submissionScreen: ScreenArtifact?; var requestDeadline: Double?; var authoring: AuthoringStoreState?; var linkedProfile: LocalProfileDescriptor?; var localRequestIDs: Set<String>?; var bundledScreenSeeds: Set<String>?; var catalog: CatalogQueue?; var hiddenScreenIDs: Set<String>?; var onboarding: Onboarding?; var publicDataRevocations: Set<String>?; var screenDataGenerations: [String: String]? }
+    struct State: Codable { var screens: [Saved] = []; var selectedID: String?; var previous: Saved?; var lastRequest: String?; var pendingID: String?; var pendingScreenID: String?; var consumedID: String?; var cancelledRequests: [String]?; var cancelIntents: [String]?; var lastInstruction: String?; var keyboardDrafts: [String: String]?; var submissionKey: String?; var submissionText: String?; var submissionScreen: ScreenArtifact?; var requestDeadline: Double?; var authoring: AuthoringStoreState?; var linkedProfile: LocalProfileDescriptor?; var localRequestIDs: Set<String>?; var bundledScreenSeeds: Set<String>?; var catalog: CatalogQueue?; var hiddenScreenIDs: Set<String>?; var onboarding: Onboarding?; var publicDataRevocations: Set<String>?; var screenDataGenerations: [String: String]? }
     private(set) var state = State()
     var onCatalogRevisionCommitted: (() -> Void)?
     private let root: URL
@@ -396,6 +396,16 @@ import ScreenpunkCore
     }
     func savePending(id: String?, screenID: String?, consumedID: String?) throws {
         var next = state; next.pendingID = id; next.pendingScreenID = screenID; next.consumedID = consumedID; try commit(next)
+    }
+    func keyboardDraft(screenID: String?) -> String? { state.keyboardDrafts?[screenID ?? "screenpunk.new-draft"] }
+    func saveKeyboardDraft(_ text: String, screenID: String?) throws {
+        guard text.utf8.count <= 65_536 else { throw DeviceError.message("The draft is too large to save. Shorten it or copy it before closing.") }
+        let key = screenID ?? "screenpunk.new-draft"
+        guard state.keyboardDrafts?[key] != text else { return }
+        var next = state
+        if next.keyboardDrafts == nil { next.keyboardDrafts = [:] }
+        next.keyboardDrafts?[key] = text
+        try commit(next, captureCatalog: false)
     }
     func saveInstruction(_ text: String) throws { var next = state; next.lastInstruction = text; try commit(next) }
     func saveSubmission(key: String, text: String, screen: ScreenArtifact?) throws {

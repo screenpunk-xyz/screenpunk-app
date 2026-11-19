@@ -44,7 +44,7 @@ struct DeviceAccountSettings: View {
                     Button("Add agent") { model.beginSetup(); setup = .pairing }.disabled(device.routeChangeBlocked)
                 }
                 Text("Mac supported in this prototype.").font(.caption).foregroundStyle(.secondary)
-                if let error = model.error { Text(error).foregroundStyle(.red) }
+                if let error = model.presentedError { DismissibleMessage(error.text, color: .red, onDismiss: { model.dismissError(id: error.id) }).id(error.id) }
             }
             Section("Use for new requests") {
                 Picker("Agent", selection: Binding(get: { device.routePreference }, set: device.selectRoutePreference)) {
@@ -155,7 +155,10 @@ struct LocalAgentSetupView: View {
                 if step == 0 { prepare }
                 else if step == 1 { scan }
                 else { connected }
-                if let error = model.error ?? cameraError { Section { Text(error).foregroundStyle(.red) } }
+                if let error = model.presentedError {
+                    Section { DismissibleMessage(error.text, color: .red, onDismiss: { model.dismissError(id: error.id) }).id(error.id) }
+                }
+                if let error = cameraError { Section { DismissibleMessage(error, color: .red, onDismiss: { cameraError = nil }) } }
             }
             .navigationTitle(titles[step])
             .navigationBarTitleDisplayMode(.inline)
@@ -240,7 +243,7 @@ struct LocalAgentSetupView: View {
                 TextField("Computer name", text: $model.name)
                 TextField("Mac address", text: $model.host).textInputAutocapitalization(.never).autocorrectionDisabled()
                 Button(discovery.searching ? "Search again" : "Find nearby computers") { discovery.start() }
-                if let message = discovery.message { Text(message).font(.caption).foregroundStyle(.secondary) }
+                if let message = discovery.message { DismissibleMessage(message).font(.caption) }
                 ForEach(discovery.computers) { computer in
                     Button { model.host = computer.host; model.sshPort = String(computer.port); discovery.stop() } label: {
                         VStack(alignment: .leading) { Text(computer.name); Text(computer.host).font(.caption) }
@@ -310,7 +313,7 @@ private struct LocalAgentAddressRecoveryView: View {
                 Section("Computer address") {
                     Text("Use this if the paired Mac moved to another address. The saved SSH identity and connection credential stay the same.")
                     Button(discovery.searching ? "Search again" : "Find nearby computers") { discovery.start() }.disabled(model.testing)
-                    if let message = discovery.message { Text(message).font(.caption).foregroundStyle(.secondary) }
+                    if let message = discovery.message { DismissibleMessage(message).font(.caption) }
                     ForEach(discovery.computers) { computer in
                         Button { host = computer.host; port = String(computer.port); discovery.stop() } label: {
                             VStack(alignment: .leading) { Text(computer.name); Text(computer.host).font(.caption) }
@@ -328,7 +331,7 @@ private struct LocalAgentAddressRecoveryView: View {
                     }.disabled(model.testing || host.isEmpty || Int(port) == nil)
                     if model.testing { ProgressView() }
                     Text(model.connectionStatusLabel).foregroundStyle(.secondary)
-                    if let error = model.error { Text(error).foregroundStyle(.red) }
+                    if let error = model.presentedError { DismissibleMessage(error.text, color: .red, onDismiss: { model.dismissError(id: error.id) }).id(error.id) }
                     if completed { Button("Done") { dismiss() } }
                 }
                 DisclosureGroup("Advanced") {
@@ -354,8 +357,10 @@ struct DeviceAccountDeletionSection: View {
                 if device.accountDeletionInProgress {
                     ProgressView(device.accountDeletionStatus ?? "Deleting account…")
                 } else if device.accountDeletionNeedsRetry {
-                    Text(device.accountDeletionStatus ?? "Account deletion needs attention.")
-                        .font(.callout).foregroundStyle(.secondary)
+                    if let status = device.presentedInlineMessage(.deletionStatus) {
+                        DismissibleMessage(status.text, onDismiss: { device.dismissInlineMessage(.deletionStatus, id: status.id) }).id(status.id)
+                            .font(.callout).foregroundStyle(.secondary)
+                    }
                     Button(device.accountDeletionRetryTitle, role: .destructive) {
                         if device.accountDeletionRequiresConfirmation {
                             confirmationAccountID = accountID
@@ -367,12 +372,10 @@ struct DeviceAccountDeletionSection: View {
                     Button("Delete This Account", role: .destructive) { confirmationAccountID = accountID }
                         .disabled(device.accountOperationInProgress || device.routeChangeBlocked)
                 }
-                if let failure = device.accountDeletionError {
-                    Text(failure).font(.callout).foregroundStyle(.red)
-                    if let code = device.accountDeletionDiagnosticCode {
-                        Text("Last server report: \(code)")
-                            .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
-                    }
+                if let failure = device.presentedInlineMessage(.deletionError) {
+                    let diagnostic = device.accountDeletionDiagnosticCode.map { "\nLast server report: \($0)" } ?? ""
+                    DismissibleMessage(failure.text + diagnostic, color: .red,
+                        onDismiss: { device.dismissInlineMessage(.deletionError, id: failure.id) }).id(failure.id).font(.callout)
                 }
                 Text("Deleting your Screenpunk account does not cancel an App Store subscription.")
                     .font(.caption).foregroundStyle(.secondary)
