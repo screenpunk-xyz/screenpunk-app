@@ -350,6 +350,8 @@ import ScreenpunkLocalTransport
     }
     init() {
         RequestTimeline.record(.launch)
+        cloud.sessionRevoked = { [weak self] in self?.finishCloudDeviceRevocation() }
+        cloud.deviceNameChanged = { [weak self] name, status in self?.displayName = name; self?.deviceNameSyncStatus = status }
         email = cloud.session?.user.email
         billing.observeAccount(self)
         do {
@@ -1225,7 +1227,7 @@ import ScreenpunkLocalTransport
             do {
                 try await cloud.syncDeviceName()
                 guard preferenceSyncBinding == binding, cloud.session?.accessToken == token, !Task.isCancelled else { return true }
-                deviceNameSyncStatus = nil
+                deviceNameSyncStatus = cloud.deviceNameSyncNotice
             } catch {
                 guard preferenceSyncBinding == binding, cloud.session?.accessToken == token, !Task.isCancelled else { return true }
                 if (error as? DeviceError)?.authorizationRejected == true { throw error }
@@ -1500,6 +1502,12 @@ import ScreenpunkLocalTransport
                 self.requestCloudStatusReconciliation()
             }
             switch notice {
+            case .deviceNameUpdated(let snapshot):
+                do {
+                    if try !self.cloud.observeDeviceName(snapshot, token: session.accessToken) { self.requestCloudStatusReconciliation() }
+                } catch { self.deviceNameSyncStatus = "Cloud could not save this device name on the iPad. It will retry when connected." }
+            case .deviceRevoked(let deviceID):
+                self.cloud.acceptRevocation(token: session.accessToken, deviceID: deviceID)
             case .statusChanged:
                 if !initial {
                     RequestTimeline.record(.socketStatusChanged, requestID: self.pendingID)
@@ -1535,6 +1543,7 @@ import ScreenpunkLocalTransport
         requestCloudStatusReconciliation()
     }
     private func rejectCloudAuthorization() {
+        guard cloud.session != nil else { return }
         if currentRequestRoute == .cloud { agentWorkingRequestID = nil }
         cloudAuthorizationRejected = true
         clearCloudStatusReads()
@@ -1547,6 +1556,24 @@ import ScreenpunkLocalTransport
         preferenceSyncFlight.cancel()
         cancelCatalogWork()
         preferenceSyncStatus = "Sign in again to synchronize with Cloud. Preferences saved on this iPad are still available."
+    }
+    private func finishCloudDeviceRevocation() {
+        stopConnection()
+        // Account deletion has its own durable recovery transaction. A revoked
+        // enrollment must never erase or masquerade as completion of that flow.
+        if accountDeletionIntent != nil { email = nil; return }
+        library?.setCatalogBackupScope(nil)
+        detachAccountLibrary()
+        email = nil
+        busy = false
+        choosingSignInProvider = false
+        settingsOpen = false
+        do { try openLibrary() }
+        catch { message = "This device was removed from Cloud. Could not open the local library: \(error.localizedDescription)"; return }
+        message = cloud.revocationPersistenceFailed
+            ? "This device was removed from Cloud. Unlock this iPad and reopen Screenpunk to finish clearing its saved sign-in. Your saved screens are preserved."
+            : "This device was removed from your Cloud account. Your saved screens and Cloud backups are preserved."
+        startConnection()
     }
     private func requestCloudStatusReconciliation() {
         if shouldCheckCloudSetup {
@@ -2547,6 +2574,7 @@ extension DeviceModel {
     func updateDeviceName(_ name: String) {
         guard let key = deviceNameStorageKey else { message = "Device identity is not ready. Try again shortly."; return }
         do {
+            try cloud.queueDeviceName(name)
             displayName = try DeviceNameStore().save(name, for: key)
             deviceNameSyncStatus = cloudBindingMatches ? "Saved on this iPad. Updating Cloud…" : "Saved on this iPad. Cloud will update when this account is connected."
             requestPreferenceSync()
