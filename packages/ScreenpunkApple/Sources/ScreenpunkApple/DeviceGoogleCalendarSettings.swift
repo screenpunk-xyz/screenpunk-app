@@ -45,6 +45,7 @@ public struct DeviceGoogleCalendarSettings: View {
     let onChange: () -> Void
     @State private var state = GoogleCalendarState()
     @State private var message: String?
+    @State private var configurationNoticeDismissed = false
     @State private var busy = false
     @State private var pending: Task<Void, Never>?
     @State private var signIn = GoogleCalendarSignIn()
@@ -83,7 +84,7 @@ public struct DeviceGoogleCalendarSettings: View {
                         try await service.connect(oauth: oauth, code: oauth.code(from: callback), expected: expected)
                     }
                 }.disabled(!configured)
-                if !configured { Text("Google Calendar sign-in is not configured in this build.").foregroundStyle(.secondary) }
+                if !configured && !configurationNoticeDismissed { ConnectionFeedback("Google Calendar sign-in is not configured in this build.") { configurationNoticeDismissed = true } }
             }
             ForEach(calendarScreens, id: \.dashboardId) { screen in
                 Section(screen.name) {
@@ -106,7 +107,7 @@ public struct DeviceGoogleCalendarSettings: View {
                 Link("Manage access in Google", destination: URL(string: "https://myaccount.google.com/connections")!)
             }
             if busy { Section { ProgressView("Connecting to Google…") } }
-            if let message { Section { Text(message).foregroundStyle(.secondary) } }
+            if let message { Section { ConnectionFeedback(message) { self.message = nil } } }
         }
         .disabled(busy)
         .task { reload() }

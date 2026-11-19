@@ -5,14 +5,22 @@ final class GoogleTVSetup: ObservableObject {
     @Published var host = GoogleTVConfiguration.load().host
     @Published var code = ""
     @Published var dashboards = GoogleTVConfiguration.load().dashboardIDs.joined(separator: "\n")
-    @Published var message = "Pair separately on the Mac and each iPad. No Home Assistant or running Mac is required."
+    @Published var message = "Pair separately on the Mac and each iPad. No Home Assistant or running Mac is required." {
+        didSet { if message != oldValue { acknowledgedMessage = nil } }
+    }
+    @Published private var acknowledgedMessage: String?
+    var presentedMessage: String? { message.isEmpty || acknowledgedMessage == message ? nil : message }
+    func dismissMessage(_ text: String) {
+        guard message == text else { return }
+        acknowledgedMessage = text
+    }
     @Published var waitingCode = false
     @Published var busy = false
     private var pairingHost = ""
     private let session = GoogleTVSession()
     private var task: Task<Void, Never>?
     func run(_ action: @escaping () async throws -> Void) {
-        guard !busy else { return }; busy = true
+        guard !busy else { return }; acknowledgedMessage = nil; busy = true
         task = Task { do { try await action() } catch is CancellationError { message = "Operation cancelled. You can try again." } catch { message = error.localizedDescription }; busy = false }
     }
     func pair() {
@@ -86,7 +94,7 @@ public struct GoogleTVConnectionSheet: View {
                     Text("On Google TV, find its IP address in network settings. Keep both devices on the same LAN and allow Screenpunk Local Network access.")
                     TextField("Google TV IP address or hostname", text: $model.host).disabled(model.busy || model.waitingCode)
                     Button("Start Pairing", action: model.pair).disabled(model.busy)
-                    Text(model.message).textSelection(.enabled)
+                    if let message = model.presentedMessage { ConnectionFeedback(message) { model.dismissMessage(message) } }
                     if model.busy {
                         ProgressView()
                         Button("Cancel", action: model.stop)
@@ -103,7 +111,7 @@ public struct GoogleTVConnectionSheet: View {
                 }
                 Section("Connection") {
                     Button("Check Connection", action: model.check).disabled(model.busy)
-                    Text(model.message).textSelection(.enabled)
+                    if let message = model.presentedMessage { ConnectionFeedback(message) { model.dismissMessage(message) } }
                 }
                 Section { Button("Forget Google TV Connection", role: .destructive, action: model.forget) }
             }

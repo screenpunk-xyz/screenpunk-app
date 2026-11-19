@@ -34,7 +34,7 @@ public struct DeviceHomeAssistantSettings: View {
                     do { try HomeAssistantDeviceVault().revokeCredential(owner: owner); token = ""; message = "Disconnected"; reload(); onChange() }
                     catch { message = "Could not remove the connection." }
                 }.disabled(!connected)
-                if let message { Text(message).foregroundStyle(.secondary) }
+                if let message { ConnectionFeedback(message) { self.message = nil } }
             }
             Section("Screens using Home Assistant") {
                 ForEach(manifests, id: \.dashboardId) { manifest in

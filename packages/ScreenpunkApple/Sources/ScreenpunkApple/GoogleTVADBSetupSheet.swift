@@ -9,7 +9,15 @@ final class GoogleTVADBSetup: ObservableObject {
     @Published var screens = GoogleTVADBConfiguration.load().dashboardIDs.joined(separator: "\n")
     @Published var powerToggleAllowed = GoogleTVADBConfiguration.load().powerToggleAllowed == true
     @Published var channels = GoogleTVADBConfiguration.load().channelIDs.joined(separator: "\n")
-    @Published var message = "Pair this device separately. No Mac, Home Assistant, or computer connection is needed at runtime."
+    @Published var message = "Pair this device separately. No Mac, Home Assistant, or computer connection is needed at runtime." {
+        didSet { if message != oldValue { acknowledgedMessage = nil } }
+    }
+    @Published private var acknowledgedMessage: String?
+    var presentedMessage: String? { message.isEmpty || acknowledgedMessage == message ? nil : message }
+    func dismissMessage(_ text: String) {
+        guard message == text else { return }
+        acknowledgedMessage = text
+    }
     @Published var busy = false
     @Published private(set) var pendingPairing = false
     private var pendingPeer: (host: String, guid: String, pin: Data?)?
@@ -19,7 +27,7 @@ final class GoogleTVADBSetup: ObservableObject {
     private var cancellationReason = "Connection check cancelled. Pairing was preserved."
     func stop(reason: String = "Cancelled. Pairing was preserved.") { cancellationReason = reason; generation = UUID(); task?.cancel(); client?.close(); code = "" }
     private func run(_ action: @escaping () async throws -> Void) {
-        guard !busy else { return }; busy = true
+        guard !busy else { return }; acknowledgedMessage = nil; busy = true
         task = Task { defer { busy = false; client?.close(); client = nil; code = "" }; do { try await action() } catch is CancellationError { message = cancellationReason } catch { message = error.localizedDescription } }
     }
     func pair() {
@@ -151,7 +159,7 @@ struct GoogleTVADBSetupSheet: View {
                     Button("Forget Direct Channels", role: .destructive, action: model.forget)
                 }.disabled(model.busy)
                 Section {
-                    Text(model.message).textSelection(.enabled)
+                    if let message = model.presentedMessage { ConnectionFeedback(message) { model.dismissMessage(message) } }
                     if model.busy { ProgressView(); Button("Cancel", action: { model.stop() }) }
                 }
             }
