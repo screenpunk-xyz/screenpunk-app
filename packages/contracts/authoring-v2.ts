@@ -1,5 +1,5 @@
 import definition from './generated/authoring-v2-definition';
-import { AUTHORING_DEFINITION, AuthoringContractError, authoringRuntime, canonicalJSON, checkAuthoringManifestScreenData, sealAuthoringRequest, validateAuthoringRequest, validateAuthoringResult, validateAuthoringScreen, type AuthoringRequestV1, type AuthoringResultV1, type AuthoringScreen, type JSONSchema } from './authoring';
+import { AUTHORING_DEFINITION, AuthoringContractError, authoringRuntime, canonicalJSON, checkAuthoringManifestScreenData, checkBrowserHostAuthoringManifest, checkBrowserHostAuthoringScreen, isBrowserHostAuthoringRuntime, sealAuthoringRequest, validateAuthoringRequest, validateAuthoringResult, validateAuthoringScreen, type AuthoringRequestV1, type AuthoringResultV1, type AuthoringScreen, type JSONSchema } from './authoring';
 export interface AuthoringSourceFileV2 { path: string; mediaType: string; byteLength: number; digest: string; reference: string; content?: string }
 export interface AuthoringSourceScreenV2 { title: string; entry: 'index.html'; files: AuthoringSourceFileV2[] }
 export interface AuthoringContextV2 extends Omit<AuthoringRequestV1['context'],'currentScreen'> { libraryID: string; currentScreen?: AuthoringSourceScreenV2 }
@@ -97,7 +97,7 @@ export function validateAuthoringResultV2(value:unknown,request?:AuthoringReques
   for(const path of screen.deletedPaths){if(deleted.has(path.toLowerCase()))fail('duplicate deleted path');deleted.add(path.toLowerCase());}
   let total=0;
   for(const file of screen.files){const path=file.path.toLowerCase();if(targets.has(path)||deleted.has(path))fail('duplicate/overlapping destination');targets.add(path);
-   if(file.kind==='write'){total+=utf8(file.content).length;if(file.path==='manifest.json')checkAuthoringManifestScreenData(file.content,previousManifest,supportsScreenData);}
+   if(file.kind==='write'){total+=utf8(file.content).length;if(file.path==='manifest.json'){checkAuthoringManifestScreenData(file.content,previousManifest,supportsScreenData);if(request&&isBrowserHostAuthoringRuntime(request.runtime))checkBrowserHostAuthoringManifest(file.content,screen.files.map(f=>f.path));}}
    else if(request){const source=base.find(f=>f.path===file.sourcePath&&f.reference===file.reference&&f.digest===file.digest)??fail('unknown/out-of-scope source reference');total+=source.byteLength;
     if(file.path==='manifest.json'&&source.path!==file.path){if(source.content!==undefined)checkAuthoringManifestScreenData(source.content,previousManifest,supportsScreenData);else if(!supportsScreenData)fail('target runtime cannot admit a manifest from an opaque reference');}}
   }
@@ -111,5 +111,7 @@ export function validateAuthoringResultV2(value:unknown,request?:AuthoringReques
 export async function materializeAuthoringResultV2(result:AuthoringResultV2,request:AuthoringRequestV2,resolve:(file:AuthoringSourceFileV2)=>Promise<Uint8Array>|Uint8Array):Promise<AuthoringScreen|undefined> {
  if(!await verifyAuthoringRequestDigestV2(request))fail('snapshot/reference digest mismatch');validateAuthoringResultV2(result,request);if(!result.screen)return undefined;const files=[];
  for(const file of result.screen.files){if(file.kind==='write'){files.push({path:file.path,content:file.content});continue;}const source=request.context.currentScreen!.files.find(f=>f.path===file.sourcePath)!;const bytes=await resolve(source);if(bytes.length!==source.byteLength||await authoringContentDigestV2(bytes)!==source.digest)fail('pinned source corrupt/missing');let content:string;try{content=new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(bytes);}catch{fail('source is not UTF8');}if(file.path==='manifest.json'&&source.path!==file.path)checkAuthoringManifestScreenData(content!,request.context.currentScreen?.files.find(f=>f.path==='manifest.json')?.content,canonicalJSON(request.runtime)===canonicalJSON(authoringRuntime(true)));files.push({path:file.path,content:content!});}
- return validateAuthoringScreen({title:result.screen.title,entry:result.screen.entry,files});
+ const materialized=validateAuthoringScreen({title:result.screen.title,entry:result.screen.entry,files});
+ if(isBrowserHostAuthoringRuntime(request.runtime))checkBrowserHostAuthoringScreen(materialized);
+ return materialized;
 }

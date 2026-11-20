@@ -1,4 +1,5 @@
 import definition from "./generated/authoring-definition";
+import browserHostDefinition from "./generated/browser-host-definition";
 import { validateManifestScreenData } from "./screen-data";
 
 export type JSONValue = null | boolean | number | string | JSONValue[] | { [key: string]: JSONValue };
@@ -17,12 +18,15 @@ export interface AuthoringRequestV1 { schemaVersion: 1; requestID: string; creat
 export interface AuthoringResultV1 { schemaVersion: 1; requestID: string; inputDigest: string; baseRevision: string | null; preferenceRevisions: Record<string, number>; operationID: string; screen?: AuthoringScreen; answer?: string; preferenceMutations?: PreferenceMutationV1[]; durablePreferenceAuthorization?: DurablePreferenceAuthorizationV1 }
 export interface ApplicationReceiptV1 { schemaVersion: 1; requestID: string; operationID: string; inputDigest: string; status: "applied" | "conflict" | "rejected"; appliedAt: number; message?: string }
 export interface AuthoringDefinitionV1 { schemaVersion: 1; designGuidance: AuthoringDesignGuidanceV1; runtime: AuthoringRuntimeV1; browser: {designGuidance: AuthoringDesignGuidanceV1; runtime: AuthoringRuntimeV1}; serviceCatalog: AuthoringServiceDefinitionV1[]; schemas: Record<"Request" | "Result" | "Preference" | "Receipt", JSONSchema>; screenData: { version: 1; features: string[]; rules: string[]; manifestSchema: JSONSchema } }
+export interface BrowserHostAuthoringProfileV1 { profileID: "browser-host-v1"; designGuidance: AuthoringDesignGuidanceV1; runtime: AuthoringRuntimeV1; serviceCatalog: AuthoringServiceDefinitionV1[]; policy: JSONSchema }
 const baseDefinition = definition as unknown as AuthoringDefinitionV1;
 function deepFreeze<T>(value: T): T {
   if (value !== null && typeof value === "object") { for (const item of Object.values(value)) deepFreeze(item); Object.freeze(value); }
   return value;
 }
 export const AUTHORING_DEFINITION = deepFreeze({ ...baseDefinition, schemas: { ...baseDefinition.schemas, request: baseDefinition.schemas.Request, result: baseDefinition.schemas.Result, preference: baseDefinition.schemas.Preference, receipt: baseDefinition.schemas.Receipt } });
+/** Opt-in contract only: consumers must verify their adapter implements this profile before selecting it. */
+export const BROWSER_HOST_AUTHORING_PROFILE = deepFreeze(browserHostDefinition as unknown as BrowserHostAuthoringProfileV1);
 export const SCREEN_AUTHORING_GUIDANCE: readonly string[] = AUTHORING_DEFINITION.designGuidance.rules;
 export function browserAuthoringRuntime(): AuthoringRuntimeV1 {
   return structuredClone(AUTHORING_DEFINITION.browser.runtime);
@@ -30,8 +34,18 @@ export function browserAuthoringRuntime(): AuthoringRuntimeV1 {
 export function browserAuthoringDesignGuidance(): AuthoringDesignGuidanceV1 {
   return structuredClone(AUTHORING_DEFINITION.browser.designGuidance);
 }
+export function browserHostAuthoringRuntime(): AuthoringRuntimeV1 { return structuredClone(BROWSER_HOST_AUTHORING_PROFILE.runtime); }
+export function browserHostAuthoringDesignGuidance(): AuthoringDesignGuidanceV1 { return structuredClone(BROWSER_HOST_AUTHORING_PROFILE.designGuidance); }
+export function isBrowserHostAuthoringRuntime(runtime: AuthoringRuntimeV1): boolean {
+  return canonicalJSON(runtime) === canonicalJSON(BROWSER_HOST_AUTHORING_PROFILE.runtime);
+}
+export function makeBrowserHostAuthoringServices(observedAt: number, observations: Partial<Pick<AuthoringServiceV1, "configured" | "authorized" | "entitled" | "reachable">> = {}): AuthoringServiceV1[] {
+  const unknown: CapabilityState = { state: "unknown", observedAt };
+  return BROWSER_HOST_AUTHORING_PROFILE.serviceCatalog.map(service => ({ id: service.id, provider: service.provider, operations: structuredClone(service.operations), supported: { state: "yes", observedAt },
+    configured: structuredClone(observations.configured ?? unknown), authorized: structuredClone(observations.authorized ?? unknown), entitled: structuredClone(observations.entitled ?? unknown), reachable: structuredClone(observations.reachable ?? unknown) }));
+}
 function isBrowserRuntime(runtime: AuthoringRuntimeV1): boolean {
-  return canonicalJSON(runtime) === canonicalJSON(AUTHORING_DEFINITION.browser.runtime);
+  return canonicalJSON(runtime) === canonicalJSON(AUTHORING_DEFINITION.browser.runtime) || isBrowserHostAuthoringRuntime(runtime);
 }
 export function authoringRuntime(supportsScreenData: boolean): AuthoringRuntimeV1 {
   const { runtime, screenData } = AUTHORING_DEFINITION;
@@ -139,21 +153,50 @@ export function checkAuthoringManifestScreenData(content: string, previous?: str
 export function makeAuthoringServices(observedAt: number): AuthoringServiceV1[] {
   return AUTHORING_DEFINITION.serviceCatalog.map(service => ({id:service.id,provider:service.provider,operations:structuredClone(service.operations),supported:{state:"yes",observedAt},configured:{state:service.provider === "googleCalendar" ? "no" : "unknown",observedAt},authorized:{state:"unknown",observedAt},entitled:{state:"unknown",observedAt},reachable:{state:"unknown",observedAt}}));
 }
+/** Checks authored host-profile manifests, including materialized v2 references. Runtime admission still owns permissions/network policy. */
+export function checkBrowserHostAuthoringManifest(content: string, filePaths: string[]): void {
+  let manifest: any;
+  try { manifest = JSON.parse(content); } catch { return fail("invalid browser host manifest"); }
+  if (!plain(manifest) || manifest.screenData !== undefined) fail("browser host runtime does not support screen data");
+  const connections = manifest.connections === undefined ? [] : manifest.connections;
+  if (!Array.isArray(connections) || connections.length > 8) fail("invalid browser public connections");
+  const schema = BROWSER_HOST_AUTHORING_PROFILE.serviceCatalog[0].operations[0].inputSchema;
+  const aliases = new Set<string>();
+  for (const connection of connections) {
+    check(schema.$defs.PublicHTTPConnection, connection, schema.$defs, "$.screen.manifest.connections");
+    if (aliases.has(connection.alias)) fail("duplicate browser public alias"); aliases.add(connection.alias);
+  }
+  const pages = manifest.pages === undefined ? [{ id: "default", name: "Screen", path: "index.html" }] : manifest.pages;
+  if (!Array.isArray(pages) || !pages.length || pages.length > 64) fail("invalid browser pages");
+  const ids = new Set<string>();
+  for (const page of pages) {
+    if (!plain(page) || typeof page.id !== "string" || (!page.id.length || page.id.length > 128 || /[^A-Za-z0-9_-]/.test(page.id)) || ids.has(page.id) || typeof page.name !== "string" || !page.name.length || page.name.length > 128 || typeof page.path !== "string" || !/^([A-Za-z0-9_-]+\/)*[A-Za-z0-9_.-]+\.html$/.test(page.path) || !filePaths.includes(page.path)) fail("invalid browser page target");
+    ids.add(page.id);
+  }
+  if (manifest.defaultPageId !== undefined && !ids.has(manifest.defaultPageId)) fail("invalid browser default page");
+}
+export function checkBrowserHostAuthoringScreen(screen: AuthoringScreen): void {
+  const manifest = screen.files.find(file => file.path === "manifest.json");
+  if (manifest) checkBrowserHostAuthoringManifest(manifest.content, screen.files.map(file => file.path));
+}
 export function validatePreferenceRecord(value: unknown): PreferenceRecordV1 { validate("Preference",value); return value as PreferenceRecordV1; }
 export function validateAuthoringRequest(value: unknown): AuthoringRequestV1 {
   validate("Request", value); const request = value as AuthoringRequestV1;
   if (request.deadlineAt <= request.createdAt) fail("deadline must follow creation");
   const runtime = canonicalJSON(request.runtime);
   const screenData = runtime === canonicalJSON(authoringRuntime(true));
-  const browser = isBrowserRuntime(request.runtime);
-  const expectedRuntime = browser ? browserAuthoringRuntime() : authoringRuntime(screenData);
-  const expectedGuidance = browser ? browserAuthoringDesignGuidance() : authoringDesignGuidance(screenData);
+  const browserHost = isBrowserHostAuthoringRuntime(request.runtime);
+  const browser = runtime === canonicalJSON(browserAuthoringRuntime());
+  const expectedRuntime = browserHost ? browserHostAuthoringRuntime() : browser ? browserAuthoringRuntime() : authoringRuntime(screenData);
+  const expectedGuidance = browserHost ? browserHostAuthoringDesignGuidance() : browser ? browserAuthoringDesignGuidance() : authoringDesignGuidance(screenData);
   if (runtime !== canonicalJSON(expectedRuntime) || canonicalJSON(request.designGuidance) !== canonicalJSON(expectedGuidance)) fail("unsupported guidance/runtime definition");
   if (browser && (request.services.length || request.preferences.length)) fail("browser runtime requires empty services and preferences");
+  if (browserHost && request.preferences.length) fail("browser host runtime does not support authoring preferences");
   const seen = new Set<string>();
   for (const service of request.services) {
     if (seen.has(service.id)) fail("duplicate service id"); seen.add(service.id);
-    const catalog = AUTHORING_DEFINITION.serviceCatalog.find(x => x.provider === service.provider);
+    const catalog = (browserHost ? BROWSER_HOST_AUTHORING_PROFILE.serviceCatalog : AUTHORING_DEFINITION.serviceCatalog).find(x => x.provider === service.provider);
+    if (browserHost && service.id !== catalog?.id) fail("unsupported browser service id");
     if (!catalog || canonicalJSON(catalog.operations) !== canonicalJSON(service.operations)) fail("unsupported provider operation definitions");
     for (const key of ["supported","configured","authorized","entitled","reachable"] as const) if (service[key].observedAt > request.createdAt) fail("capability observation is in the future");
   }
@@ -187,6 +230,7 @@ export function validateAuthoringResult(value: unknown, request?: AuthoringReque
   if (request) {
     validateAuthoringRequest(request);
     if (isBrowserRuntime(request.runtime) && mutations.length) fail("browser runtime does not support preference mutations");
+    if (isBrowserHostAuthoringRuntime(request.runtime) && result.screen) checkBrowserHostAuthoringScreen(result.screen);
     const manifest = result.screen?.files.find(f => f.path === "manifest.json");
     if (manifest) checkAuthoringManifestScreenData(manifest.content, request.context.currentScreen?.files.find(f => f.path === "manifest.json")?.content,
       canonicalJSON(request.runtime) === canonicalJSON(authoringRuntime(true)));

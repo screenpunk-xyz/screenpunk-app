@@ -340,6 +340,15 @@ public struct AuthoringBrowserProfileV1: Codable, Sendable, Equatable {
     public var runtime: AuthoringRuntimeV1
 }
 
+/// Separate opt-in profile; legacy definitions and sealed snapshots are unchanged.
+public struct AuthoringBrowserHostProfileV1: Codable, Sendable, Equatable {
+    public var profileID: String
+    public var designGuidance: AuthoringDesignGuidanceV1
+    public var runtime: AuthoringRuntimeV1
+    public var serviceCatalog: [AuthoringServiceDefinitionV1]
+    public var policy: AuthoringJSONValue
+}
+
 public struct AuthoringDefinitionV1: Codable, Sendable, Equatable {
     public var schemaVersion: Int
     public var designGuidance: AuthoringDesignGuidanceV1

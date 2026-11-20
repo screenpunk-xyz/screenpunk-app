@@ -1,0 +1,787 @@
+{
+  "profileID": "browser-host-v1",
+  "designGuidance": {
+    "version": "1",
+    "rules": [
+      "Author for the actual responsive browser viewport in this request. browser-host-v1 is an opt-in host bridge in an opaque-origin sandbox; it is not the native device runtime. Existing offline browser snapshots are a separate unchanged profile.",
+      "Use index.html with bundled CSS, classic JavaScript, SVG and local JSON. Keep the existing UTF-8 package/file/path/byte limits. No modules, remote code/fonts/styles, direct remote fetch/XHR/sockets, workers, nested frames, forms or external navigation. Manifest pages may select other bundled HTML documents through the host.",
+      "The host supplies window.screenpunk before package scripts. Use only runtime.ready/onStatus, connections.read/release, state.get/set/remove, navigation.get/open and dispose advertised here. Do not replace the bridge or bundle a native transport for newly authored browser screens. Unsupported APIs must show an honest unavailable state.",
+      "Only the browser publicHTTP service descriptor may appear in services. Its supported/configured/authorized/entitled/reachable observations are independent yes/no/unknown facts; unknown does not authorize a read. Never infer a grant from runtime status, a declared connection, a backup, a native account or prior package revision. Public reads require an exact declared operation and user approval for this browser screen package revision.",
+      "Use the publicHTTP operation descriptor for reviewed origins, string parameters, cache/size/rate limits and returned JSON or image resources. Resource URLs are opaque and browser-managed; release images when replaced and on teardown. Handle CORS, offline, denied, rate-limited and stale responses without fabricating fresh data. Never forward credentials, cookies or caller-controlled headers.",
+      "screenpunk.state.get/set/remove is asynchronous JSON state in this browser account and screen, with 16384 bytes per value, 131072 bytes and 128 keys per screen, and host-enforced JSON nesting limits. Missing state resolves to null; await writes and handle failures. State and persistent DOM-storage keys are limited to 256 characters and must not be __proto__, prototype or constructor. State is separate from authoring preferences, screen data and DOM storage, and never accesses state on a native device or another screen.",
+      "The host provides scoped localStorage and sessionStorage compatibility methods length/key/getItem/setItem/removeItem/clear. Use these methods rather than named property access. localStorage is hydrated for this browser account/screen and is limited to 524288 bytes; writes update the local projection synchronously and persistence can fail asynchronously. sessionStorage is limited to 524288 bytes and resets on document recreation. No cross-tab storage events or native-device persistence is promised.",
+      "Declare optional manifest pages as unique {id,name,path} entries selecting existing bundled HTML files, at most64 pages within the package file limit, and an optional defaultPageId matching a page. navigation.get returns {pageId}; navigation.open changes only to a declared local page, not another saved screen or device. Without pages, the page is default/index.html. No automatic native event rules are advertised.",
+      "Call runtime.ready when usable. runtime.onStatus reports lifecycle and adapter availability, not user authorization. Honor document visibility/pagehide, cancel reads and stop timers while inactive, release old image resources and call dispose at teardown. A browser may throttle background timers; there is no always-on native background execution guarantee.",
+      "No Home Assistant, Google TV, Calendar, native Maps/cameras/microphones/location, device brightness, authoring preference mutations or screen-data publish/remove/query is implemented by this profile. Requests must have empty preferences and results must not mutate them or introduce screenData declarations. Do not invent provider integrations or inherit native credentials. A configured weather location may remain in bundled package data without requesting browser geolocation.",
+      "Preserve semantic HTML, keyboard/focus behavior, image alt text, live status messages and reduced-motion CSS. Do not invent an accessibility SDK namespace. When editing, preserve behavior except requested changes and return results bound to the exact sealed request/digest/base revision."
+    ]
+  },
+  "runtime": {
+    "version": "1",
+    "packageFormat": "utf8-files-v1",
+    "features": [
+      "html",
+      "css",
+      "javascript",
+      "bundled-classic-scripts",
+      "bundled-local-assets",
+      "browser-host-v1",
+      "runtime.ready",
+      "runtime.onStatus",
+      "connections.read",
+      "connections.release",
+      "state.get",
+      "state.set",
+      "state.remove",
+      "navigation.get",
+      "navigation.open",
+      "browser.localStorage-v1",
+      "browser.sessionStorage-v1",
+      "dispose"
+    ],
+    "limits": {
+      "metadataBytes": 131072,
+      "requestBytes": 393216,
+      "screenBytes": 204800,
+      "screenFiles": 20
+    }
+  },
+  "serviceCatalog": [
+    {
+      "id": "publicHTTP",
+      "provider": "publicHTTP",
+      "operations": [
+        {
+          "name": "read",
+          "kind": "http",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "alias": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "maxBytes": 64,
+                "pattern": "^[a-zA-Z][a-zA-Z0-9_-]{0,63}$"
+              },
+              "operation": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "maxBytes": 128,
+                "pattern": "^[a-zA-Z0-9_.-]+$"
+              },
+              "parameters": {
+                "type": "object",
+                "maxProperties": 12,
+                "additionalProperties": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256,
+                  "maxBytes": 256
+                }
+              }
+            },
+            "required": [
+              "alias",
+              "operation",
+              "parameters"
+            ],
+            "additionalProperties": false,
+            "$defs": {
+              "PublicHTTPConnection": {
+                "type": "object",
+                "properties": {
+                  "alias": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "maxBytes": 64,
+                    "pattern": "^[a-zA-Z][a-zA-Z0-9_-]{0,63}$"
+                  },
+                  "required": {
+                    "type": "boolean"
+                  },
+                  "publicHTTP": {
+                    "type": "object",
+                    "properties": {
+                      "origin": {
+                        "enum": [
+                          "https://api.weather.gov",
+                          "https://mapservices.weather.noaa.gov",
+                          "https://basemap.nationalmap.gov",
+                          "https://www.nasa.gov",
+                          "https://images-assets.nasa.gov"
+                        ]
+                      },
+                      "userAgent": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 256,
+                        "maxBytes": 256,
+                        "pattern": "^[\\x20-\\x7e]+$"
+                      },
+                      "operations": {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "name": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 128,
+                              "maxBytes": 128,
+                              "pattern": "^[a-zA-Z0-9_.-]+$"
+                            },
+                            "path": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 512,
+                              "maxBytes": 512
+                            },
+                            "response": {
+                              "enum": [
+                                "json",
+                                "raster"
+                              ]
+                            },
+                            "parameters": {
+                              "type": "object",
+                              "maxProperties": 12,
+                              "propertyNames": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 64,
+                                "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$"
+                              },
+                              "additionalProperties": {
+                                "anyOf": [
+                                  {
+                                    "type": "object",
+                                    "properties": {
+                                      "location": {
+                                        "enum": [
+                                          "path",
+                                          "query"
+                                        ]
+                                      },
+                                      "minimum": {
+                                        "type": "integer",
+                                        "minimum": -9007199254740991,
+                                        "maximum": 9007199254740991
+                                      },
+                                      "maximum": {
+                                        "type": "integer",
+                                        "minimum": -9007199254740991,
+                                        "maximum": 9007199254740991
+                                      }
+                                    },
+                                    "required": [
+                                      "location",
+                                      "minimum",
+                                      "maximum"
+                                    ],
+                                    "additionalProperties": false
+                                  },
+                                  {
+                                    "type": "object",
+                                    "properties": {
+                                      "location": {
+                                        "enum": [
+                                          "path",
+                                          "query"
+                                        ]
+                                      },
+                                      "values": {
+                                        "type": "array",
+                                        "items": {
+                                          "type": "string",
+                                          "minLength": 1,
+                                          "maxLength": 256,
+                                          "maxBytes": 256,
+                                          "pattern": "^[\\x20-\\x7e]+$"
+                                        },
+                                        "maxItems": 64,
+                                        "minItems": 1
+                                      }
+                                    },
+                                    "required": [
+                                      "location",
+                                      "values"
+                                    ],
+                                    "additionalProperties": false
+                                  },
+                                  {
+                                    "type": "object",
+                                    "properties": {
+                                      "location": {
+                                        "const": "path"
+                                      },
+                                      "pathSegment": {
+                                        "type": "object",
+                                        "properties": {
+                                          "maxLength": {
+                                            "type": "integer",
+                                            "minimum": 1,
+                                            "maximum": 256
+                                          }
+                                        },
+                                        "required": [
+                                          "maxLength"
+                                        ],
+                                        "additionalProperties": false
+                                      }
+                                    },
+                                    "required": [
+                                      "location",
+                                      "pathSegment"
+                                    ],
+                                    "additionalProperties": false
+                                  }
+                                ]
+                              }
+                            },
+                            "maxAgeSeconds": {
+                              "type": "integer",
+                              "minimum": 1,
+                              "maximum": 86400
+                            },
+                            "staleSeconds": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 604800
+                            }
+                          },
+                          "required": [
+                            "name",
+                            "path",
+                            "response",
+                            "parameters",
+                            "maxAgeSeconds",
+                            "staleSeconds"
+                          ],
+                          "additionalProperties": false
+                        },
+                        "maxItems": 16,
+                        "minItems": 1
+                      }
+                    },
+                    "required": [
+                      "origin",
+                      "userAgent",
+                      "operations"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "alias",
+                  "required",
+                  "publicHTTP"
+                ],
+                "additionalProperties": false
+              },
+              "PublicHTTPDeclaration": {
+                "type": "object",
+                "properties": {
+                  "origin": {
+                    "enum": [
+                      "https://api.weather.gov",
+                      "https://mapservices.weather.noaa.gov",
+                      "https://basemap.nationalmap.gov",
+                      "https://www.nasa.gov",
+                      "https://images-assets.nasa.gov"
+                    ]
+                  },
+                  "userAgent": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "maxBytes": 256,
+                    "pattern": "^[\\x20-\\x7e]+$"
+                  },
+                  "operations": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "name": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 128,
+                          "maxBytes": 128,
+                          "pattern": "^[a-zA-Z0-9_.-]+$"
+                        },
+                        "path": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 512,
+                          "maxBytes": 512
+                        },
+                        "response": {
+                          "enum": [
+                            "json",
+                            "raster"
+                          ]
+                        },
+                        "parameters": {
+                          "type": "object",
+                          "maxProperties": 12,
+                          "propertyNames": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 64,
+                            "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$"
+                          },
+                          "additionalProperties": {
+                            "anyOf": [
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "location": {
+                                    "enum": [
+                                      "path",
+                                      "query"
+                                    ]
+                                  },
+                                  "minimum": {
+                                    "type": "integer",
+                                    "minimum": -9007199254740991,
+                                    "maximum": 9007199254740991
+                                  },
+                                  "maximum": {
+                                    "type": "integer",
+                                    "minimum": -9007199254740991,
+                                    "maximum": 9007199254740991
+                                  }
+                                },
+                                "required": [
+                                  "location",
+                                  "minimum",
+                                  "maximum"
+                                ],
+                                "additionalProperties": false
+                              },
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "location": {
+                                    "enum": [
+                                      "path",
+                                      "query"
+                                    ]
+                                  },
+                                  "values": {
+                                    "type": "array",
+                                    "items": {
+                                      "type": "string",
+                                      "minLength": 1,
+                                      "maxLength": 256,
+                                      "maxBytes": 256,
+                                      "pattern": "^[\\x20-\\x7e]+$"
+                                    },
+                                    "maxItems": 64,
+                                    "minItems": 1
+                                  }
+                                },
+                                "required": [
+                                  "location",
+                                  "values"
+                                ],
+                                "additionalProperties": false
+                              },
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "location": {
+                                    "const": "path"
+                                  },
+                                  "pathSegment": {
+                                    "type": "object",
+                                    "properties": {
+                                      "maxLength": {
+                                        "type": "integer",
+                                        "minimum": 1,
+                                        "maximum": 256
+                                      }
+                                    },
+                                    "required": [
+                                      "maxLength"
+                                    ],
+                                    "additionalProperties": false
+                                  }
+                                },
+                                "required": [
+                                  "location",
+                                  "pathSegment"
+                                ],
+                                "additionalProperties": false
+                              }
+                            ]
+                          }
+                        },
+                        "maxAgeSeconds": {
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 86400
+                        },
+                        "staleSeconds": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 604800
+                        }
+                      },
+                      "required": [
+                        "name",
+                        "path",
+                        "response",
+                        "parameters",
+                        "maxAgeSeconds",
+                        "staleSeconds"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "maxItems": 16,
+                    "minItems": 1
+                  }
+                },
+                "required": [
+                  "origin",
+                  "userAgent",
+                  "operations"
+                ],
+                "additionalProperties": false
+              },
+              "PublicHTTPParameter": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "location": {
+                        "enum": [
+                          "path",
+                          "query"
+                        ]
+                      },
+                      "minimum": {
+                        "type": "integer",
+                        "minimum": -9007199254740991,
+                        "maximum": 9007199254740991
+                      },
+                      "maximum": {
+                        "type": "integer",
+                        "minimum": -9007199254740991,
+                        "maximum": 9007199254740991
+                      }
+                    },
+                    "required": [
+                      "location",
+                      "minimum",
+                      "maximum"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "location": {
+                        "enum": [
+                          "path",
+                          "query"
+                        ]
+                      },
+                      "values": {
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 256,
+                          "maxBytes": 256,
+                          "pattern": "^[\\x20-\\x7e]+$"
+                        },
+                        "maxItems": 64,
+                        "minItems": 1
+                      }
+                    },
+                    "required": [
+                      "location",
+                      "values"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "location": {
+                        "const": "path"
+                      },
+                      "pathSegment": {
+                        "type": "object",
+                        "properties": {
+                          "maxLength": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 256
+                          }
+                        },
+                        "required": [
+                          "maxLength"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "required": [
+                      "location",
+                      "pathSegment"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "PublicHTTPOperation": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "maxBytes": 128,
+                    "pattern": "^[a-zA-Z0-9_.-]+$"
+                  },
+                  "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512,
+                    "maxBytes": 512
+                  },
+                  "response": {
+                    "enum": [
+                      "json",
+                      "raster"
+                    ]
+                  },
+                  "parameters": {
+                    "type": "object",
+                    "maxProperties": 12,
+                    "propertyNames": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 64,
+                      "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$"
+                    },
+                    "additionalProperties": {
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "location": {
+                              "enum": [
+                                "path",
+                                "query"
+                              ]
+                            },
+                            "minimum": {
+                              "type": "integer",
+                              "minimum": -9007199254740991,
+                              "maximum": 9007199254740991
+                            },
+                            "maximum": {
+                              "type": "integer",
+                              "minimum": -9007199254740991,
+                              "maximum": 9007199254740991
+                            }
+                          },
+                          "required": [
+                            "location",
+                            "minimum",
+                            "maximum"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "location": {
+                              "enum": [
+                                "path",
+                                "query"
+                              ]
+                            },
+                            "values": {
+                              "type": "array",
+                              "items": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 256,
+                                "maxBytes": 256,
+                                "pattern": "^[\\x20-\\x7e]+$"
+                              },
+                              "maxItems": 64,
+                              "minItems": 1
+                            }
+                          },
+                          "required": [
+                            "location",
+                            "values"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "location": {
+                              "const": "path"
+                            },
+                            "pathSegment": {
+                              "type": "object",
+                              "properties": {
+                                "maxLength": {
+                                  "type": "integer",
+                                  "minimum": 1,
+                                  "maximum": 256
+                                }
+                              },
+                              "required": [
+                                "maxLength"
+                              ],
+                              "additionalProperties": false
+                            }
+                          },
+                          "required": [
+                            "location",
+                            "pathSegment"
+                          ],
+                          "additionalProperties": false
+                        }
+                      ]
+                    }
+                  },
+                  "maxAgeSeconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 86400
+                  },
+                  "staleSeconds": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 604800
+                  }
+                },
+                "required": [
+                  "name",
+                  "path",
+                  "response",
+                  "parameters",
+                  "maxAgeSeconds",
+                  "staleSeconds"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          "outputSchema": {
+            "type": "object",
+            "properties": {
+              "state": {
+                "enum": [
+                  "fresh",
+                  "stale",
+                  "error",
+                  "unavailable"
+                ]
+              },
+              "resourceURL": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096,
+                "maxBytes": 4096
+              },
+              "fetchedAt": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "maxBytes": 128
+              },
+              "status": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 599
+              },
+              "retryAfterSeconds": {
+                "type": "number",
+                "minimum": 0
+              },
+              "code": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "maxBytes": 128
+              },
+              "data": {
+                "type": [
+                  "object",
+                  "array",
+                  "string",
+                  "number",
+                  "boolean",
+                  "null"
+                ]
+              },
+              "lastModified": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "maxBytes": 128
+              }
+            },
+            "required": [
+              "state"
+            ],
+            "additionalProperties": false
+          },
+          "requirements": [
+            "manifestPublicHTTPDeclaration",
+            "browserScreenRevisionApproval",
+            "reviewedBrowserPublicOrigin"
+          ],
+          "instructions": "Use await screenpunk.connections.read(alias, operation, parameters, {signal}) for a manifest-defined publicHTTP operation. read is the SDK method, not a literal provider operation. The exact supported origins are https://api.weather.gov, https://mapservices.weather.noaa.gov, https://basemap.nationalmap.gov, https://www.nasa.gov and https://images-assets.nasa.gov; no other host or port is supported by this profile. Declare <=8 connections, <=16 unique operations each, <=12 exact string parameters. Paths are safe absolute ASCII paths without query, fragment, percent encoding, empty, dot or parent segments; parameters are declared query or path values. Names match [A-Za-z_][A-Za-z0-9_]{0,63} and must not override credentials or destination. Use finite strings, canonical safe-integer ranges, or raster-only pathSegment declarations of <=256 safe ASCII characters. The trusted host performs credential-free, redirect-free public reads; browser CORS or source availability may still reject a request. userAgent is manifest metadata, not a promise that the browser sends a custom User-Agent. JSON <=1MiB, PNG/JPEG <=4MiB and <=4096 each dimension/4194304 pixels. Successful reads return state fresh or stale plus data or an opaque browser-managed resourceURL, fetchedAt and optional lastModified; failures reject with a code. Assign the returned resourceURL to a local image and call screenpunk.connections.release when finished. Never assume a screenpunk: URL or fetch the image URL yourself. Respect <=4 simultaneous reads and <=60 reads/minute; refresh only while visible. maxAgeSeconds is 1..86400 and staleSeconds 0..604800. Current-package authorization does not authorize a newly edited package."
+        }
+      ],
+      "setupInstructions": "Use only the reviewed browser public-data sources and declared operations. The user must allow public data in Viewer Screen Settings for the current screen package revision; no native credentials or approvals are inherited."
+    }
+  ],
+  "policy": {
+    "publicHTTP": {
+      "origins": [
+        "https://api.weather.gov",
+        "https://mapservices.weather.noaa.gov",
+        "https://basemap.nationalmap.gov",
+        "https://www.nasa.gov",
+        "https://images-assets.nasa.gov"
+      ],
+      "jsonBytes": 1048576,
+      "rasterBytes": 4194304,
+      "rasterTypes": [
+        "image/png",
+        "image/jpeg"
+      ],
+      "rasterMaxDimension": 4096,
+      "rasterMaxPixels": 4194304,
+      "maxInFlight": 4,
+      "readsPerMinute": 60
+    },
+    "state": {
+      "bytesPerValue": 16384,
+      "bytesPerScreen": 131072,
+      "keysPerScreen": 128,
+      "maxJSONDepth": 16
+    },
+    "storage": {
+      "localBytesPerScreen": 524288,
+      "sessionBytesPerDocument": 524288
+    },
+    "pages": {
+      "maxPages": 64
+    }
+  }
+}

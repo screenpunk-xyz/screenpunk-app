@@ -30,6 +30,24 @@ public enum AuthoringContract {
         guard let value = definition.browser?.designGuidance else { preconditionFailure("Bundled browser guidance missing") }
         return value
     }
+    public static let browserHostProfile: AuthoringBrowserHostProfileV1 = {
+        guard let url = Bundle.module.url(forResource: "browser-host-v1", withExtension: "json", subdirectory: "AuthoringResources"),
+              let data = try? Data(contentsOf: url), let value = try? JSONDecoder().decode(AuthoringBrowserHostProfileV1.self, from: data) else {
+            preconditionFailure("Bundled browser host profile is missing or corrupt")
+        }
+        return value
+    }()
+    public static var browserHostRuntime: AuthoringRuntimeV1 { browserHostProfile.runtime }
+    public static var browserHostDesignGuidance: AuthoringDesignGuidanceV1 { browserHostProfile.designGuidance }
+    /// Call only after verifying the host adapter implements browser-host-v1. Unknown facts never grant access.
+    public static func makeBrowserHostServices(observedAt: Int64, observations: [String: AuthoringCapabilityStateV1] = [:]) -> [AuthoringServiceV1] {
+        let unknown = AuthoringCapabilityStateV1(state: "unknown", observedAt: observedAt)
+        return browserHostProfile.serviceCatalog.map { service in
+            .init(id: service.id, provider: service.provider, operations: service.operations,
+                  supported: .init(state: "yes", observedAt: observedAt), configured: observations["configured"] ?? unknown,
+                  authorized: observations["authorized"] ?? unknown, entitled: observations["entitled"] ?? unknown, reachable: observations["reachable"] ?? unknown)
+        }
+    }
     public static let serviceCatalog = definition.serviceCatalog
     public static let screenAuthoringGuidance = definition.designGuidance.rules
     public static let resultMetadataBytes = 131072
@@ -69,15 +87,18 @@ public enum AuthoringContract {
         guard request.deadlineAt > request.createdAt else { throw AuthoringContractError("deadline must follow creation") }
         let screenData = request.runtime == runtime(supportsScreenData: true)
         let browser = request.runtime == browserRuntime
-        guard request.runtime == (browser ? browserRuntime : runtime(supportsScreenData: screenData)),
-              request.designGuidance == (browser ? browserDesignGuidance : designGuidance(supportsScreenData: screenData)) else { throw AuthoringContractError("unsupported guidance/runtime definition") }
+        let browserHost = request.runtime == browserHostRuntime
+        guard request.runtime == (browserHost ? browserHostRuntime : browser ? browserRuntime : runtime(supportsScreenData: screenData)),
+              request.designGuidance == (browserHost ? browserHostDesignGuidance : browser ? browserDesignGuidance : designGuidance(supportsScreenData: screenData)) else { throw AuthoringContractError("unsupported guidance/runtime definition") }
         if browser, !request.services.isEmpty || !request.preferences.isEmpty {
             throw AuthoringContractError("browser runtime requires empty services and preferences")
         }
+        if browserHost, !request.preferences.isEmpty { throw AuthoringContractError("browser host runtime does not support authoring preferences") }
         var services = Set<String>()
         for service in request.services {
             guard services.insert(service.id).inserted,
-                  let catalog = serviceCatalog.first(where: { $0.provider == service.provider }),
+                  let catalog = (browserHost ? browserHostProfile.serviceCatalog : serviceCatalog).first(where: { $0.provider == service.provider }),
+                  !browserHost || service.id == catalog.id,
                   service.operations == catalog.operations else { throw AuthoringContractError("unsupported/duplicate service definition") }
             for state in [service.supported,service.configured,service.authorized,service.entitled,service.reachable] {
                 guard state.observedAt <= request.createdAt else { throw AuthoringContractError("capability observation is in the future") }
@@ -125,9 +146,10 @@ public enum AuthoringContract {
         }
         if let request {
             _ = try validateRequest(JSONEncoder().encode(request))
-            if request.runtime == browserRuntime, !mutations.isEmpty {
+            if request.runtime == browserRuntime || request.runtime == browserHostRuntime, !mutations.isEmpty {
                 throw AuthoringContractError("browser runtime does not support preference mutations")
             }
+            if request.runtime == browserHostRuntime, let screen = result.screen { try validateBrowserHostScreen(screen) }
             if let manifest = result.screen?.files.first(where: { $0.path == "manifest.json" }) {
                 try ScreenDataContract.validateManifestDeclaration(manifest.content,
                     previous: request.context.currentScreen?.files.first(where: { $0.path == "manifest.json" })?.content,
@@ -196,6 +218,38 @@ public enum AuthoringContract {
         }
     }
     private static func json(_ data: Data) throws -> Any { try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) }
+    public static func validateBrowserHostScreen(_ screen: AuthoringScreen) throws {
+        if let manifest = screen.files.first(where: { $0.path == "manifest.json" }) {
+            try validateBrowserHostManifest(manifest.content, filePaths: screen.files.map(\.path))
+        }
+    }
+    public static func validateBrowserHostManifest(_ content: String, filePaths: [String]) throws {
+        guard let object = try json(Data(content.utf8)) as? [String: Any], object["screenData"] == nil else {
+            throw AuthoringContractError("browser host runtime does not support screen data")
+        }
+        guard let connections = (object["connections"] ?? []) as? [[String: Any]], connections.count <= 8 else {
+            throw AuthoringContractError("invalid browser public connections")
+        }
+        let schema = try json(JSONEncoder().encode(browserHostProfile.serviceCatalog[0].operations[0].inputSchema)) as! [String: Any]
+        let defs = schema["$defs"] as! [String: Any]
+        var aliases = Set<String>()
+        for connection in connections {
+            try check(defs["PublicHTTPConnection"] as! [String: Any], value: connection, defs: defs, path: "$.screen.manifest.connections")
+            guard let alias = connection["alias"] as? String, aliases.insert(alias).inserted else { throw AuthoringContractError("duplicate browser public alias") }
+        }
+        guard let pages = (object["pages"] ?? [["id": "default", "name": "Screen", "path": "index.html"]]) as? [[String: Any]],
+              !pages.isEmpty, pages.count <= 64 else { throw AuthoringContractError("invalid browser pages") }
+        var ids = Set<String>()
+        for page in pages {
+            guard let id = page["id"] as? String, id.range(of: "^[A-Za-z0-9_-]{1,128}$", options: .regularExpression) == id.startIndex..<id.endIndex, ids.insert(id).inserted,
+                  let name = page["name"] as? String, !name.isEmpty, name.utf16.count <= 128,
+                  let path = page["path"] as? String, path.range(of: "^([A-Za-z0-9_-]+/)*[A-Za-z0-9_.-]+\\.html$", options: .regularExpression) != nil,
+                  filePaths.contains(path) else { throw AuthoringContractError("invalid browser page target") }
+        }
+        if let raw = object["defaultPageId"] {
+            guard let page = raw as? String, ids.contains(page) else { throw AuthoringContractError("invalid browser default page") }
+        }
+    }
     private static func validateSchema(_ name: String, data: Data) throws {
         guard data.count <= runtime.limits.requestBytes else { throw AuthoringContractError("byte limit") }
         let root = try json(JSONEncoder().encode(definition.schemas[name]!)) as! [String: Any]

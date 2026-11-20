@@ -90,6 +90,9 @@ public enum AuthoringV2Contract {
                     bytes += file.content!.utf8.count
                     if file.path == "manifest.json" {
                         try ScreenDataContract.validateManifestDeclaration(file.content!, previous: previousManifest, supportsScreenData: supportsScreenData)
+                        if request?.runtime == AuthoringContract.browserHostRuntime {
+                            try AuthoringContract.validateBrowserHostManifest(file.content!, filePaths: screen.files.map(\.path))
+                        }
                     }
                 }
                 else if request != nil {
@@ -132,7 +135,9 @@ public enum AuthoringV2Contract {
             }
             files.append(.init(path: file.path, content: content))
         }
-        return try AuthoringContract.validateScreen(JSONEncoder().encode(AuthoringScreen(title: mutation.title, entry: mutation.entry, files: files)))
+        let screen = try AuthoringContract.validateScreen(JSONEncoder().encode(AuthoringScreen(title: mutation.title, entry: mutation.entry, files: files)))
+        if request.runtime == AuthoringContract.browserHostRuntime { try AuthoringContract.validateBrowserHostScreen(screen) }
+        return screen
     }
     private static func json(_ data: Data) throws -> Any { try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) }
     private static func validateSchema(_ name: String, data: Data) throws {
