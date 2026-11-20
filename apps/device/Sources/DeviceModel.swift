@@ -2413,7 +2413,7 @@ extension DeviceModel {
     func billingBackupAccessChanged() {
         objectWillChange.send()
         refreshCatalogScope()
-        if catalogBackupAccess.allowsBackups { requestCatalogSync() }
+        if catalogBackupAccess.allowsBackups { requestCatalogCatchUp() }
     }
 
     private func refreshCatalogScope() {
@@ -2451,7 +2451,8 @@ extension DeviceModel {
             profileID: profile.id, binding: binding, token: session.accessToken)
     }
     private func requestCatalogCatchUp() {
-        guard catalogFlight != nil else { return }
+        // Keep the intent while billing or the connection is not ready. A verified
+        // grant must perform capability catch-up even when no revision is queued.
         catalogCatchUpNeeded = true
         requestCatalogSync()
     }

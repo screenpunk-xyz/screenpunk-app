@@ -74,6 +74,45 @@ final class ScreenLibraryCatalogTests: XCTestCase {
         XCTAssertEqual(wakes, 1)
     }
 
+    @MainActor func testDelayedGrantCatchesUpPlainHTMLWithoutRequeuingAcknowledgedScreens() throws {
+        let root = directory(); defer { CatalogFixture.cleanup(root) }
+        let library = try CatalogFixture.open(root, binding: binding)
+        try CatalogFixture.enable(library, binding: binding)
+        try library.install(artifact("Weather"), requestID: "weather", replacing: "weather")
+        try library.install(artifact("NASA"), requestID: "nasa", replacing: "nasa")
+        while let head = library.catalogQueue?.entries.first {
+            try library.acknowledgeCatalogIntent(id: head.id, binding: binding)
+        }
+        let originals = library.state.screens
+        let weatherCopy = library.catalogQueue?.copies["weather"]?.id
+        let nasaCopy = library.catalogQueue?.copies["nasa"]?.id
+
+        // Startup can discover local content before the asynchronous Pro read.
+        library.setCatalogBackupScope(nil)
+        try library.install(artifact("SDK-free counter"), requestID: "counter", replacing: "counter")
+        XCTAssertTrue(library.catalogQueue?.entries.isEmpty == true)
+        XCTAssertTrue(library.catalogBackupsPreference(binding: binding))
+        XCTAssertNil(library.catalogQueue?.copies["counter"])
+
+        // Once verified, run capability catch-up, not just an empty-queue drain.
+        library.setCatalogBackupScope(binding, validUntil: .distantFuture)
+        try library.activateCatalog(binding: binding)
+        let queued = try XCTUnwrap(library.catalogQueue?.entries.first)
+        XCTAssertEqual(library.catalogQueue?.entries.count, 1)
+        XCTAssertEqual(queued.screenID, "counter")
+        XCTAssertEqual(queued.origin, "seed")
+        XCTAssertEqual(library.catalogQueue?.acknowledgedCount, 2)
+        XCTAssertEqual(library.catalogQueue?.copies["weather"]?.id, weatherCopy)
+        XCTAssertEqual(library.catalogQueue?.copies["nasa"]?.id, nasaCopy)
+        for original in originals {
+            let current = try XCTUnwrap(library.state.screens.first { $0.id == original.id })
+            XCTAssertEqual(current.revision, original.revision)
+            XCTAssertEqual(current.artifact.files, original.artifact.files)
+        }
+        try library.activateCatalog(binding: binding)
+        XCTAssertEqual(library.catalogQueue?.entries.map(\.id), [queued.id])
+    }
+
     @MainActor func testDefaultOffRequiresOptInAndCapabilityBeforeSeedingCurrentScreens() throws {
         let root = directory(); defer { CatalogFixture.cleanup(root) }
         let library = try CatalogFixture.open(root, binding: binding)
