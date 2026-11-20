@@ -432,7 +432,7 @@ struct AgentStatus: Decodable {
     }
     private struct CatalogErrorEnvelope: Decodable { var error: CatalogError }
     func catalogRequest<T: Decodable>(_ path: String, method: String = "GET", bytes: Data? = nil, token: String, package: Bool = false, image: Bool = false) async throws -> T {
-        let data = try await catalogBytes(path, method: method, bytes: bytes, token: token, requestLimit: image ? CatalogContract.previewBytes : package ? CatalogContract.packageBytes : 64 * 1024, responseLimit: 64 * 1024, contentType: image ? "image/png" : "application/json")
+        let data = try await catalogBytes(path, method: method, bytes: bytes, token: token, requestLimit: image ? CatalogContract.previewBytes : package ? CatalogContract.packageBytes : 64 * 1024, responseLimit: path.hasPrefix("/api/catalog/device-screens") ? 2 * 1024 * 1024 : 64 * 1024, contentType: image ? "image/png" : "application/json")
         return try JSONDecoder().decode(T.self, from: data.isEmpty ? Data("{}".utf8) : data)
     }
     func catalogPackage(_ path: String, token: String, declaration: CatalogObjectDeclaration) async throws -> CatalogPackage {

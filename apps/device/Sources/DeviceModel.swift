@@ -2380,6 +2380,54 @@ extension DeviceModel {
     }
     var catalogBackupAccess: DeviceBackupAccess { billing.backupAccess(for: cloud) }
 
+    var canAddCatalogScreen: Bool {
+        catalogBackupsCanConfigure && catalogBackupAccess.allowsBackups && !busy && !requestPending && !routeChangeBlocked
+    }
+
+    func availableCatalogScreens() async throws -> [CatalogScreen] {
+        guard canAddCatalogScreen, let binding = catalogBinding, let library, let token = cloud.session?.accessToken else {
+            throw DeviceError.message("Connect this device to your Screenpunk Pro account to open your catalog.")
+        }
+        let generation = connectionGeneration
+        var screens: [CatalogScreen] = [], cursor: String?, seen = Set<String>()
+        repeat {
+            var path = URLComponents(); path.path = "/api/catalog/device-screens"
+            if let cursor { path.queryItems = [.init(name: "cursor", value: cursor)] }
+            let page: CatalogList = try await cloud.catalogRequest(path.string!, token: token)
+            try Task.checkCancellation()
+            guard canAddCatalogScreen, catalogBinding == binding, self.library === library, connectionGeneration == generation else {
+                throw DeviceError.message("The account or device connection changed. Reopen your catalog.")
+            }
+            guard page.schemaVersion == 1, page.entitlement.backupEnabled else { throw DeviceError.message("Screenpunk Pro is required to add catalog screens.") }
+            screens.append(contentsOf: page.screens)
+            cursor = page.nextCursor
+            if let cursor, !seen.insert(cursor).inserted { throw DeviceError.message("The catalog changed. Please try again.") }
+        } while cursor != nil
+        var ids = Set<String>()
+        return screens.filter { ids.insert($0.catalogScreenID).inserted && !library.containsCatalogScreen($0) }
+    }
+
+    func addCatalogScreen(_ item: CatalogScreen) async throws {
+        guard canAddCatalogScreen, let binding = catalogBinding, let library, let token = cloud.session?.accessToken else {
+            throw DeviceError.message("Connect this device to your Screenpunk Pro account to add a screen.")
+        }
+        let generation = connectionGeneration
+        let version = item.latest
+        guard [item.catalogScreenID, version.versionID].allSatisfy({ $0.range(of: "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$", options: .regularExpression) != nil }) else {
+            throw DeviceError.message("The catalog returned an invalid screen.")
+        }
+        var path = URLComponents()
+        path.path = "/api/catalog/screens/\(item.catalogScreenID)/versions/\(version.versionID)/import-package"
+        path.queryItems = [.init(name: "sourceRevisionID", value: version.sourceRevisionID), .init(name: "packageDigest", value: version.packageDigest)]
+        let package = try await cloud.catalogPackage(path.string!, token: token, declaration: .init(byteLength: version.sizeBytes, digest: version.packageDigest))
+        try Task.checkCancellation()
+        guard canAddCatalogScreen, catalogBinding == binding, self.library === library, connectionGeneration == generation else {
+            throw DeviceError.message("The account or device connection changed. Reopen your catalog.")
+        }
+        try library.installCatalogScreen(item, package: package)
+        refreshScreen()
+    }
+
     var catalogBackupsEnabled: Bool {
         guard catalogBackupAccess != .inactive, let binding = catalogBinding else { return false }
         return library?.catalogBackupsPreference(binding: binding) == true
@@ -2643,6 +2691,9 @@ extension DeviceModel {
             }
         } else if ["deleted", "superseded"].contains(status.state), let preview = library.catalogQueue?.previews?.first(where: { $0.revision == intent.revision }) {
             try? library.acknowledgeCatalogPreview(preview, binding: binding)
+        }
+        if ["completed", "duplicate"].contains(status.state) {
+            try library.recordCatalogIdentity(status.catalogScreenID, screenID: intent.screenID)
         }
         try library.acknowledgeCatalogIntent(id: intent.id, binding: binding)
         return true

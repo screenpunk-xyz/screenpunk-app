@@ -68,6 +68,7 @@ private struct GalleryIntroSheet: View {
 }
 
 struct DeviceRootView: View {
+    @State private var keyboardRequestPresented = false
     @StateObject private var model = DeviceModel()
     @StateObject private var speech = SpeechCapture()
     @StateObject private var display = DeviceDisplayPreferences()
@@ -144,8 +145,8 @@ struct DeviceRootView: View {
         .foregroundStyle(.white)
         .background(DeviceGestures(
             began: beginSpeech, ended: speech.end, cancelled: speech.cancel,
-            canSwipe: canSwipe && swipeID == nil, pagePan: handlePagePan,
-            settings: { if galleryIntro == nil && weatherDestination == nil && !onboardingHelpInFlight { model.openSettings() } }
+            canSwipe: canSwipe && !keyboardRequestPresented && swipeID == nil, pagePan: handlePagePan,
+            settings: { if !keyboardRequestPresented && galleryIntro == nil && weatherDestination == nil && !onboardingHelpInFlight { model.openSettings() } }
         ))
         .statusBarHidden()
         .onChange(of: swipeContext) { _ in cancelPagePan() }
@@ -187,6 +188,7 @@ struct DeviceRootView: View {
         }) { help in
             CloudListenerSetupSheet(scope: help.scope, email: help.email, stage: help.id.stage)
         }
+        .sheet(isPresented: $keyboardRequestPresented) { KeyboardRequestEditor(model: model, creatingNew: true) }
         .sheet(item: $galleryIntro) { intro in
             GalleryIntroSheet {
                 model.dismissGalleryIntro(owner: intro.id)
@@ -555,6 +557,8 @@ struct DeviceRootView: View {
                 canHide: model.canHideInstructions && !model.hiddenScreenIDs.contains(ScreenLibrary.instructionsID),
                 hideDisabled: model.permissionOwner.isEmpty || model.accountOperationInProgress,
                 openSettings: { model.openSettings() },
+                addUsingKeyboard: { keyboardRequestPresented = true },
+                keyboardDisabled: model.busy || model.requestPending || model.routeChangeBlocked || model.accountOperationInProgress,
                 hide: {
                     model.setScreenShown(false, id: ScreenLibrary.instructionsID, owner: model.permissionOwner)
                 }
@@ -562,7 +566,7 @@ struct DeviceRootView: View {
         }
     }
     private func beginSpeech() {
-        guard !model.settingsOpen, galleryIntro == nil, weatherDestination == nil, !onboardingHelpInFlight else { return }
+        guard !model.settingsOpen, !keyboardRequestPresented, galleryIntro == nil, weatherDestination == nil, !onboardingHelpInFlight else { return }
         guard model.hasProfile, !model.needsAgentSetup, !model.busy else { model.message = model.busy ? "Your agent is still working." : "Connect your agent before speaking."; return }
         recordingBackdropScope = currentRecordingBackdropScope
         #if DEBUG
@@ -768,6 +772,8 @@ private struct CreationPlaceholder: View {
     let canHide: Bool
     let hideDisabled: Bool
     let openSettings: () -> Void
+    let addUsingKeyboard: () -> Void
+    let keyboardDisabled: Bool
     let hide: () -> Void
     @State private var showsGestures = false
 
@@ -804,6 +810,15 @@ private struct CreationPlaceholder: View {
                 }
             }
             .multilineTextAlignment(.center)
+        }
+        .safeAreaInset(edge: .bottom) {
+            Button("Add screen using keyboard", action: addUsingKeyboard)
+                .buttonStyle(.borderless)
+                .font(.callout)
+                .frame(maxWidth: .infinity, minHeight: 44)
+                .padding(.bottom, 12)
+                .disabled(keyboardDisabled)
+                .accessibilityIdentifier("screen.addUsingKeyboard")
         }
         .alert("Screen gestures", isPresented: $showsGestures) {
             Button("Done", role: .cancel) {}
@@ -1146,7 +1161,7 @@ struct DeviceSettingsView: View {
     @State private var screenToRemove: ScreenLibrary.Saved?
     @State private var sheet: SettingsSheet?
     private enum SettingsSheet: String, Identifiable {
-        case cloudListener, newKeyboardRequest, editKeyboardRequest
+        case cloudListener, catalog, editKeyboardRequest
         var id: String { rawValue }
     }
     @State private var columns: NavigationSplitViewVisibility = .all
@@ -1196,7 +1211,7 @@ struct DeviceSettingsView: View {
         .sheet(item: $sheet) { destination in
             switch destination {
             case .cloudListener: CloudListenerSetupSheet(scope: CloudClient.originScope, email: model.email)
-            case .newKeyboardRequest: KeyboardRequestEditor(model: model, creatingNew: true)
+            case .catalog: CatalogScreenPicker(model: model)
             case .editKeyboardRequest: KeyboardRequestEditor(model: model, creatingNew: false)
             }
         }
@@ -1275,8 +1290,11 @@ struct DeviceSettingsView: View {
             Form {
                 Section {
                     Button("Create another screen", action: model.newScreen).disabled(model.needsAgentSetup)
-                    Button("Create a screen with keyboard") { sheet = .newKeyboardRequest }
-                        .disabled(model.needsAgentSetup || model.routeChangeBlocked || model.accountOperationInProgress)
+                    if model.catalogBackupAccess.allowsBackups {
+                        Button("Add a screen from my catalog") { sheet = .catalog }
+                            .disabled(!model.canAddCatalogScreen)
+                            .accessibilityIdentifier("screen.addFromCatalog")
+                    }
                     if model.screen != nil {
                         Button("Edit this screen with keyboard") { sheet = .editKeyboardRequest }
                             .disabled(model.needsAgentSetup || model.routeChangeBlocked || model.accountOperationInProgress)
@@ -1529,6 +1547,82 @@ private struct PluginConnectionStatusPill: View {
     }
 }
 
+private struct CatalogScreenPicker: View {
+    @ObservedObject var model: DeviceModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var screens: [CatalogScreen] = []
+    @State private var loading = true
+    @State private var addingID: String?
+    @State private var errorMessage: String?
+    @State private var reload = UUID()
+    @State private var addedCount = 0
+    @State private var importTask: Task<Void, Never>?
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if let errorMessage {
+                    Section {
+                        Text(errorMessage).foregroundStyle(.secondary)
+                        Button("Try again") { reload = UUID() }.disabled(addingID != nil)
+                    }
+                }
+                if loading {
+                    ProgressView("Loading your catalog…")
+                } else if screens.isEmpty && errorMessage == nil {
+                    Text(addedCount > 0 ? "All available screens have been added to this device." : "No screens to add. Your catalog is empty or all its screens are already on this device.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    Section {
+                        ForEach(screens, id: \.catalogScreenID) { screen in
+                            Button {
+                                addingID = screen.catalogScreenID
+                                errorMessage = nil
+                                importTask = Task {
+                                    defer { addingID = nil }
+                                    do {
+                                        try await model.addCatalogScreen(screen)
+                                        screens.removeAll { $0.catalogScreenID == screen.catalogScreenID }
+                                        addedCount += 1
+                                    } catch is CancellationError { }
+                                    catch { errorMessage = error.localizedDescription }
+                                }
+                            } label: {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text(screen.latest.screenName).foregroundStyle(.primary)
+                                        Text("Version \(screen.latest.displayVersion) · \(screen.latest.deviceDisplayName)")
+                                            .font(.caption).foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    if addingID == screen.catalogScreenID { ProgressView() }
+                                    else { Image(systemName: "plus.circle") }
+                                }
+                            }
+                            .disabled(addingID != nil || !model.canAddCatalogScreen)
+                            .accessibilityLabel("Add \(screen.latest.screenName) to this device")
+                        }
+                    } footer: {
+                        Text("Adds the latest saved version. Connections may need to be set up on this device.")
+                    }
+                }
+            }
+            .navigationTitle("My catalog")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+            .task(id: reload) {
+                loading = true; errorMessage = nil
+                defer { loading = false }
+                do { screens = try await model.availableCatalogScreens() }
+                catch is CancellationError { }
+                catch { errorMessage = error.localizedDescription }
+            }
+        }
+        .onDisappear { importTask?.cancel() }
+        .onChange(of: model.keyboardRequestScope) { _ in importTask?.cancel(); dismiss() }
+    }
+}
+
 private struct KeyboardRequestEditor: View {
     @ObservedObject var model: DeviceModel
     let creatingNew: Bool
@@ -1538,6 +1632,7 @@ private struct KeyboardRequestEditor: View {
     @Environment(\.dismiss) private var dismiss
     @State private var text: String
     @State private var submitted = false
+    @FocusState private var instructionsFocused: Bool
 
     init(model: DeviceModel, creatingNew: Bool) {
         self.model = model; self.creatingNew = creatingNew
@@ -1551,6 +1646,7 @@ private struct KeyboardRequestEditor: View {
             Form {
                 Section(creatingNew ? "Describe a new screen" : "Describe your changes") {
                     TextEditor(text: $text)
+                        .focused($instructionsFocused)
                         .frame(minHeight: 200)
                         .accessibilityLabel("Screen instructions")
                         .accessibilityIdentifier("request.instructions")
@@ -1578,6 +1674,7 @@ private struct KeyboardRequestEditor: View {
                 }
             }
         }
+        .task { instructionsFocused = true }
         .onChange(of: text) { model.saveKeyboardDraft($0, owner: owner, screenID: screenID) }
         .onDisappear { model.persistKeyboardDraft(text, owner: owner, screenID: screenID) }
     }
