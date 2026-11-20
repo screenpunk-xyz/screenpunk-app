@@ -30,6 +30,37 @@ final class ScreenLibraryCatalogTests: XCTestCase {
     private func artifact(_ title: String) -> ScreenArtifact { .init(title: title, files: [.init(path: "index.html", content: "<html><body>\(title)</body></html>")]) }
     private var binding: ScreenLibrary.CatalogBinding { .init(origin: "https://example.test", accountID: "account", userID: "user", deviceID: "device", libraryID: "library") }
 
+    @MainActor func testCatalogImportPersistsIdentityExcludesHiddenAndAllowsReaddingAfterRemoval() throws {
+        let root = directory(); defer { CatalogFixture.cleanup(root) }
+        let library = try CatalogFixture.open(root, binding: binding)
+        let content = "<html><body>Imported</body></html>"
+        let bytes = Data(content.utf8)
+        let package = CatalogPackage(screen: .init(title: "Imported", entry: "index.html", requiredAssets: [], externalDependencies: []), files: [
+            .init(path: "index.html", mediaType: "text/html", byteLength: bytes.count, digest: CatalogContract.digest(bytes), contentBase64: bytes.base64EncodedString())
+        ])
+        let encoded = try CatalogContract.encodePackage(package)
+        let version = CatalogVersion(versionID: "version", catalogScreenID: "catalog", displayVersion: 1, sourceRevisionID: "source", parentRevisionIDs: [], copyID: "copy", commitCounter: 1, screenName: "Imported", sourceAppliedAt: "2026-11-20T00:00:00.000Z", backedUpAt: "2026-11-20T00:00:00.000Z", packageDigest: CatalogContract.digest(encoded), sizeBytes: encoded.count, deviceDisplayName: "Other device", deviceLinked: true, preview: .init())
+        let item = CatalogScreen(catalogScreenID: "catalog", latest: version, history: [])
+        try library.install(artifact("Existing"), requestID: "existing", replacing: "existing")
+        let selected = library.state.selectedID
+        XCTAssertFalse(library.containsCatalogScreen(item))
+        try library.installCatalogScreen(item, package: package)
+        XCTAssertEqual(library.state.selectedID, selected)
+        XCTAssertEqual(library.state.lastRequest, "existing")
+        XCTAssertFalse(library.catalogBackupsPreference(binding: binding))
+        XCTAssertTrue(library.containsCatalogScreen(item))
+        XCTAssertThrowsError(try library.installCatalogScreen(item, package: package))
+        let imported = try XCTUnwrap(library.state.screens.first { $0.id != "existing" })
+        try library.setScreenShown(false, id: imported.id)
+        XCTAssertTrue(library.containsCatalogScreen(item))
+        let reopened = try CatalogFixture.open(root, binding: binding)
+        XCTAssertTrue(reopened.containsCatalogScreen(item))
+        try reopened.remove(imported.id)
+        XCTAssertFalse(reopened.containsCatalogScreen(item))
+        try reopened.installCatalogScreen(item, package: package)
+        XCTAssertEqual(reopened.state.screens.count, 2)
+    }
+
     @MainActor func testBackupGrantDeadlineBlocksCaptureAndUploadWithoutDeletingQueueOrConsent() throws {
         let root = directory(); defer { CatalogFixture.cleanup(root) }
         let library = try CatalogFixture.open(root, binding: binding)

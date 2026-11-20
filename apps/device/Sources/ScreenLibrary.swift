@@ -31,7 +31,7 @@ import ScreenpunkCore
     func containsRotationScreen(_ id: String) -> Bool { id == Self.instructionsID || state.screens.contains { $0.id == id } }
 
     struct Saved: Codable, Identifiable { let id: String; let revision: String; let artifact: ScreenArtifact }
-    struct State: Codable { var screens: [Saved] = []; var selectedID: String?; var previous: Saved?; var lastRequest: String?; var pendingID: String?; var pendingScreenID: String?; var consumedID: String?; var cancelledRequests: [String]?; var cancelIntents: [String]?; var lastInstruction: String?; var keyboardDrafts: [String: String]?; var submissionKey: String?; var submissionText: String?; var submissionScreen: ScreenArtifact?; var requestDeadline: Double?; var authoring: AuthoringStoreState?; var linkedProfile: LocalProfileDescriptor?; var localRequestIDs: Set<String>?; var bundledScreenSeeds: Set<String>?; var catalog: CatalogQueue?; var hiddenScreenIDs: Set<String>?; var onboarding: Onboarding?; var publicDataRevocations: Set<String>?; var screenDataGenerations: [String: String]? }
+    struct State: Codable { var screens: [Saved] = []; var selectedID: String?; var previous: Saved?; var lastRequest: String?; var pendingID: String?; var pendingScreenID: String?; var consumedID: String?; var cancelledRequests: [String]?; var cancelIntents: [String]?; var lastInstruction: String?; var keyboardDrafts: [String: String]?; var submissionKey: String?; var submissionText: String?; var submissionScreen: ScreenArtifact?; var requestDeadline: Double?; var authoring: AuthoringStoreState?; var linkedProfile: LocalProfileDescriptor?; var localRequestIDs: Set<String>?; var bundledScreenSeeds: Set<String>?; var catalog: CatalogQueue?; var hiddenScreenIDs: Set<String>?; var onboarding: Onboarding?; var publicDataRevocations: Set<String>?; var screenDataGenerations: [String: String]?; var catalogScreenIDs: [String: Set<String>]? }
     private(set) var state = State()
     var onCatalogRevisionCommitted: (() -> Void)?
     private let root: URL
@@ -292,7 +292,7 @@ import ScreenpunkCore
         try commit(next)
     }
     func store(for screen: Saved) throws -> PackageAssetStore { try PackageAssetStore.load(directory: root.appendingPathComponent(screen.revision)) }
-    func install(_ artifact: ScreenArtifact, requestID: String, replacing id: String?, selectInstalled: Bool = true, preserveRequestHistory: Bool = false) throws {
+    func install(_ artifact: ScreenArtifact, requestID: String, replacing id: String?, selectInstalled: Bool = true, preserveRequestHistory: Bool = false, catalogScreenID: String? = nil) throws {
         guard state.lastRequest != requestID else { return }
         guard !(state.cancelledRequests ?? []).contains(requestID), !(state.authoring?.cancelledRequestIDs ?? []).contains(requestID) else { throw DeviceError.message("This request was cancelled on this device.") }
         try Self.validate(artifact)
@@ -311,6 +311,10 @@ import ScreenpunkCore
             let saved = Saved(id: id ?? UUID().uuidString, revision: revision, artifact: artifact)
             if let position = next.screens.firstIndex(where: { $0.id == saved.id }) { next.previous = next.screens[position]; next.screens[position] = saved }
             else { next.screens.append(saved) }
+            if let catalogScreenID {
+                if next.catalogScreenIDs == nil { next.catalogScreenIDs = [:] }
+                next.catalogScreenIDs?[saved.id, default: []].insert(catalogScreenID)
+            }
             if selectInstalled && selectsInstalledRevision(saved.id) { next.selectedID = saved.id }
             if !preserveRequestHistory { next.lastRequest = requestID }
             committing = true
@@ -318,6 +322,44 @@ import ScreenpunkCore
             pruneUnusedRevisions()
         } catch { if !committing { try? FileManager.default.removeItem(at: directory) }; throw error }
     }
+    func containsCatalogScreen(_ screen: CatalogScreen) -> Bool {
+        let versions = [screen.latest] + screen.history
+        return state.screens.contains { saved in
+            state.catalogScreenIDs?[saved.id]?.contains(screen.catalogScreenID) == true ||
+                versions.contains { version in
+                    version.sourceRevisionID == saved.revision ||
+                        version.sourceRevisionID == state.catalog?.copies[saved.id]?.acknowledgedRevision ||
+                        version.sourceRevisionID == state.catalog?.copies[saved.id]?.head
+                } ||
+                state.catalog?.previews?.contains { $0.candidate?.catalogScreenID == screen.catalogScreenID && $0.candidate?.localScreenID == state.catalog?.copies[saved.id]?.localScreenID } == true
+        }
+    }
+
+    func recordCatalogIdentity(_ catalogID: String, screenID: String) throws {
+        guard state.screens.contains(where: { $0.id == screenID }) else { return }
+        var next = state
+        if next.catalogScreenIDs == nil { next.catalogScreenIDs = [:] }
+        next.catalogScreenIDs?[screenID, default: []].insert(catalogID)
+        try commit(next, captureCatalog: false)
+    }
+
+    func installCatalogScreen(_ screen: CatalogScreen, package: CatalogPackage) throws {
+        guard !containsCatalogScreen(screen) else { throw DeviceError.message("This screen is already on this device.") }
+        guard state.pendingID == nil, state.submissionKey == nil else {
+            throw DeviceError.message("Finish or cancel the current request before adding a screen.")
+        }
+        _ = try CatalogContract.encodePackage(package)
+        let files: [ScreenFile] = try package.files.map { file in
+            guard let bytes = Data(base64Encoded: file.contentBase64), let content = String(data: bytes, encoding: .utf8) else {
+                throw DeviceError.message("The catalog screen contains an invalid file.")
+            }
+            return .init(path: file.path, content: content)
+        }
+        try install(.init(title: package.screen.title, entry: package.screen.entry, files: files),
+                    requestID: UUID().uuidString, replacing: nil, selectInstalled: false,
+                    preserveRequestHistory: true, catalogScreenID: screen.catalogScreenID)
+    }
+
     /// Upgrade only the exact pristine shipped Weather package. A committed replacement
     /// is recognizable on retry; edited/configured/deleted screens are never recreated.
     func migratePristineWeatherIfNeeded() throws {
