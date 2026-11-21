@@ -19,9 +19,10 @@ public enum AuthoringPackageDependencies {
 
     /// Uses the exact bounded, quote-aware installation parser to collect catalog
     /// declarations. Catalog admission is stricter; ordinary validation is unchanged.
-    public static func catalogDependencies(files: [AuthoringScreenFile]) throws -> (local: [String], external: [String]) {
-        var budget = Budget(remaining: workLimit, catalog: true)
-        try scan(files: files, byteLimit: packageByteLimit, budget: &budget)
+    public static func catalogDependencies(files: [AuthoringScreenFile], extended: Bool = false) throws -> (local: [String], external: [String]) {
+        let limit = extended ? CatalogContract.expandedPackageBytes : packageByteLimit
+        var budget = Budget(remaining: limit * 32, catalog: true)
+        try scan(files: files, byteLimit: limit, budget: &budget)
         guard budget.local.count <= 20, budget.external.count <= 20 else { throw invalid("Too many catalog dependencies.") }
         return (budget.local.sorted(), budget.external.sorted())
     }
@@ -46,7 +47,7 @@ public enum AuthoringPackageDependencies {
     /// Count the canonical JSON files array without first encoding/copying arbitrary input.
     /// Title/entry admission remains with AuthoringContract.validateScreen at its caller.
     private static func admit(files: [AuthoringScreenFile], byteLimit: Int) throws {
-        guard files.count <= 20, (0...packageByteLimit).contains(byteLimit) else { throw invalid("The screen package is too large.") }
+        guard files.count <= 20, (0...CatalogContract.expandedPackageBytes).contains(byteLimit) else { throw invalid("The screen package is too large.") }
         var remaining = byteLimit
         func spend(_ count: Int) throws {
             guard count <= remaining else { throw invalid("The screen package is too large.") }

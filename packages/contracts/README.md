@@ -258,3 +258,9 @@ a **current rendering of that exact saved source**, not a historical snapshot of
 external runtime data at sourceAppliedAt or backedUpAt. Never label missing or
 failed captures as a screenshot. The synthetic one-pixel conformance raster is
 protocol test evidence only and must never be served as a production preview.
+
+### Catalog native package v2
+
+Catalog transport still uses `catalog-backup-v1`. Package `schemaVersion: 2` and version metadata `packageSchema: 2` preserve native WAV/MP3 assets and larger UTF8 source files. Each file is bounded to 2 MiB; expanded files total at most 4 MiB and canonical base64 transport remains bounded to 10 MiB. Native packages require a complete SDK manifest with exact raw-byte sizes and SHA256 digests. Audio headers, paths, media types, dependency declarations and credential markers are validated. Package v1 remains byte-for-byte compatible with its existing UTF8-only limits.
+
+Native catalog imports write exact decoded bytes atomically, persist full asset paths, and use the same package version for later backups. Package-v2 screens currently cannot be edited through the UTF8-only authoring protocol; import never strips assets to make them editable. Connection credentials and permission grants are not included in packages and must be configured separately on the target device.

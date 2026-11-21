@@ -357,18 +357,50 @@ public enum CatalogContract {
         let patterns = ["(?:^|/)(?:credentials|secrets?|id_rsa|id_ed25519|keychain)(?:[./_-]|$)", "-----BEGIN (?:[A-Z ]*PRIVATE KEY|OPENSSH PRIVATE KEY)-----", "\\b(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{16,})\\b"]
         return path.range(of: patterns[0], options: [.regularExpression,.caseInsensitive]) != nil || patterns.dropFirst().contains { content.range(of: $0, options: .regularExpression) != nil }
     }
+    public static let extendedFileBytes = 2 * 1024 * 1024
+    public static let expandedPackageBytes = 4 * 1024 * 1024
+    public static func mediaType(path: String, extended: Bool = false) throws -> String {
+        if extended, let audio = ["wav":"audio/wav", "mp3":"audio/mpeg"][String(path.split(separator: ".").last ?? "")] { return audio }
+        return try AuthoringV2Contract.mediaType(path: path)
+    }
     public static func encodePackage(_ package: CatalogPackage) throws -> Data {
-        guard package.schemaVersion == 1, package.screen.entry == "index.html", !package.files.isEmpty, package.files.count <= 20, package.screen.requiredAssets.count <= 20, package.screen.externalDependencies.count <= 20 else { throw ValidationError.invalid("package metadata") }
-        var previous = ""; var paths = Set<String>(); var files: [AuthoringScreenFile] = []
-        let media = ["html":"text/html","css":"text/css","js":"text/javascript","json":"application/json","svg":"image/svg+xml","txt":"text/plain"]
+        let extended = package.schemaVersion == 2
+        guard [1,2].contains(package.schemaVersion), !package.screen.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, package.screen.title.utf16.count <= 100, package.screen.entry == "index.html", !package.files.isEmpty, package.files.count <= 20, package.screen.requiredAssets.count <= 20, package.screen.externalDependencies.count <= 20 else { throw ValidationError.invalid("package metadata") }
+        var previous = ""; var paths = Set<String>(); var files: [AuthoringScreenFile] = []; var expanded = 0
         for file in package.files {
-            guard safePath(file.path), file.path > previous, paths.insert(file.path.lowercased()).inserted, file.byteLength >= 0, file.byteLength <= 204800, media[String(file.path.split(separator: ".").last ?? "")] == file.mediaType, let bytes = Data(base64Encoded: file.contentBase64), bytes.base64EncodedString() == file.contentBase64, bytes.count == file.byteLength, digest(bytes) == file.digest, let content = String(data: bytes, encoding: .utf8), !containsCredentials(path: file.path, content: content) else { throw ValidationError.invalid("package file") }
-            previous = file.path; files.append(AuthoringScreenFile(path: file.path, content: content))
+            guard safePath(file.path), file.path > previous, paths.insert(file.path.lowercased()).inserted, file.byteLength >= 0, file.byteLength <= (extended ? extendedFileBytes : 204800), file.contentBase64.utf8.count <= (extended ? 2796204 : 273068), try mediaType(path: file.path, extended: extended) == file.mediaType, let bytes = Data(base64Encoded: file.contentBase64), bytes.base64EncodedString() == file.contentBase64, bytes.count == file.byteLength, digest(bytes) == file.digest else { throw ValidationError.invalid("package file") }
+            expanded += bytes.count
+            guard expanded <= expandedPackageBytes else { throw ValidationError.invalid("expanded package bytes") }
+            previous = file.path
+            if extended && file.mediaType.hasPrefix("audio/") {
+                guard !containsCredentials(path: file.path, content: String(decoding: bytes, as: UTF8.self)) else { throw ValidationError.invalid("credential-bearing asset") }
+                let raw = Array(bytes.prefix(12))
+                let wav = raw.count >= 12 && String(bytes: raw[0..<4], encoding: .ascii) == "RIFF" && String(bytes: raw[8..<12], encoding: .ascii) == "WAVE"
+                let mp3 = raw.count >= 3 && (String(bytes: raw[0..<3], encoding: .ascii) == "ID3" || (raw[0] == 255 && raw[1] & 224 == 224))
+                guard (file.mediaType == "audio/wav" && wav) || (file.mediaType == "audio/mpeg" && mp3) else { throw ValidationError.invalid("bundled audio header") }
+                files.append(.init(path: file.path, content: ""))
+            } else {
+                guard let content = String(data: bytes, encoding: .utf8), !containsCredentials(path: file.path, content: content) else { throw ValidationError.invalid("package text") }
+                files.append(.init(path: file.path, content: content))
+            }
         }
-        guard Set(package.screen.requiredAssets).count == package.screen.requiredAssets.count, package.screen.requiredAssets.allSatisfy({ p in safePath(p) && package.files.contains { $0.path == p } }), package.screen.externalDependencies.allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && $0.count <= 160 }) else { throw ValidationError.invalid("package dependencies") }
-        try AuthoringPackageDependencies.validate(files: files)
-        try AuthoringPackageDependencies.validateManifest(files: files)
-        _ = try AuthoringContract.validateScreen(JSONEncoder().encode(AuthoringScreen(title: package.screen.title, entry: package.screen.entry, files: files)))
+        guard paths.contains("index.html"), Set(package.screen.requiredAssets).count == package.screen.requiredAssets.count, package.screen.requiredAssets.allSatisfy({ p in safePath(p) && package.files.contains { $0.path == p } }), package.screen.externalDependencies.allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && $0.count <= 160 }) else { throw ValidationError.invalid("package dependencies") }
+        let dependencies = try AuthoringPackageDependencies.catalogDependencies(files: files, extended: extended)
+        guard Set(dependencies.local).isSubset(of: Set(package.screen.requiredAssets)), Set(dependencies.external).isSubset(of: Set(package.screen.externalDependencies)) else { throw ValidationError.invalid("undeclared dependency") }
+        if extended {
+            guard let source = files.first(where: { $0.path == "manifest.json" }) else { throw ValidationError.invalid("manifest required") }
+            let manifest = try JSONDecoder().decode(DashboardManifest.self, from: Data(source.content.utf8))
+            guard manifest.entrypoint == "index.html", manifest.files.count <= 20, manifest.files.allSatisfy({ $0.bytes >= 0 && $0.bytes <= extendedFileBytes }) else { throw ValidationError.invalid("manifest bounds") }
+            try PackageValidator.validate(manifest)
+            let actual = Dictionary(uniqueKeysWithValues: package.files.filter { $0.path != "manifest.json" }.map { ($0.path, $0) })
+            guard Set(manifest.files.map(\.path)) == Set(actual.keys), manifest.files.count == actual.count else { throw ValidationError.invalid("manifest file set") }
+            for file in manifest.files {
+                guard let asset = actual[file.path], asset.byteLength == file.bytes, asset.digest == file.sha256 else { throw ValidationError.invalid("manifest integrity") }
+            }
+        } else {
+            try AuthoringPackageDependencies.validateManifest(files: files)
+            _ = try AuthoringContract.validateScreen(JSONEncoder().encode(AuthoringScreen(title: package.screen.title, entry: package.screen.entry, files: files)))
+        }
         let bytes = try canonical(package); guard bytes.count <= packageBytes else { throw ValidationError.invalid("package bytes") }; return bytes
     }
     public static func verifyPackage(_ bytes: Data, declaration: CatalogObjectDeclaration) throws -> CatalogPackage {

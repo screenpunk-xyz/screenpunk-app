@@ -230,13 +230,15 @@ export default {
             "text/javascript",
             "application/json",
             "image/svg+xml",
-            "text/plain"
+            "text/plain",
+            "audio/wav",
+            "audio/mpeg"
           ]
         },
         "byteLength": {
           "type": "integer",
           "minimum": 0,
-          "maximum": 204800
+          "maximum": 2097152
         },
         "digest": {
           "type": "string",
@@ -247,7 +249,7 @@ export default {
         "contentBase64": {
           "type": "string",
           "minLength": 0,
-          "maxLength": 273068
+          "maxLength": 2796204
         }
       },
       "required": [
@@ -263,7 +265,10 @@ export default {
       "type": "object",
       "properties": {
         "schemaVersion": {
-          "const": 1
+          "enum": [
+            1,
+            2
+          ]
         },
         "screen": {
           "type": "object",
@@ -733,7 +738,10 @@ export default {
           "pattern": "^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d\\.\\d{3}Z$"
         },
         "packageSchema": {
-          "const": 1
+          "enum": [
+            1,
+            2
+          ]
         },
         "packageDigest": {
           "type": "string",
