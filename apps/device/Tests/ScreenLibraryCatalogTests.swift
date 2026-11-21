@@ -168,6 +168,64 @@ final class ScreenLibraryCatalogTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: destination), bytes)
     }
 
+    @MainActor func testRetainedGeneratorUsesCustomReadAfterEditingLegacyCatalogCopy() throws {
+        guard let path = ProcessInfo.processInfo.environment["SCREENPUNK_GENERATOR_FIXTURE"] else {
+            throw XCTSkip("No retained Generator fixture supplied")
+        }
+        let root = directory()
+        defer { CatalogFixture.cleanup(root) }
+        let package = try JSONDecoder().decode(CatalogPackage.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
+        let encoded = try CatalogContract.encodePackage(package)
+        let version = CatalogVersion(versionID: "generator-legacy", catalogScreenID: "generator-catalog", displayVersion: 1,
+            sourceRevisionID: "source", parentRevisionIDs: [], copyID: "copy", commitCounter: 1,
+            screenName: package.screen.title, sourceAppliedAt: "2026-11-21T00:00:00.000Z", backedUpAt: "2026-11-21T00:00:00.000Z",
+            packageSchema: package.schemaVersion, packageDigest: CatalogContract.digest(encoded), sizeBytes: encoded.count,
+            deviceDisplayName: "Test iPad", deviceLinked: false, preview: .init())
+        let library = try CatalogFixture.open(root, binding: binding)
+        try library.installCatalogScreen(.init(catalogScreenID: version.catalogScreenID, latest: version, history: []), package: package)
+        let original = try XCTUnwrap(library.state.screens.first)
+        let originalManifestURL = root.appendingPathComponent(original.revision).appendingPathComponent("manifest.json")
+        let originalBytes = try Data(contentsOf: originalManifestURL)
+        let manifest = try JSONDecoder().decode(DashboardManifest.self, from: originalBytes)
+        let script = try XCTUnwrap(original.artifact.files.first { $0.path == "app.js" })
+        XCTAssertNil(manifest.connections.first?.customHTTP)
+        XCTAssertNotNil(LegacyGeneratorConnection.enrich(manifest, appDigest: CatalogContract.digest(Data(script.content.utf8))).connections.first?.customHTTP)
+
+        let request = try library.makeAuthoringRequestV2(from: .init(requestID: UUID().uuidString, createdAt: 1_000,
+            deadlineAt: 600_000, designGuidance: AuthoringContract.designGuidance, runtime: AuthoringContract.runtime,
+            services: [], context: .init(profileID: "profile", deviceID: "device", screenID: original.id, baseRevision: original.revision,
+                userRequest: "Update the screen script.", viewport: .init(width: 1_024, height: 768, orientation: "landscape")),
+            delivery: .init(route: "local")))
+        let source = try XCTUnwrap(request.context.currentScreen)
+        let newScript = script.content + "\n// An ordinary display edit.\n"
+        let newScriptBytes = Data(newScript.utf8)
+        var newManifest = manifest
+        let declaration = try XCTUnwrap(newManifest.files.firstIndex(where: { $0.path == "app.js" }))
+        newManifest.files[declaration].bytes = newScriptBytes.count
+        newManifest.files[declaration].sha256 = CatalogContract.digest(newScriptBytes)
+        let reportedManifest = String(decoding: try CatalogContract.canonical(newManifest), as: UTF8.self)
+        let files = source.files.map { file in
+            switch file.path {
+            case "app.js": return AuthoringFileMutationV2.write(path: file.path, content: newScript)
+            case "manifest.json": return AuthoringFileMutationV2.write(path: file.path, content: reportedManifest)
+            default: return .retain(path: file.path, sourcePath: file.path, reference: file.reference, digest: file.digest)
+            }
+        }
+        try library.prepareAuthoringRequest(request, text: request.context.userRequest, screen: nil)
+        let result = AuthoringResultV2(requestID: request.requestID, inputDigest: request.delivery.snapshotDigest,
+            baseRevision: request.context.baseRevision, preferenceRevisions: [:], operationID: UUID().uuidString,
+            screen: .init(title: source.title, files: files))
+        let receipt = try library.applyAuthoringResult(result, now: 2_000)
+        XCTAssertEqual(receipt.status, "applied", receipt.message ?? "")
+        let installed = try XCTUnwrap(library.state.screens.first)
+        XCTAssertNotEqual(installed.revision, original.revision)
+        let migratedBytes = try Data(contentsOf: root.appendingPathComponent(installed.revision).appendingPathComponent("manifest.json"))
+        let persisted = try JSONDecoder().decode(DashboardManifest.self, from: migratedBytes)
+        XCTAssertEqual(persisted.connections.first?.customHTTP?.operations, [.init(name: "telemetry", path: "/telemetry")])
+        XCTAssertEqual(persisted.files, newManifest.files)
+        XCTAssertEqual(try Data(contentsOf: originalManifestURL), originalBytes)
+    }
+
     @MainActor func testNativeCatalogImportRetainsAudioOnDiskReopenAndBackup() throws {
         let root = directory(); defer { CatalogFixture.cleanup(root) }
         var repository = URL(fileURLWithPath: #filePath)

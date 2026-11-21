@@ -5964,5 +5964,14 @@ export default {
         }
       }
     }
+  },
+  "customHTTP": {
+    "rules": [
+      "When runtime.features includes custom-http-v1, you may declare a native customHTTP connection in manifest.json for the user’s requested API. Use only documented operations. The device prompts the user for configuration and review. Never place configured host values, credentials, or other entered values in the package. Browser fetch and arbitrary headers are unavailable.",
+      "Declare a connection as {alias,required,customHTTP:{id,version,label,fields,originField,auth?,operations}}. id is a stable lowercase identifier, version a positive integer. Field descriptors are {id,label,type,options?}; supported types are url, text, number, toggle, choice and secret. Use one url field for originField. Optionally use exactly one secret field via auth:{mode:\"bearer\",field:\"credential\"}. Only choice fields have options, an array of distinct strings.",
+      "Each customHTTP operation is {name,method:\"GET\",path:\"/relative/path\",response:\"json\",parameters:{}}. Paths are fixed and begin with /, without a query or fragment. Each named query parameter is {type,options?,field?} using text, number, toggle or choice. If field is present it identifies a configuration field with the same type and options. Native code supplies bound fields; the screen supplies only the remaining parameters as strings. Secret and URL fields cannot be bound as parameters.",
+      "Use this stable declaration for the existing Generator telemetry integration: {\"alias\":\"generator\",\"required\":true,\"customHTTP\":{\"id\":\"generator-telemetry\",\"version\":1,\"label\":\"Generator\",\"fields\":[{\"id\":\"origin\",\"label\":\"Server address\",\"type\":\"url\"},{\"id\":\"credential\",\"label\":\"Bearer token\",\"type\":\"secret\"}],\"originField\":\"origin\",\"auth\":{\"mode\":\"bearer\",\"field\":\"credential\"},\"operations\":[{\"name\":\"telemetry\",\"method\":\"GET\",\"path\":\"/telemetry\",\"response\":\"json\",\"parameters\":{}}]}}",
+      "Call await screenpunk.connections.request(alias, operation, parameters) and read the decoded response at result.value. Handle unconfigured, permission-required, denied-egress and unavailable states, showing a setup instruction. User approval is specific to the screen and declaration. Public HTTPS is preferred. Device review separately permits LAN destinations or insecure HTTP for a user-configured device. Keep the connection id and declaration stable across unrelated edits."
+    ]
   }
 } as const;

@@ -431,7 +431,7 @@ struct DeviceRootView: View {
 
     private var currentRecordingBackdropScope: RecordingBackdropScope {
         RecordingBackdropScope(owner: model.permissionOwner, accountID: model.cloud.localAccountID,
-                               rendererID: model.screen.map { $0.revision + model.publicReadSessionKey + model.screenDataRendererKey },
+                               rendererID: model.screen.map { $0.revision + model.publicReadSessionKey + model.screenDataRendererKey + model.customHTTPRendererKey },
                                temporaryActivationID: model.temporaryActivationID)
     }
 
@@ -473,6 +473,13 @@ struct DeviceRootView: View {
                             .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
                         Button("Allow public data", action: model.allowCurrentPublicData).buttonStyle(.borderedProminent)
                         Button("Review sources", action: model.openConnectionSettings)
+                    } else if let requirement = model.missingConnections.first(where: { $0.customAlias != nil }) {
+                        Text("Connect " + requirement.name).font(.title2.bold())
+                        Text("Set up this connection and allow this screen to read from it.")
+                            .multilineTextAlignment(.center)
+                        Button("Set up " + requirement.name) { model.openConnectionSettings(customAlias: requirement.customAlias) }
+                            .buttonStyle(.borderedProminent)
+                            .accessibilityIdentifier("custom-connection.open")
                     } else if let unsupported = model.missingConnections.first(where: { $0.unsupportedAlias != nil })?.unsupportedAlias {
                         Text("Connection unavailable").font(.title2.bold())
                         Text("This screen requires the “\(unsupported)” connection, which this version of Screenpunk cannot run.")
@@ -508,8 +515,8 @@ struct DeviceRootView: View {
         } else if let screen = model.screen, let assets = model.assets {
             // The isolated WebView coordinator owns an immutable package and bridge scope.
             // A new local revision must create a new renderer, including on rollback/swipe.
-            let rendererID = screen.revision + model.publicReadSessionKey + model.screenDataRendererKey
-            DashboardRuntimeView(store: assets, homeAssistant: model.homeAssistant, publicReads: model.publicReads, screenData: model.screenDataProvider, revision: screen.revision, catalogContext: model.catalogPreviewContext, connectionCount: 1, screenName: screen.displayName,
+            let rendererID = screen.revision + model.publicReadSessionKey + model.screenDataRendererKey + model.customHTTPRendererKey
+            DashboardRuntimeView(store: assets, homeAssistant: model.homeAssistant, customHTTP: model.customHTTP, publicReads: model.publicReads, screenData: model.screenDataProvider, revision: screen.revision, catalogContext: model.catalogPreviewContext, connectionCount: 1, screenName: screen.displayName,
                                  onMenu: { if swipeID == nil { model.openSettings() } })
                 .environment(\.dashboardSnapshotRegistration, DashboardSnapshotRegistration(
                     source: dashboardSnapshot, rendererID: rendererID
@@ -1093,7 +1100,7 @@ struct CloudListenerSetupView_Previews: PreviewProvider {
 
 enum DeviceSettingsPage: String, Hashable {
     case overview = "Overview", guidedAccess = "Guided Access", display = "General", account = "Account", screens = "Screens"
-    case home = "Home Assistant", television = "Google TV", calendar = "Google Calendar"
+    case home = "Home Assistant", television = "Google TV", calendar = "Google Calendar", customConnections = "Custom Connections"
     var symbol: String {
         switch self {
         case .overview: return "hand.draw"
@@ -1104,6 +1111,7 @@ enum DeviceSettingsPage: String, Hashable {
         case .home: return "house"
         case .television: return "tv"
         case .calendar: return "calendar"
+        case .customConnections: return "link"
         }
     }
 }
@@ -1177,6 +1185,8 @@ private struct ScreenDataAccessSettings: View {
 private enum ScreenSettingsRoute: Hashable {
     case screen(String, owner: String)
     case shared(DeviceSettingsPage)
+    case custom(String, alias: String, owner: String)
+    case sharedCustom(String, owner: String)
 }
 
 struct DeviceSettingsView: View {
@@ -1184,6 +1194,8 @@ struct DeviceSettingsView: View {
     @State private var renameText = ""
     @State private var renameTarget: ScreenSettingsRoute?
     @State private var renameError: String?
+    @State private var customConnectionToRemove: ScreenSettingsRoute?
+    @State private var customConnectionError: String?
     @ObservedObject var model: DeviceModel
     @ObservedObject var display: DeviceDisplayPreferences
     @Environment(\.dismiss) private var dismiss
@@ -1210,6 +1222,7 @@ struct DeviceSettingsView: View {
                     row(.home)
                     row(.calendar)
                     row(.television)
+                    row(.customConnections)
                 }
                 Section("Help") { row(.overview); row(.guidedAccess) }
             }
@@ -1227,6 +1240,14 @@ struct DeviceSettingsView: View {
                                 screenDetails(saved, owner: owner)
                             } else { Text("Screen unavailable") }
                         case let .shared(provider): sharedProvider(provider)
+                        case let .custom(id, alias, owner):
+                            if owner == model.permissionOwner,
+                               let use = model.customConnectionUses().first(where: { $0.screen.id == id && $0.alias == alias }) {
+                                DeviceCustomConnectionSettings(model: model, use: use, owner: owner, allowsApproval: true)
+                            } else { Text("Connection unavailable") }
+                        case let .sharedCustom(id, owner):
+                            if owner == model.permissionOwner { sharedCustomConnection(id, owner: owner) }
+                            else { Text("Connection unavailable") }
                         }
                     }
                     .navigationTitle((selection ?? .overview).rawValue)
@@ -1254,8 +1275,11 @@ struct DeviceSettingsView: View {
         .onAppear {
             selection = model.settingsPage
             if let id = model.settingsScreenID {
-                path = [.screen(id, owner: model.permissionOwner)]
+                let owner = model.permissionOwner
+                path = [.screen(id, owner: owner)]
+                if let alias = model.settingsCustomConnectionAlias { path.append(.custom(id, alias: alias, owner: owner)) }
                 model.settingsScreenID = nil
+                model.settingsCustomConnectionAlias = nil
             }
             model.checkListenerStatusOnSettingsEntry()
         }
@@ -1265,6 +1289,7 @@ struct DeviceSettingsView: View {
         }
         .onChange(of: model.permissionOwner) { _ in
             path.removeAll(); renameTarget = nil; screenToRemove = nil
+            customConnectionToRemove = nil; customConnectionError = nil
         }
         .alert("Rename screen", isPresented: Binding(get: { renameTarget != nil }, set: { if !$0 { renameTarget = nil } }), presenting: renameTarget) { target in
             TextField("Screen name", text: $renameText)
@@ -1278,6 +1303,19 @@ struct DeviceSettingsView: View {
         .alert("Couldn’t rename screen", isPresented: Binding(get: { renameError != nil }, set: { if !$0 { renameError = nil } })) {
             Button("OK") {}
         } message: { Text(renameError ?? "") }
+        .confirmationDialog("Delete this saved connection?", isPresented: Binding(
+            get: { customConnectionToRemove != nil },
+            set: { if !$0 { customConnectionToRemove = nil } }
+        ), titleVisibility: .visible, presenting: customConnectionToRemove) { target in
+            Button("Delete connection", role: .destructive) {
+                guard case let .sharedCustom(id, owner) = target else { return }
+                do { try model.removeCustomConnection(id, owner: owner); customConnectionError = nil }
+                catch { customConnectionError = "Couldn’t remove this connection. Try again." }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { _ in
+            Text("Every screen using this connection will need to be set up and approved again.")
+        }
         .alert("Remove screen?", isPresented: Binding(get: { screenToRemove != nil }, set: { if !$0 { screenToRemove = nil } })) {
             Button("Cancel", role: .cancel) { screenToRemove = nil }
             Button("Remove", role: .destructive) {
@@ -1403,6 +1441,8 @@ struct DeviceSettingsView: View {
                     }
                 }
             }
+        case .customConnections:
+            customConnections
         case .home, .television, .calendar:
             sharedProvider(selection ?? .home)
         }
@@ -1433,6 +1473,56 @@ struct DeviceSettingsView: View {
         ForEach(screens) { saved in
             NavigationLink(saved.displayName, value: ScreenSettingsRoute.screen(saved.id, owner: model.permissionOwner))
         }
+    }
+
+    private var customConnections: some View {
+        let uses = model.customConnectionUses()
+        let saved = model.savedCustomConnections
+        let serviceIDs = Set(uses.map { $0.declaration.id } + saved.map(\.id))
+        return Form {
+            if serviceIDs.isEmpty { Text("No custom connections on this device.").foregroundStyle(.secondary) }
+            ForEach(serviceIDs.sorted(), id: \.self) { id in
+                let label = uses.first(where: { $0.declaration.id == id })?.declaration.label
+                    ?? saved.first(where: { $0.id == id })?.label ?? id
+                NavigationLink(label, value: ScreenSettingsRoute.sharedCustom(id, owner: model.permissionOwner))
+            }
+        }
+    }
+
+    private func sharedCustomConnection(_ serviceID: String, owner: String) -> some View {
+        let uses = model.customConnectionUses(serviceID: serviceID)
+        let saved = model.savedCustomConnections.first { $0.id == serviceID }
+        return Form {
+            if let saved {
+                Section("Saved connection") {
+                    LabeledContent("Server", value: saved.origin)
+                    Button("Delete saved connection", role: .destructive) {
+                        customConnectionToRemove = .sharedCustom(serviceID, owner: owner)
+                    }
+                }
+            }
+            if !uses.isEmpty {
+                Section("Screens") {
+                    ForEach(uses) { use in
+                        NavigationLink(value: ScreenSettingsRoute.custom(use.screen.id, alias: use.alias, owner: owner)) {
+                            LabeledContent(use.screen.displayName, value: model.customConnectionApproved(use) ? "Allowed" : "Approval required")
+                        }
+                    }
+                }
+            }
+            if let use = uses.first {
+                Section {
+                    NavigationLink {
+                        DeviceCustomConnectionSettings(model: model, use: use, owner: owner, allowsApproval: false)
+                    } label: { Text(saved == nil ? "Set up connection" : "Edit connection settings") }
+                }
+            }
+            if let customConnectionError {
+                Section { Text(customConnectionError).foregroundStyle(.red) }
+            }
+        }
+        .navigationTitle(uses.first?.declaration.label ?? saved?.label ?? serviceID)
+        .disabled(owner != model.permissionOwner || model.accountOperationInProgress)
     }
 
     private func screenDetails(_ saved: ScreenLibrary.Saved, owner: String) -> some View {
@@ -1474,6 +1564,16 @@ struct DeviceSettingsView: View {
                     sharedLink(.calendar)
                 }
                 if aliases.contains("googleTV") { sharedLink(.television) }
+            }
+            let customUses = model.customConnectionUses().filter { $0.screen.id == saved.id }
+            if !customUses.isEmpty {
+                Section("Custom Connections") {
+                    ForEach(customUses, id: \.alias) { use in
+                        NavigationLink(value: ScreenSettingsRoute.custom(saved.id, alias: use.alias, owner: owner)) {
+                            LabeledContent(use.declaration.label, value: model.customConnectionApproved(use) ? "Allowed" : "Set up")
+                        }
+                    }
+                }
             }
             ScreenDataAccessSettings(model: model, screenID: saved.id)
             Section {

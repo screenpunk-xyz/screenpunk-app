@@ -55,6 +55,7 @@ public enum PackageValidator {
     ) throws {
         var issues: [PackageIssue] = []
         do { _ = try PublicReadProvisioning(manifest: manifest) } catch { issues.append(.validationFailed) }
+        do { try CustomHTTPDeclaration.validateConnections(manifest.connections) } catch { issues.append(.validationFailed) }
         if manifest.schemaVersion != PackageLimits.schemaMajor {
             issues.append(.unsupportedVersion)
         }

@@ -167,7 +167,6 @@ private final class NavigationWaiter: NSObject, WKNavigationDelegate {
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { loaded.fulfill() }
 }
 
-@MainActor
 private final class RecordingPackageTask: NSObject, WKURLSchemeTask {
     let request: URLRequest
     let finished = XCTestExpectation(description: "Package asset transferred")

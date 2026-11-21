@@ -1,5 +1,5 @@
 import definition from './generated/authoring-v2-definition';
-import { AUTHORING_DEFINITION, AuthoringContractError, authoringRuntime, canonicalJSON, checkAuthoringManifestScreenData, sealAuthoringRequest, validateAuthoringRequest, validateAuthoringResult, validateAuthoringScreen, type AuthoringRequestV1, type AuthoringResultV1, type AuthoringScreen, type JSONSchema } from './authoring';
+import { AUTHORING_DEFINITION, CUSTOM_HTTP_FEATURE, AuthoringContractError, canonicalJSON, checkAuthoringManifestScreenData, sealAuthoringRequest, validateAuthoringRequest, validateAuthoringResult, validateAuthoringScreen, type AuthoringRequestV1, type AuthoringResultV1, type AuthoringScreen, type JSONSchema } from './authoring';
 export interface AuthoringSourceFileV2 { path: string; mediaType: string; byteLength: number; digest: string; reference: string; content?: string }
 export interface AuthoringSourceScreenV2 { title: string; entry: 'index.html'; files: AuthoringSourceFileV2[]; packageSchema?: 3 }
 export interface AuthoringContextV2 extends Omit<AuthoringRequestV1['context'],'currentScreen'> { libraryID: string; currentScreen?: AuthoringSourceScreenV2 }
@@ -8,7 +8,7 @@ export type AuthoringFileMutationV2 = {kind:'write';path:string;content:string} 
 export interface AuthoringScreenMutationV2 { title:string;entry:'index.html';files:AuthoringFileMutationV2[];deletedPaths:string[];requiredAssets?:string[] }
 export interface AuthoringResultV2 extends Omit<AuthoringResultV1,'schemaVersion'|'screen'> { schemaVersion:2;screen?:AuthoringScreenMutationV2 }
 export interface AuthoringCapabilitiesV2 { contractVersions: string[]; features: string[] }
-export const AUTHORING_V2_CAPABILITIES: Readonly<AuthoringCapabilitiesV2> = Object.freeze({contractVersions:Object.freeze(['1','2']) as unknown as string[],features:Object.freeze(['asset-references-v2','package-assets-v2']) as unknown as string[]});
+export const AUTHORING_V2_CAPABILITIES: Readonly<AuthoringCapabilitiesV2> = Object.freeze({contractVersions:Object.freeze(['1','2']) as unknown as string[],features:Object.freeze(['asset-references-v2','package-assets-v2',CUSTOM_HTTP_FEATURE]) as unknown as string[]});
 export function supportsAuthoringV2(value: unknown): boolean { const v = value as AuthoringCapabilitiesV2 | null; return !!v && Array.isArray(v.contractVersions) && v.contractVersions.includes('2') && Array.isArray(v.features) && v.features.includes('asset-references-v2'); }
 export function supportsAuthoringPackageAssets(value: unknown): boolean {
   return supportsAuthoringV2(value) && (value as AuthoringCapabilitiesV2).features.includes('package-assets-v2');
@@ -136,16 +136,17 @@ export function validateAuthoringResultV2(value:unknown,request?:AuthoringReques
   }
   if(!screen.title.trim()||screen.title.length>100)fail('invalid screen title');
   const targets=new Set<string>();const deleted=new Set<string>();const base=request?.context.currentScreen?.files??[];
-  const supportsScreenData = !request || canonicalJSON(request.runtime) === canonicalJSON(authoringRuntime(true));
+  const supportsScreenData = !request || AUTHORING_DEFINITION.screenData.features.every(feature => request.runtime.features.includes(feature));
+  const supportsCustomHTTP = !request || request.runtime.features.includes(CUSTOM_HTTP_FEATURE);
   const previousManifest = base.find(f => f.path === 'manifest.json')?.content;
   for(const path of screen.deletedPaths){if(deleted.has(path.toLowerCase()))fail('duplicate deleted path');deleted.add(path.toLowerCase());}
   let total=0;
   for(const file of screen.files){const path=file.path.toLowerCase();if(targets.has(path)||deleted.has(path))fail('duplicate/overlapping destination');targets.add(path);
-   if(file.kind==='write'){if(!isEditableAuthoringText(file.path))fail('writes require editable text');total+=utf8(file.content).length;if(file.path==='manifest.json')checkAuthoringManifestScreenData(file.content,previousManifest,supportsScreenData);}
+   if(file.kind==='write'){if(!isEditableAuthoringText(file.path))fail('writes require editable text');total+=utf8(file.content).length;if(file.path==='manifest.json')checkAuthoringManifestScreenData(file.content,previousManifest,supportsScreenData,supportsCustomHTTP);}
    else if(request){const source=base.find(f=>f.path===file.sourcePath&&f.reference===file.reference&&f.digest===file.digest)??fail('unknown/out-of-scope source reference');if (extended) {
      if (file.path !== source.path && extension(file.path).toLowerCase() !== extension(source.path).toLowerCase()) fail('retain must preserve the file extension');
     } else total += source.byteLength;
-    if(file.path==='manifest.json'&&source.path!==file.path){if(source.content!==undefined)checkAuthoringManifestScreenData(source.content,previousManifest,supportsScreenData);else if(!supportsScreenData)fail('target runtime cannot admit a manifest from an opaque reference');}}
+    if(file.path==='manifest.json'&&source.path!==file.path){if(source.content!==undefined)checkAuthoringManifestScreenData(source.content,previousManifest,supportsScreenData,supportsCustomHTTP);else if(!supportsScreenData || !supportsCustomHTTP)fail('target runtime cannot admit a manifest from an opaque reference');}}
   }
   if(!screen.files.some(f=>f.path==='index.html')||(legacy && total>204800))fail('materialized entry/byte limit');
   const required=new Set<string>();for(const path of screen.requiredAssets??[]){if(required.has(path.toLowerCase())||!screen.files.some(f=>f.path===path))fail('missing/duplicate declared asset');required.add(path.toLowerCase());}
@@ -176,7 +177,8 @@ export async function materializeAuthoringResultBytesV2(result: AuthoringResultV
     if (bytes.length !== source.byteLength || await authoringContentDigestV2(bytes) !== source.digest) fail('pinned source corrupt/missing');
     if (file.path === 'manifest.json' && source.path !== file.path) {
       checkAuthoringManifestScreenData(decodeUTF8(bytes), base.get('manifest.json')?.content,
-        canonicalJSON(request.runtime) === canonicalJSON(authoringRuntime(true)));
+        AUTHORING_DEFINITION.screenData.features.every(feature => request.runtime.features.includes(feature)),
+        request.runtime.features.includes(CUSTOM_HTTP_FEATURE));
     }
     files.set(file.path, bytes);
   }

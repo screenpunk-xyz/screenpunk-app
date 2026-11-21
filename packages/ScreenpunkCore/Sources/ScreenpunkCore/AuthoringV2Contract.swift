@@ -78,7 +78,7 @@ public enum AuthoringV2Contract {
                 if let content = file.content {
                     guard !extended || isEditableText(path: file.path) else { throw AuthoringContractError("opaque source must omit content") }
                     guard content.utf8.count == file.byteLength, AuthoringContract.contentDigest(Data(content.utf8)) == file.digest else { throw AuthoringContractError("source content hash/length mismatch") }
-                    if file.path == "manifest.json" { try ScreenDataContract.validateManifestDeclaration(content) }
+                    if file.path == "manifest.json" { try AuthoringContract.validateManifest(content) }
                 }
             }
             guard bytes <= 204800, source.files.contains(where: { $0.path == "index.html" }) else { throw AuthoringContractError("source package limit/entry") }
@@ -112,7 +112,6 @@ public enum AuthoringV2Contract {
             guard !screen.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, screen.title.utf16.count <= 100 else { throw AuthoringContractError("invalid screen title") }
             var destinations = Set<String>(); var deleted = Set<String>(); var bytes = 0
             let base = request?.context.currentScreen?.files ?? []
-            let supportsScreenData = request.map { $0.runtime == AuthoringContract.runtime(supportsScreenData: true) } ?? true
             let previousManifest = base.first(where: { $0.path == "manifest.json" })?.content
             for path in screen.deletedPaths { guard deleted.insert(path.lowercased()).inserted else { throw AuthoringContractError("duplicate delete path") } }
             for file in screen.files {
@@ -121,7 +120,7 @@ public enum AuthoringV2Contract {
                     guard isEditableText(path: file.path) else { throw AuthoringContractError("writes require editable text") }
                     bytes += file.content!.utf8.count
                     if file.path == "manifest.json" {
-                        try ScreenDataContract.validateManifestDeclaration(file.content!, previous: previousManifest, supportsScreenData: supportsScreenData)
+                        try AuthoringContract.validateManifest(file.content!, previous: previousManifest, runtime: request?.runtime)
                     }
                 }
                 else if request != nil {
@@ -135,8 +134,9 @@ public enum AuthoringV2Contract {
                     }
                     if file.path == "manifest.json", source.path != file.path {
                         if let content = source.content {
-                            try ScreenDataContract.validateManifestDeclaration(content, previous: previousManifest, supportsScreenData: supportsScreenData)
-                        } else if !supportsScreenData {
+                            try AuthoringContract.validateManifest(content, previous: previousManifest, runtime: request?.runtime)
+                        } else if request?.runtime.features.contains(AuthoringContract.customHTTPFeature) != true
+                                    || AuthoringContract.definition.screenData?.features.allSatisfy({ request?.runtime.features.contains($0) == true }) != true {
                             throw AuthoringContractError("target runtime cannot admit a manifest from an opaque reference")
                         }
                     }
@@ -177,9 +177,9 @@ public enum AuthoringV2Contract {
             guard bytes.count == source.byteLength, AuthoringContract.contentDigest(bytes) == source.digest else { throw AuthoringContractError("pinned source missing/corrupt") }
             if file.path == "manifest.json", source.path != file.path {
                 guard String(data: bytes, encoding: .utf8) != nil else { throw AuthoringContractError("manifest source is not UTF8") }
-                try ScreenDataContract.validateManifestDeclaration(String(decoding: bytes, as: UTF8.self),
+                try AuthoringContract.validateManifest(String(decoding: bytes, as: UTF8.self),
                     previous: request.context.currentScreen?.files.first(where: { $0.path == "manifest.json" })?.content,
-                    supportsScreenData: request.runtime == AuthoringContract.runtime(supportsScreenData: true))
+                    runtime: request.runtime)
             }
             files[file.path] = bytes
         }

@@ -35,14 +35,28 @@ public enum AuthoringContract {
     public static let resultMetadataBytes = 131072
     public static let resultBytes = 393216
 
-    public static func designGuidance(supportsScreenData: Bool) -> AuthoringDesignGuidanceV1 {
-        guard supportsScreenData, let screenData = definition.screenData else { return designGuidance }
-        return .init(version: designGuidance.version, rules: designGuidance.rules + screenData.rules)
+    public static let customHTTPFeature = "custom-http-v1"
+
+    public static func designGuidance(supportsScreenData: Bool, supportsCustomHTTP: Bool = false) -> AuthoringDesignGuidanceV1 {
+        var guidance = designGuidance
+        if supportsScreenData { guidance.rules += definition.screenData?.rules ?? [] }
+        if supportsCustomHTTP { guidance.rules += definition.customHTTP?.rules ?? [] }
+        return guidance
     }
 
-    public static func runtime(supportsScreenData: Bool) -> AuthoringRuntimeV1 {
-        guard supportsScreenData, let screenData = definition.screenData else { return runtime }
-        return .init(version: runtime.version, packageFormat: runtime.packageFormat, features: runtime.features + screenData.features, limits: runtime.limits)
+    public static func runtime(supportsScreenData: Bool, supportsCustomHTTP: Bool = false) -> AuthoringRuntimeV1 {
+        var runtime = runtime
+        if supportsScreenData { runtime.features += definition.screenData?.features ?? [] }
+        if supportsCustomHTTP { runtime.features.append(customHTTPFeature) }
+        return runtime
+    }
+
+    static func validateManifest(_ content: String, previous: String? = nil, runtime: AuthoringRuntimeV1? = nil) throws {
+        let screenData = runtime.map { candidate in
+            definition.screenData?.features.allSatisfy(candidate.features.contains) == true
+        } ?? true
+        try ScreenDataContract.validateManifestDeclaration(content, previous: previous, supportsScreenData: screenData)
+        try CustomHTTPDeclaration.validateManifest(content, previous: previous, supported: runtime?.features.contains(customHTTPFeature) ?? true)
     }
 
     public static func makeServices(observedAt: Int64) -> [AuthoringServiceV1] {
@@ -67,10 +81,11 @@ public enum AuthoringContract {
         try validateSchema("Request", data: data)
         let request = try JSONDecoder().decode(AuthoringRequestV1.self, from: data)
         guard request.deadlineAt > request.createdAt else { throw AuthoringContractError("deadline must follow creation") }
-        let screenData = request.runtime == runtime(supportsScreenData: true)
+        let screenData = definition.screenData?.features.allSatisfy(request.runtime.features.contains) == true
+        let customHTTP = request.runtime.features.contains(customHTTPFeature)
         let browser = request.runtime == browserRuntime
-        guard request.runtime == (browser ? browserRuntime : runtime(supportsScreenData: screenData)),
-              request.designGuidance == (browser ? browserDesignGuidance : designGuidance(supportsScreenData: screenData)) else { throw AuthoringContractError("unsupported guidance/runtime definition") }
+        guard request.runtime == (browser ? browserRuntime : runtime(supportsScreenData: screenData, supportsCustomHTTP: customHTTP)),
+              request.designGuidance == (browser ? browserDesignGuidance : designGuidance(supportsScreenData: screenData, supportsCustomHTTP: customHTTP)) else { throw AuthoringContractError("unsupported guidance/runtime definition") }
         if browser, !request.services.isEmpty || !request.preferences.isEmpty {
             throw AuthoringContractError("browser runtime requires empty services and preferences")
         }
@@ -129,9 +144,9 @@ public enum AuthoringContract {
                 throw AuthoringContractError("browser runtime does not support preference mutations")
             }
             if let manifest = result.screen?.files.first(where: { $0.path == "manifest.json" }) {
-                try ScreenDataContract.validateManifestDeclaration(manifest.content,
+                try validateManifest(manifest.content,
                     previous: request.context.currentScreen?.files.first(where: { $0.path == "manifest.json" })?.content,
-                    supportsScreenData: request.runtime == runtime(supportsScreenData: true))
+                    runtime: request.runtime)
             }
             guard result.requestID == request.requestID, result.inputDigest == request.delivery.snapshotDigest,
                   result.baseRevision == request.context.baseRevision else { throw AuthoringContractError("result is not bound to request snapshot") }
@@ -192,7 +207,7 @@ public enum AuthoringContract {
         }
         guard screen.files.contains(where: { $0.path == "index.html" }), try encodedCanonical(screen).count <= runtime.limits.screenBytes else { throw AuthoringContractError("screen entry/serialized size limit") }
         if let manifest = screen.files.first(where: { $0.path == "manifest.json" }) {
-            try ScreenDataContract.validateManifestDeclaration(manifest.content)
+            try validateManifest(manifest.content)
         }
     }
     private static func json(_ data: Data) throws -> Any { try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) }

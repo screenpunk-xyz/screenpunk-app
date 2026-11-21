@@ -1068,6 +1068,27 @@ import ScreenpunkCore
         clearTerminalDelivery(receipt.requestID, in: &next)
         try commit(next); pruneUnusedRevisions()
     }
+    private func legacyGeneratorDescriptor(for saved: Saved?) -> ManifestConnection? {
+        guard let saved, let metadata = saved.artifact.files.first(where: { $0.path == "manifest.json" }),
+              let manifest = try? JSONDecoder().decode(DashboardManifest.self, from: Data(metadata.content.utf8)),
+              let app = manifest.files.first(where: { $0.path == "app.js" }),
+              manifest.connections.first?.customHTTP == nil,
+              let connection = LegacyGeneratorConnection.enrich(manifest, appDigest: app.sha256).connections.first,
+              connection.customHTTP != nil,
+              let stored = try? AuthoringPinnedPackage.inspectNative(directory: root.appendingPathComponent(saved.revision), path: app.path),
+              stored.digest == app.sha256, stored.byteLength == app.bytes else { return nil }
+        return connection
+    }
+
+    private func carryingForwardGenerator(from saved: Saved?, into files: [AuthoringScreenFile]) throws -> [AuthoringScreenFile] {
+        guard let descriptor = legacyGeneratorDescriptor(for: saved),
+              let index = files.firstIndex(where: { $0.path == "manifest.json" }) else { return files }
+        var updated = files
+        let bytes = try LegacyGeneratorConnection.carryForward(descriptor, into: Data(files[index].content.utf8))
+        updated[index] = .init(path: files[index].path, content: String(decoding: bytes, as: UTF8.self))
+        return updated
+    }
+
     /// The complete next index (screen, CAS mutations, receipt, outbox) is one redo transaction.
     func applyAuthoringResult(_ result: AuthoringResultV1, now: Int64 = Int64(Date().timeIntervalSince1970 * 1000)) throws -> ApplicationReceiptV1 {
         if let old = state.authoring?.receipts[result.operationID] {
@@ -1088,10 +1109,12 @@ import ScreenpunkCore
         next.authoring = authoring
         var stagedRevision: String?
         if receipt.status == "applied", let screen = result.screen {
-            let artifact = ScreenArtifact(title: screen.title, entry: screen.entry, files: screen.files.map { ScreenFile(path: $0.path, content: $0.content) })
+            let artifact: ScreenArtifact
             let revision = UUID().uuidString
             let directory = root.appendingPathComponent(revision, isDirectory: true)
             do {
+                let files = try carryingForwardGenerator(from: current, into: screen.files)
+                artifact = ScreenArtifact(title: screen.title, entry: screen.entry, files: files.map { ScreenFile(path: $0.path, content: $0.content) })
                 try Self.validate(artifact)
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
                 for file in artifact.files {
@@ -1160,13 +1183,15 @@ import ScreenpunkCore
                         retained[source.path] = raw
                         return raw
                     }
-                    try AuthoringPackageDependencies.validateManifest(files: materialized.files)
-                    let artifact = ScreenArtifact(title: materialized.title, entry: materialized.entry, files: materialized.files.map { .init(path: $0.path, content: $0.content) })
+                    let files = try carryingForwardGenerator(from: current, into: materialized.files)
+                    try AuthoringPackageDependencies.validateManifest(files: files)
+                    let artifact = ScreenArtifact(title: materialized.title, entry: materialized.entry, files: files.map { .init(path: $0.path, content: $0.content) })
                     try Self.validate(artifact)
                     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
                     for file in mutation.files {
                         let data: Data
-                        if file.kind == "retain", let path = file.sourcePath, let raw = retained[path] { data = raw }
+                        if file.path == "manifest.json", let manifest = files.first(where: { $0.path == file.path }) { data = Data(manifest.content.utf8) }
+                        else if file.kind == "retain", let path = file.sourcePath, let raw = retained[path] { data = raw }
                         else if file.kind == "write", let content = file.content { data = Data(content.utf8) }
                         else { throw DeviceError.message("The materialized asset is missing.") }
                         let url = directory.appendingPathComponent(file.path)
@@ -1234,6 +1259,14 @@ import ScreenpunkCore
                 bytes = try JSONSerialization.data(withJSONObject: document, options: [.sortedKeys, .withoutEscapingSlashes])
                 guard bytes.count <= CatalogContract.assetManifestBytes else { throw DeviceError.message("The screen manifest is too large.") }
                 try bytes.write(to: url, options: .atomic)
+            }
+            if let descriptor = legacyGeneratorDescriptor(for: current) {
+                let migrated = try LegacyGeneratorConnection.carryForward(descriptor, into: bytes)
+                if migrated != bytes {
+                    guard migrated.count <= CatalogContract.assetManifestBytes else { throw DeviceError.message("The screen manifest is too large.") }
+                    try migrated.write(to: url, options: .atomic)
+                    bytes = migrated
+                }
             }
             let manifest = try JSONDecoder().decode(DashboardManifest.self, from: bytes)
             guard manifest.entrypoint == mutation.entry else { throw DeviceError.message("The manifest entrypoint differs from the screen entry.") }
