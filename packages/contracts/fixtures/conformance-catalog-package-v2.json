@@ -1,0 +1,36 @@
+{
+  "package": {
+    "schemaVersion": 2,
+    "screen": {
+      "title": "Audio fixture",
+      "entry": "index.html",
+      "requiredAssets": [
+        "sound.wav"
+      ],
+      "externalDependencies": []
+    },
+    "files": [
+      {
+        "path": "index.html",
+        "mediaType": "text/html",
+        "byteLength": 66,
+        "digest": "ca346ce5cdd3d43bdad2974f0df18830e3a0de4f475a9c5789bf7cf5b959640e",
+        "contentBase64": "PGh0bWw+PGJvZHk+PGF1ZGlvIHNyYz0ic291bmQud2F2IiBjb250cm9scz48L2F1ZGlvPjwvYm9keT48L2h0bWw+"
+      },
+      {
+        "path": "manifest.json",
+        "mediaType": "application/json",
+        "byteLength": 475,
+        "digest": "8d297f445cd2c5ca40fdc4c9d1e4c9675c1d81cbefd96463732b1f0e99ca9578",
+        "contentBase64": "eyJzY2hlbWFWZXJzaW9uIjoxLCJzZGtWZXJzaW9uIjoiMSIsImRhc2hib2FyZElkIjoiYXVkaW8tZml4dHVyZSIsIm5hbWUiOiJBdWRpbyBmaXh0dXJlIiwicmV2aXNpb24iOiJyZXZpc2lvbi1hIiwiZW50cnlwb2ludCI6ImluZGV4Lmh0bWwiLCJ0YXJnZXQiOnsicHJvZmlsZUlkIjoidGVzdCIsIndpZHRoIjoxMDI0LCJoZWlnaHQiOjc2OCwic2NhbGUiOjEsIm9yaWVudGF0aW9uIjoibGFuZHNjYXBlIn0sImNvbm5lY3Rpb25zIjpbXSwiZmlsZXMiOlt7InBhdGgiOiJpbmRleC5odG1sIiwiYnl0ZXMiOjY2LCJzaGEyNTYiOiJjYTM0NmNlNWNkZDNkNDNiZGFkMjk3NGYwZGYxODgzMGUzYTBkZTRmNDc1YTljNTc4OWJmN2NmNWI5NTk2NDBlIn0seyJwYXRoIjoic291bmQud2F2IiwiYnl0ZXMiOjYwLCJzaGEyNTYiOiI4NmI1ZjVhNGE2OWIyMjZjZWY1MzJjYjQwMTlkZjhmZjBjMDhhODA0ZmE5MTlhZjVkMTE2ZTZlMjU3Y2Q5ZWFjIn1dfQ=="
+      },
+      {
+        "path": "sound.wav",
+        "mediaType": "audio/wav",
+        "byteLength": 60,
+        "digest": "86b5f5a4a69b226cef532cb4019df8ff0c08a804fa919af5d116e6e257cd9eac",
+        "contentBase64": "UklGRjQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YRAAAAAAAAAAAAAAAAAAAAAAAAAA"
+      }
+    ]
+  }
+}

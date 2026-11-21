@@ -20,3 +20,29 @@ describe('catalog v1 independent capability and complete package',()=>{
  it('marks missing objects and permits operation rotation only for failed expired retry statuses',()=>{validateCatalogWire('Version',fixture.missingVersion);validateCatalogWire('BackupStatus',fixture.expiredStatus);for(const state of ['pending','uploaded','completed'])expect(()=>validateCatalogWire('BackupStatus',{...fixture.expiredStatus,state})).toThrow();expect(()=>validateCatalogWire('Error',{...fixture.expiredStatus.error,code:'quota_exceeded'})).toThrow();expect(()=>validateCatalogWire('Error',{...fixture.expiredStatus.error,restartOperation:false})).toThrow();expect(()=>validateCatalogWire('Version',{...fixture.missingVersion,integrity:'okay'})).toThrow();});
  it('requires explicit honest unavailable previews and configured entitlement',()=>{validateCatalogWire('Preview',{status:'unavailable',reason:'not_provided'});expect(()=>validateCatalogWire('Preview',{status:'available'})).toThrow();const entitlement={backupEnabled:false,reason:'not_enabled',versionsPerScreen:3,screensPerAccount:20,packageBytes:CATALOG_LIMITS.packageBytes,previewBytes:CATALOG_LIMITS.previewBytes,previewDimension:2048,accountBytes:CATALOG_LIMITS.accountBytes,publicationOverlapBytes:CATALOG_LIMITS.publicationOverlapBytes};validateCatalogWire('Capability',{version:'1',feature:CATALOG_CAPABILITY,previewMediaTypes:[],entitlement});expect(()=>validateCatalogWire('Capability',{version:'2',feature:CATALOG_CAPABILITY,previewMediaTypes:[],entitlement})).toThrow();});
 });
+
+describe('catalog native package v2',()=>{
+ const extended=JSON.parse(readFileSync(new URL('./fixtures/conformance-catalog-package-v2.json',import.meta.url),'utf8')).package;
+ it('preserves audio bytes with manifest integrity and rejects v1 downgrade',async()=>{
+  const bytes=await encodeCatalogPackage(extended);
+  expect(await verifyCatalogPackageUpload(bytes,{byteLength:bytes.length,digest:await authoringContentDigestV2(bytes)})).toEqual(extended);
+  await expect(encodeCatalogPackage({...extended,schemaVersion:1})).rejects.toThrow();
+  const corrupt=structuredClone(extended);corrupt.files.find((f:any)=>f.path==='sound.wav').contentBase64='AAAA';
+  await expect(encodeCatalogPackage(corrupt)).rejects.toThrow();
+ });
+ it('rejects missing manifest, forged audio media, mismatched declarations and oversize',async()=>{
+  for(const mutate of [(p:any)=>p.files=p.files.filter((f:any)=>f.path!=='manifest.json'),(p:any)=>p.files[2].mediaType='text/plain',(p:any)=>p.files[2].byteLength=2097153,(p:any)=>p.screen.requiredAssets=[]]){
+   const p=structuredClone(extended);mutate(p);await expect(encodeCatalogPackage(p)).rejects.toThrow();
+  }
+ });
+ it('preserves larger text only in explicitly versioned native packages',async()=>{
+  const p=structuredClone(extended),data=new TextEncoder().encode('const historicalData="'+'x'.repeat(220000)+'";');
+  p.files.push({path:'large.js',mediaType:'text/javascript',byteLength:data.length,digest:await authoringContentDigestV2(data),contentBase64:''});
+  p.files.at(-1).contentBase64=btoa(Array.from(data,b=>String.fromCharCode(b)).join(''));
+  const m=p.files.find((f:any)=>f.path==='manifest.json'),manifest=JSON.parse(atob(m.contentBase64));
+  manifest.files.push({path:'large.js',bytes:data.length,sha256:await authoringContentDigestV2(data)});
+  const mb=new TextEncoder().encode(JSON.stringify(manifest));Object.assign(m,{byteLength:mb.length,digest:await authoringContentDigestV2(mb),contentBase64:btoa(Array.from(mb,b=>String.fromCharCode(b)).join(''))});
+  p.files.sort((a:any,b:any)=>a.path.localeCompare(b.path));await expect(encodeCatalogPackage(p)).resolves.toBeInstanceOf(Uint8Array);
+  await expect(encodeCatalogPackage({...p,schemaVersion:1})).rejects.toThrow();
+ });
+});

@@ -14,7 +14,7 @@ public enum CatalogPackageExporter {
         public var bytes: Data
         public var declaration: CatalogObjectDeclaration
     }
-    public static func export(directory: URL, title: String, entry: String, paths: [String]) throws -> Export {
+    public static func export(directory: URL, title: String, entry: String, paths: [String], schemaVersion: Int = 1) throws -> Export {
         guard entry == "index.html", !paths.isEmpty, paths.count <= 20,
               Set(paths.map { $0.lowercased() }).count == paths.count,
               paths.allSatisfy(CatalogContract.safePath) else { throw invalid("Invalid package paths or entrypoint.") }
@@ -38,14 +38,17 @@ public enum CatalogPackageExporter {
         var source: [AuthoringScreenFile] = []
         for path in paths.sorted() {
             let raw = try read(directory: directory, path: path)
+            let media = try CatalogContract.mediaType(path: path, extended: schemaVersion == 2)
+            if schemaVersion == 2 && media.hasPrefix("audio/") {
+                files.append(.init(path: path, mediaType: media, byteLength: raw.count, digest: CatalogContract.digest(raw), contentBase64: raw.base64EncodedString()))
+                source.append(.init(path: path, content: "")); continue
+            }
             guard let text = String(data: raw, encoding: .utf8), !CatalogContract.containsCredentials(path: path, content: text) else { throw invalid("This package contains unsupported bytes or credential markers. Remove credentials from source before backing up.") }
-            files.append(.init(path: path, mediaType: try AuthoringV2Contract.mediaType(path: path), byteLength: raw.count, digest: CatalogContract.digest(raw), contentBase64: raw.base64EncodedString()))
+            files.append(.init(path: path, mediaType: media, byteLength: raw.count, digest: CatalogContract.digest(raw), contentBase64: raw.base64EncodedString()))
             source.append(.init(path: path, content: text))
         }
-        try AuthoringPackageDependencies.validate(files: source)
-        try AuthoringPackageDependencies.validateManifest(files: source)
-        let dependencies = try dependencies(files: source)
-        let package = CatalogPackage(screen: .init(title: title, entry: entry, requiredAssets: dependencies.local, externalDependencies: dependencies.external), files: files)
+        let dependencies = try AuthoringPackageDependencies.catalogDependencies(files: source, extended: schemaVersion == 2)
+        let package = CatalogPackage(schemaVersion: schemaVersion, screen: .init(title: title, entry: entry, requiredAssets: dependencies.local, externalDependencies: dependencies.external), files: files)
         let bytes = try CatalogContract.encodePackage(package)
         return Export(package: package, bytes: bytes, declaration: .init(byteLength: bytes.count, digest: CatalogContract.digest(bytes)))
     }
@@ -64,7 +67,7 @@ public enum CatalogPackageExporter {
         guard fd >= 0 else { throw invalid("Missing or unsafe package asset.") }
         defer { _ = close(fd) }
         var info = stat()
-        guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG, info.st_size >= 0, info.st_size <= 204_800 else { throw invalid("Invalid package asset size/type.") }
+        guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG, info.st_size >= 0, info.st_size <= CatalogContract.extendedFileBytes else { throw invalid("Invalid package asset size/type.") }
         var data = Data(count: Int(info.st_size))
         try data.withUnsafeMutableBytes { buffer in
             var offset = 0

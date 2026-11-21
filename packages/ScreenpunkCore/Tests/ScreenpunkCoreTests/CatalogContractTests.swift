@@ -8,6 +8,30 @@ final class CatalogContractTests: XCTestCase {
         return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("contracts/fixtures/conformance-catalog-v1.json"))) as? [String: Any])
     }
     private func data(_ value: Any) throws -> Data { try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys,.withoutEscapingSlashes]) }
+    func testNativeMigrationPackagesWhenProvided() throws {
+        guard let path = ProcessInfo.processInfo.environment["SCREENPUNK_CATALOG_PACKAGE_FIXTURES"] else { throw XCTSkip("No local migration packages supplied") }
+        let root = URL(fileURLWithPath: path)
+        let urls = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil).filter { $0.pathExtension == "json" }
+        XCTAssertFalse(urls.isEmpty)
+        for url in urls {
+            let bytes = try Data(contentsOf: url)
+            let package = try CatalogContract.verifyPackage(bytes, declaration: .init(byteLength: bytes.count, digest: CatalogContract.digest(bytes)))
+            XCTAssertEqual(try CatalogContract.encodePackage(package), bytes, url.lastPathComponent)
+        }
+    }
+    func testNativeAudioPackageRoundTripAndDowngradeRejection() throws {
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<4 { root.deleteLastPathComponent() }
+        let value = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("contracts/fixtures/conformance-catalog-package-v2.json"))) as? [String: Any])
+        var package = try JSONDecoder().decode(CatalogPackage.self, from: data(value["package"]!))
+        let bytes = try CatalogContract.encodePackage(package)
+        XCTAssertEqual(try CatalogContract.verifyPackage(bytes, declaration: .init(byteLength: bytes.count, digest: CatalogContract.digest(bytes))), package)
+        package.schemaVersion = 1
+        XCTAssertThrowsError(try CatalogContract.encodePackage(package))
+        package.schemaVersion = 2
+        package.files[2].contentBase64 = "AAAA"
+        XCTAssertThrowsError(try CatalogContract.encodePackage(package))
+    }
     func testCanonicalFixtureAndSHA256Parity() throws {
         let f = try fixture()
         let package = try JSONDecoder().decode(CatalogPackage.self, from: data(f["package"]!))

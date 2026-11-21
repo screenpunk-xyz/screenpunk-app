@@ -30,6 +30,34 @@ final class ScreenLibraryCatalogTests: XCTestCase {
     private func artifact(_ title: String) -> ScreenArtifact { .init(title: title, files: [.init(path: "index.html", content: "<html><body>\(title)</body></html>")]) }
     private var binding: ScreenLibrary.CatalogBinding { .init(origin: "https://example.test", accountID: "account", userID: "user", deviceID: "device", libraryID: "library") }
 
+    @MainActor func testNativeCatalogImportRetainsAudioOnDiskReopenAndBackup() throws {
+        let root = directory(); defer { CatalogFixture.cleanup(root) }
+        var repository = URL(fileURLWithPath: #filePath)
+        for _ in 0..<4 { repository.deleteLastPathComponent() }
+        let fixture = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: repository.appendingPathComponent("packages/contracts/fixtures/conformance-catalog-package-v2.json"))) as? [String: Any])
+        let package = try JSONDecoder().decode(CatalogPackage.self, from: JSONSerialization.data(withJSONObject: fixture["package"]!))
+        let encoded = try CatalogContract.encodePackage(package)
+        let version = CatalogVersion(versionID: "version", catalogScreenID: "catalog-audio", displayVersion: 1, sourceRevisionID: "source", parentRevisionIDs: [], copyID: "copy", commitCounter: 1, screenName: package.screen.title, sourceAppliedAt: "2026-11-21T00:00:00.000Z", backedUpAt: "2026-11-21T00:00:00.000Z", packageSchema: 2, packageDigest: CatalogContract.digest(encoded), sizeBytes: encoded.count, deviceDisplayName: "Theater iPad", deviceLinked: false, preview: .init())
+        let item = CatalogScreen(catalogScreenID: version.catalogScreenID, latest: version, history: [])
+        let library = try CatalogFixture.open(root, binding: binding)
+        try library.install(artifact("Existing"), requestID: "existing", replacing: "existing")
+        try CatalogFixture.enable(library, binding: binding)
+        try library.installCatalogScreen(item, package: package)
+        XCTAssertEqual(library.state.selectedID, "existing")
+        XCTAssertEqual(library.state.lastRequest, "existing")
+        let imported = try XCTUnwrap(library.state.screens.first { $0.catalogPackageSchema == 2 })
+        let sound = try XCTUnwrap(package.files.first { $0.path == "sound.wav" })
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent(imported.revision).appendingPathComponent(sound.path)), Data(base64Encoded: sound.contentBase64))
+        let reopened = try CatalogFixture.open(root, binding: binding)
+        XCTAssertTrue(reopened.containsCatalogScreen(item))
+        try reopened.activateCatalog(binding: binding)
+        let intent = try XCTUnwrap(reopened.catalogQueue?.entries.first { $0.screenID == imported.id })
+        let exported = try reopened.exportCatalogIntent(intent, binding: binding)
+        XCTAssertEqual(exported.bytes, encoded)
+        try reopened.remove(imported.id)
+        XCTAssertFalse(reopened.containsCatalogScreen(item))
+    }
+
     @MainActor func testCatalogImportPersistsIdentityExcludesHiddenAndAllowsReaddingAfterRemoval() throws {
         let root = directory(); defer { CatalogFixture.cleanup(root) }
         let library = try CatalogFixture.open(root, binding: binding)

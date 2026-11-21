@@ -30,7 +30,12 @@ import ScreenpunkCore
     var instructionsSelected: Bool { state.selectedID == Self.instructionsID || (state.selectedID == nil && isScreenShown(Self.instructionsID)) }
     func containsRotationScreen(_ id: String) -> Bool { id == Self.instructionsID || state.screens.contains { $0.id == id } }
 
-    struct Saved: Codable, Identifiable { let id: String; let revision: String; let artifact: ScreenArtifact }
+    struct Saved: Codable, Identifiable {
+        let id: String; let revision: String; let artifact: ScreenArtifact
+        var catalogPackageSchema: Int? = nil
+        var catalogAssetPaths: [String]? = nil
+        var packagePaths: [String] { catalogAssetPaths ?? artifact.files.map(\.path) }
+    }
     struct State: Codable { var screens: [Saved] = []; var selectedID: String?; var previous: Saved?; var lastRequest: String?; var pendingID: String?; var pendingScreenID: String?; var consumedID: String?; var cancelledRequests: [String]?; var cancelIntents: [String]?; var lastInstruction: String?; var keyboardDrafts: [String: String]?; var submissionKey: String?; var submissionText: String?; var submissionScreen: ScreenArtifact?; var requestDeadline: Double?; var authoring: AuthoringStoreState?; var linkedProfile: LocalProfileDescriptor?; var localRequestIDs: Set<String>?; var bundledScreenSeeds: Set<String>?; var catalog: CatalogQueue?; var hiddenScreenIDs: Set<String>?; var onboarding: Onboarding?; var publicDataRevocations: Set<String>?; var screenDataGenerations: [String: String]?; var catalogScreenIDs: [String: Set<String>]? }
     private(set) var state = State()
     var onCatalogRevisionCommitted: (() -> Void)?
@@ -349,15 +354,39 @@ import ScreenpunkCore
             throw DeviceError.message("Finish or cancel the current request before adding a screen.")
         }
         _ = try CatalogContract.encodePackage(package)
-        let files: [ScreenFile] = try package.files.map { file in
-            guard let bytes = Data(base64Encoded: file.contentBase64), let content = String(data: bytes, encoding: .utf8) else {
-                throw DeviceError.message("The catalog screen contains an invalid file.")
+        guard package.schemaVersion == screen.latest.packageSchema else { throw DeviceError.message("The catalog package format changed.") }
+        if package.schemaVersion == 1 {
+            let files: [ScreenFile] = try package.files.map { file in
+                guard let bytes = Data(base64Encoded: file.contentBase64), let content = String(data: bytes, encoding: .utf8) else { throw DeviceError.message("The catalog screen contains an invalid file.") }
+                return .init(path: file.path, content: content)
             }
-            return .init(path: file.path, content: content)
+            try install(.init(title: package.screen.title, entry: package.screen.entry, files: files), requestID: UUID().uuidString, replacing: nil, selectInstalled: false, preserveRequestHistory: true, catalogScreenID: screen.catalogScreenID)
+            return
         }
-        try install(.init(title: package.screen.title, entry: package.screen.entry, files: files),
-                    requestID: UUID().uuidString, replacing: nil, selectInstalled: false,
-                    preserveRequestHistory: true, catalogScreenID: screen.catalogScreenID)
+        // Keep native assets as exact immutable bytes; authoring snapshots remain UTF8-only.
+        let revision = UUID().uuidString
+        let directory = root.appendingPathComponent(revision, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var committing = false
+        do {
+            var textFiles: [ScreenFile] = []
+            for file in package.files {
+                guard let bytes = Data(base64Encoded: file.contentBase64) else { throw DeviceError.message("Invalid catalog asset.") }
+                let destination = directory.appendingPathComponent(file.path)
+                try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try bytes.write(to: destination, options: .atomic)
+                if !file.mediaType.hasPrefix("audio/"), let text = String(data: bytes, encoding: .utf8) { textFiles.append(.init(path: file.path, content: text)) }
+            }
+            _ = try PackageAssetStore.load(directory: directory)
+            var next = state
+            let saved = Saved(id: UUID().uuidString, revision: revision, artifact: .init(title: package.screen.title, entry: package.screen.entry, files: textFiles), catalogPackageSchema: 2, catalogAssetPaths: package.files.map(\.path))
+            next.screens.append(saved)
+            if next.catalogScreenIDs == nil { next.catalogScreenIDs = [:] }
+            next.catalogScreenIDs?[saved.id, default: []].insert(screen.catalogScreenID)
+            committing = true
+            try commit(next, stagedDirectory: revision)
+            pruneUnusedRevisions()
+        } catch { if !committing { try? FileManager.default.removeItem(at: directory) }; throw error }
     }
 
     /// Upgrade only the exact pristine shipped Weather package. A committed replacement
@@ -819,6 +848,7 @@ import ScreenpunkCore
         var input = request
         if let revision = request.context.baseRevision {
             guard let saved = state.screens.first(where: { $0.id == request.context.screenID }), saved.revision == revision else { throw DeviceError.message("The screen changed before the request was prepared.") }
+            guard saved.catalogPackageSchema != 2 else { throw DeviceError.message("This imported screen preserves larger files or audio. Editing this package format is not supported yet; its original files remain intact.") }
             let files = try saved.artifact.files.map { file -> AuthoringScreenFile in
                 let expected = Data(file.content.utf8)
                 let raw = try AuthoringPinnedPackage.read(directory: root.appendingPathComponent(revision), path: file.path, byteLength: expected.count, digest: AuthoringContract.contentDigest(expected))
@@ -1123,6 +1153,7 @@ extension ScreenLibrary {
         var beginDigest: String?
         var blockedReason: String?
         var gap: CatalogGapDeclaration?
+        var packageSchema: Int?
     }
     struct CatalogQueue: Codable {
         var binding: CatalogBinding
@@ -1249,17 +1280,17 @@ extension ScreenLibrary {
         var bytes = 0
         var admissionError: String?
         var packageDigest: String?
-        for path in saved.artifact.files.map(\.path) {
+        for path in saved.packagePaths {
             do {
                 let values = try directory.appendingPathComponent(path).resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey, .isSymbolicLinkKey])
-                guard values.isRegularFile == true, values.isSymbolicLink != true, let size = values.fileSize, size >= 0, size <= 204_800 else { throw DeviceError.message("A backup asset is missing or unsafe.") }
+                guard values.isRegularFile == true, values.isSymbolicLink != true, let size = values.fileSize, size >= 0, size <= (saved.catalogPackageSchema == 2 ? CatalogContract.extendedFileBytes : 204_800) else { throw DeviceError.message("A backup asset is missing or unsafe.") }
                 bytes += size
             } catch { admissionError = "A backup asset is missing or unsafe. Review this screen before resuming backups." }
         }
         // Base64 plus manifest overhead; budget conservatively before export.
-        bytes = ((bytes + 2) / 3) * 4 + saved.artifact.files.count * 512 + 8192
+        bytes = ((bytes + 2) / 3) * 4 + saved.packagePaths.count * 512 + 8192
         do {
-            let exported = try CatalogPackageExporter.export(directory: directory, title: saved.artifact.title, entry: saved.artifact.entry, paths: saved.artifact.files.map(\.path))
+            let exported = try CatalogPackageExporter.export(directory: directory, title: saved.artifact.title, entry: saved.artifact.entry, paths: saved.packagePaths, schemaVersion: saved.catalogPackageSchema ?? 1)
             bytes = exported.bytes.count
             packageDigest = exported.declaration.digest
         } catch {
@@ -1273,8 +1304,8 @@ extension ScreenLibrary {
             queue.status = "Backups paused: capture is unavailable or the saved queue is full. Further edits stay on this device and are not queued. After queued backups finish, choose Resume backups to save each current screen."
         } else {
             queue.entries.append(CatalogIntent(screenID: saved.id, revision: saved.revision, copyID: copy.id, counter: copy.counter,
-                parentIDs: parents, title: saved.artifact.title, entry: saved.artifact.entry, paths: saved.artifact.files.map(\.path),
-                appliedAt: Int64(Date().timeIntervalSince1970 * 1000), origin: origin, packageBytes: bytes, packageDigest: packageDigest, blockedReason: admissionError))
+                parentIDs: parents, title: saved.artifact.title, entry: saved.artifact.entry, paths: saved.packagePaths,
+                appliedAt: Int64(Date().timeIntervalSince1970 * 1000), origin: origin, packageBytes: bytes, packageDigest: packageDigest, blockedReason: admissionError, packageSchema: saved.catalogPackageSchema))
             copy.lastQueuedCounter = copy.counter
             queue.knownSavedRevisions?.insert(saved.revision)
         }
@@ -1309,7 +1340,7 @@ extension ScreenLibrary {
 extension ScreenLibrary {
     func exportCatalogIntent(_ intent: CatalogIntent, binding: CatalogBinding) throws -> CatalogPackageExporter.Export {
         guard catalogCaptureAllowed(binding: binding), state.catalog?.entries.contains(where: { $0.id == intent.id && $0.revision == intent.revision }) == true else { throw DeviceError.message("The backup connection changed.") }
-        let exported = try CatalogPackageExporter.export(directory: root.appendingPathComponent(intent.revision), title: intent.title, entry: intent.entry, paths: intent.paths)
+        let exported = try CatalogPackageExporter.export(directory: root.appendingPathComponent(intent.revision), title: intent.title, entry: intent.entry, paths: intent.paths, schemaVersion: intent.packageSchema ?? 1)
         guard intent.packageDigest == nil || intent.packageDigest == exported.declaration.digest else { throw DeviceError.message("The immutable backup package changed. Backups are paused for review.") }
         return exported
     }
@@ -1403,7 +1434,7 @@ extension ScreenLibrary {
             guard exported.declaration.digest == digest else { throw DeviceError.message("The preview source changed.") }; return exported
         }
         guard let saved = (state.screens + [state.previous].compactMap { $0 }).first(where: { $0.revision == revision }) else { throw DeviceError.message("This exact source revision is no longer stored on this device.") }
-        let exported = try CatalogPackageExporter.export(directory: root.appendingPathComponent(revision), title: saved.artifact.title, entry: saved.artifact.entry, paths: saved.artifact.files.map(\.path))
+        let exported = try CatalogPackageExporter.export(directory: root.appendingPathComponent(revision), title: saved.artifact.title, entry: saved.artifact.entry, paths: saved.packagePaths, schemaVersion: saved.catalogPackageSchema ?? 1)
         guard exported.declaration.digest == digest else { throw DeviceError.message("The preview source changed.") }; return exported
     }
     func captureCatalogPreview(bytes: Data, declaration: CatalogPNGPreviewDeclaration, revision: String, packageDigest: String, capturedAt: String, binding: CatalogBinding, candidate: CatalogPreviewCandidate? = nil) throws {
