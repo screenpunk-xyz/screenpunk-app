@@ -15,6 +15,46 @@ final class ScreenLibraryVisibilityTests: XCTestCase {
         }
     }
 
+    @MainActor func testDisplayNamePersistsThroughPackageEditsRollbackAndReopen() throws {
+        let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
+        var library = try ScreenLibrary(accountID: "one", rootDirectory: root)
+        try install(["screen-a", "screen-b"], in: library)
+        try library.selectVisible("screen-a")
+        let original = try XCTUnwrap(library.selected)
+        let originalURL = root.appendingPathComponent(original.revision).appendingPathComponent("index.html")
+        let originalBytes = try Data(contentsOf: originalURL)
+        let generation = library.state.screenDataGenerations?[original.id]
+
+        try library.renameScreen(original.id, to: "  screen-b  ")
+        XCTAssertEqual(library.state.screens.map(\.displayName), ["screen-b", "screen-b"])
+        XCTAssertEqual(library.selected?.revision, original.revision)
+        XCTAssertEqual(library.selected?.artifact.title, "screen-a")
+        XCTAssertEqual(library.state.screenDataGenerations?[original.id], generation)
+        XCTAssertEqual(try Data(contentsOf: originalURL), originalBytes)
+        XCTAssertThrowsError(try library.renameScreen(original.id, to: "  "))
+        XCTAssertThrowsError(try library.renameScreen(original.id, to: "name\nsecond line"))
+        XCTAssertThrowsError(try library.renameScreen(original.id, to: String(repeating: "a", count: 101)))
+        XCTAssertThrowsError(try library.renameScreen(ScreenLibrary.instructionsID, to: "Other"))
+
+        try library.install(.init(title: "Agent package title", files: [.init(path: "index.html", content: "<html>Updated</html>")]),
+                            requestID: UUID().uuidString, replacing: original.id)
+        XCTAssertEqual(library.selected?.displayName, "screen-b")
+        XCTAssertEqual(library.selected?.artifact.title, "Agent package title")
+        try library.renameScreen(original.id, to: "Local title")
+        try library.rollback()
+        XCTAssertEqual(library.selected?.revision, original.revision)
+        XCTAssertEqual(library.selected?.displayName, "Local title")
+
+        library = try ScreenLibrary(accountID: "one", rootDirectory: root)
+        XCTAssertEqual(library.selected?.displayName, "Local title")
+        try library.rollback()
+        XCTAssertEqual(library.selected?.displayName, "Local title")
+        XCTAssertEqual(library.selected?.artifact.title, "Agent package title")
+        try library.remove(original.id)
+        try install([original.id], in: library)
+        XCTAssertEqual(library.selected?.displayName, original.id)
+    }
+
     @MainActor func testInstructionsRotatePersistAndCannotBeDeleted() throws {
         let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
         let library = try ScreenLibrary(accountID: "one", rootDirectory: root)

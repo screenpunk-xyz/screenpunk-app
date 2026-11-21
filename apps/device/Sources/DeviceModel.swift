@@ -1400,6 +1400,16 @@ import ScreenpunkLocalTransport
         } catch { message = error.localizedDescription }
     }
 
+    func renameScreen(_ id: String, to name: String, owner: String) throws {
+        guard !needsAgentSetup, !accountOperationInProgress, let library,
+              !owner.isEmpty, owner == permissionOwner else {
+            throw DeviceError.message("This screen’s library is unavailable.")
+        }
+        try library.renameScreen(id, to: name)
+        installedScreens = library.state.screens
+        if screen?.id == id { screen = installedScreens.first(where: { $0.id == id }) }
+    }
+
     func selectScreen(_ id: String) {
         guard !needsAgentSetup, !accountOperationInProgress, let library, library.isScreenShown(id),
               library.containsRotationScreen(id) else { return }
@@ -1413,31 +1423,33 @@ import ScreenpunkLocalTransport
     }
     struct SetupRequirement {
         let name: String
-        let page: DeviceSettingsPage
+        enum Kind { case screens, publicData, home, television, calendar }
+        let kind: Kind
+        var unsupportedAlias: String? = nil
     }
     var missingConnections: [SetupRequirement] {
         guard let screen else { return [] }
-        if manifestIssues[screen.id] != nil { return [.init(name: "Screen connection configuration", page: .screens)] }
+        if manifestIssues[screen.id] != nil { return [.init(name: "Screen connection configuration", kind: .screens)] }
         guard let manifest else { return [] }
         return manifest.connections.filter(\.required).compactMap { connection in
             if connection.publicHTTP != nil {
-                return publicDataAllowed(manifest) ? nil : .init(name: connection.alias, page: .publicData)
+                return publicDataAllowed(manifest) ? nil : .init(name: connection.alias, kind: .publicData)
             }
             switch connection.alias {
             case "home":
                 let configured = HomeAssistantDeviceVault().isConfigured(owner: permissionOwner, dashboardID: manifest.dashboardId, revision: manifest.revision)
-                return configured ? nil : .init(name: "Home Assistant", page: .home)
+                return configured ? nil : .init(name: "Home Assistant", kind: .home)
             case "googleTV":
-                return DeviceConnectionReadiness.television(dashboardID: manifest.dashboardId) ? nil : .init(name: "Google TV", page: .television)
+                return DeviceConnectionReadiness.television(dashboardID: manifest.dashboardId) ? nil : .init(name: "Google TV", kind: .television)
             case "googleCalendar", "google-calendar":
-                return DeviceConnectionReadiness.calendar(dashboardID: manifest.dashboardId) ? nil : .init(name: "Google Calendar", page: .calendar)
+                return DeviceConnectionReadiness.calendar(dashboardID: manifest.dashboardId) ? nil : .init(name: "Google Calendar", kind: .calendar)
             case "appleMaps": return nil // Native built-in provider, no account setup.
-            default: return .init(name: "Unsupported connection: " + connection.alias, page: .screens)
+            default: return .init(name: connection.alias, kind: .screens, unsupportedAlias: connection.alias)
             }
         }
     }
     var canAllowCurrentPublicData: Bool {
-        !missingConnections.isEmpty && missingConnections.allSatisfy { $0.page == .publicData }
+        !missingConnections.isEmpty && missingConnections.allSatisfy { $0.kind == .publicData }
     }
     var currentPublicDataOrigins: [String] {
         Array(Set(manifest?.connections.compactMap { $0.publicHTTP?.origin } ?? [])).sorted()
@@ -1446,12 +1458,15 @@ import ScreenpunkLocalTransport
         guard canAllowCurrentPublicData, let manifest else { return }
         setPublicDataAllowed(true, for: manifest)
     }
+    var settingsScreenID: String?
     func openSettings() {
+        settingsScreenID = nil
         settingsPage = .account
         settingsOpen = true
     }
     func openConnectionSettings() {
-        settingsPage = missingConnections.first?.page ?? .screens
+        settingsPage = .screens
+        settingsScreenID = screen?.id
         settingsOpen = true
     }
     private func weatherOfferKey(_ screenID: String) -> String {
@@ -1515,6 +1530,7 @@ import ScreenpunkLocalTransport
     }
     func swipe(_ offset: Int) { guard !needsAgentSetup else { return }; do { try library?.select(offset: offset); refreshScreen() } catch { message = error.localizedDescription } }
     func newScreen() { guard !needsAgentSetup else { return }; do { try library?.newScreen(); refreshScreen(); settingsOpen = false } catch { message = error.localizedDescription } }
+    var rollbackScreenID: String? { library?.state.previous?.id }
     func rollback() { guard !needsAgentSetup else { return }; do { try library?.rollback(); refreshScreen(); settingsOpen = false } catch { message = error.localizedDescription } }
     private func syncInventory() async throws {
         guard cloudBindingMatches, let library, let token = cloud.session?.accessToken else { return }

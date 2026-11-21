@@ -56,6 +56,19 @@ final class HomeAssistantSharedCredentialTests: XCTestCase {
         XCTAssertNil(vault.credentialStatus(owner: "user"))
         XCTAssertFalse(vault.isConfigured(owner: "user", dashboardID: "one", revision: "r1"))
     }
+    func testRevokingOneScreenKeepsOtherScreenAndSharedCredential() throws {
+        let vault = HomeAssistantDeviceVault(store: MemoryCredentialStore())
+        try vault.saveCredential(owner: "user", origin: "https://ha.example", token: "fixture-token")
+        try vault.approve(manifest: manifest(), owner: "user")
+        try vault.approve(manifest: manifest("two"), owner: "user")
+
+        try vault.revokeScreen(owner: "user", dashboardID: "one")
+        try vault.saveCredential(owner: "user", origin: "https://ha.example", token: "")
+
+        XCTAssertFalse(vault.synchronize(manifest: manifest(revision: "r2"), owner: "user"))
+        XCTAssertTrue(vault.isConfigured(owner: "user", dashboardID: "two", revision: "r1"))
+        XCTAssertEqual(vault.credentialStatus(owner: "user")?.origin, "https://ha.example")
+    }
     func testLegacyMigrationCarriesCredentialAndUnchangedApprovalToNewRevision() throws {
         let store = MemoryCredentialStore()
         var config = HomeAssistantProvisioning(schemaVersion: 3, dashboardId: "one", connectionId: "home", provisioningId: "p", revision: "old", origin: "https://ha.example", token: "fixture-token")

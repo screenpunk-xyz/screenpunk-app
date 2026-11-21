@@ -34,6 +34,8 @@ import ScreenpunkCore
         let id: String; let revision: String; let artifact: ScreenArtifact
         var catalogPackageSchema: Int? = nil
         var catalogAssetPaths: [String]? = nil
+        var displayNameOverride: String? = nil
+        var displayName: String { displayNameOverride ?? artifact.title }
         var packagePaths: [String] { catalogAssetPaths ?? artifact.files.map(\.path) }
         var hasNativeAssets: Bool { catalogAssetPaths != nil || catalogPackageSchema == 2 }
     }
@@ -612,6 +614,23 @@ import ScreenpunkCore
         clearTerminalDelivery(id, in: &next)
         try commit(next); pruneUnusedRevisions()
     }
+    func renameScreen(_ id: String, to name: String) throws {
+        guard let index = state.screens.firstIndex(where: { $0.id == id }) else {
+            throw DeviceError.message("This screen is no longer installed.")
+        }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.count <= 100,
+              trimmed.rangeOfCharacter(from: .newlines) == nil,
+              !trimmed.unicodeScalars.contains(where: { $0.value < 32 || $0.value == 127 }) else {
+            throw DeviceError.message("Enter a single-line screen name between 1 and 100 characters.")
+        }
+        guard trimmed != state.screens[index].displayName else { return }
+        var next = state
+        next.screens[index].displayNameOverride = trimmed
+        if next.previous?.id == id { next.previous?.displayNameOverride = trimmed }
+        try commit(next, captureCatalog: false)
+    }
+
     func isScreenShown(_ id: String) -> Bool { state.hiddenScreenIDs?.contains(id) != true }
 
     private func selectsInstalledRevision(_ id: String) -> Bool {
@@ -757,6 +776,10 @@ import ScreenpunkCore
             }
         }
         var next = proposed
+        if let stagedDirectory, let index = next.screens.firstIndex(where: { $0.revision == stagedDirectory }),
+           let current = state.screens.first(where: { $0.id == next.screens[index].id }) {
+            next.screens[index].displayNameOverride = current.displayNameOverride
+        }
         let currentRevisions = Dictionary(state.screens.map { ($0.id, $0.revision) }, uniquingKeysWith: { first, _ in first })
         let generations = Dictionary(next.screens.map { screen in
             let retained = currentRevisions[screen.id] == screen.revision ? state.screenDataGenerations?[screen.id] : nil

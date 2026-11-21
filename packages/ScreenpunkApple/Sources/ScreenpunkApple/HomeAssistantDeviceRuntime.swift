@@ -86,6 +86,13 @@ public final class HomeAssistantDeviceVault: @unchecked Sendable {
         value.screens[manifest.dashboardId] = Record(owner: owner, configuration: config, generation: UUID())
         values[owner] = value; try saveShared(values)
     }
+    public func revokeScreen(owner: String, dashboardID: String) throws {
+        lock.lock(); defer { lock.unlock() }
+        var values = try sharedAccounts()
+        guard var value = values[owner], value.screens.removeValue(forKey: dashboardID) != nil else { return }
+        values[owner] = value
+        try saveShared(values)
+    }
     /// Carries approval across code-only revisions and narrowing; expanded permissions require approval.
     /// Invalidating the old revision also prevents a stale renderer from keeping old access.
     @discardableResult public func synchronize(manifest: DashboardManifest, owner: String) -> Bool {

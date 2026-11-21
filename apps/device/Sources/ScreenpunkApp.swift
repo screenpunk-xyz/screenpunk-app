@@ -473,6 +473,15 @@ struct DeviceRootView: View {
                             .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
                         Button("Allow public data", action: model.allowCurrentPublicData).buttonStyle(.borderedProminent)
                         Button("Review sources", action: model.openConnectionSettings)
+                    } else if let unsupported = model.missingConnections.first(where: { $0.unsupportedAlias != nil })?.unsupportedAlias {
+                        Text("Connection unavailable").font(.title2.bold())
+                        Text("This screen requires the “\(unsupported)” connection, which this version of Screenpunk cannot run.")
+                            .multilineTextAlignment(.center)
+                    } else if model.missingConnections.count == 1, model.missingConnections.first?.kind == .home {
+                        Text("Allow Home Assistant access").font(.title2.bold())
+                        Text("Review this screen’s Home Assistant access in its settings.")
+                            .multilineTextAlignment(.center)
+                        Button("Screen settings", action: model.openConnectionSettings).buttonStyle(.borderedProminent)
                     } else {
                         Text("Finish setting up this screen").font(.title2.bold())
                         Text("Configure \(model.missingConnections.map(\.name).joined(separator: ", ")) in Settings to use this screen.")
@@ -500,7 +509,7 @@ struct DeviceRootView: View {
             // The isolated WebView coordinator owns an immutable package and bridge scope.
             // A new local revision must create a new renderer, including on rollback/swipe.
             let rendererID = screen.revision + model.publicReadSessionKey + model.screenDataRendererKey
-            DashboardRuntimeView(store: assets, homeAssistant: model.homeAssistant, publicReads: model.publicReads, screenData: model.screenDataProvider, revision: screen.revision, catalogContext: model.catalogPreviewContext, connectionCount: 1, screenName: screen.artifact.title,
+            DashboardRuntimeView(store: assets, homeAssistant: model.homeAssistant, publicReads: model.publicReads, screenData: model.screenDataProvider, revision: screen.revision, catalogContext: model.catalogPreviewContext, connectionCount: 1, screenName: screen.displayName,
                                  onMenu: { if swipeID == nil { model.openSettings() } })
                 .environment(\.dashboardSnapshotRegistration, DashboardSnapshotRegistration(
                     source: dashboardSnapshot, rendererID: rendererID
@@ -1084,8 +1093,7 @@ struct CloudListenerSetupView_Previews: PreviewProvider {
 
 enum DeviceSettingsPage: String, Hashable {
     case overview = "Overview", guidedAccess = "Guided Access", display = "General", account = "Account", screens = "Screens"
-    case home = "Home Assistant", television = "Google TV", calendar = "Google Calendar", publicData = "Public Data"
-    case screenData = "Screen Data Access"
+    case home = "Home Assistant", television = "Google TV", calendar = "Google Calendar"
     var symbol: String {
         switch self {
         case .overview: return "hand.draw"
@@ -1096,8 +1104,6 @@ enum DeviceSettingsPage: String, Hashable {
         case .home: return "house"
         case .television: return "tv"
         case .calendar: return "calendar"
-        case .publicData: return "network"
-        case .screenData: return "lock.shield"
         }
     }
 }
@@ -1121,38 +1127,63 @@ private struct ScreenDataConsentAlert: ViewModifier {
 
 private struct ScreenDataAccessSettings: View {
     @ObservedObject var model: DeviceModel
+    let screenID: String
+
+    private var permissions: [DeviceScreenDataPermission] {
+        let localDeviceIDs = model.activeProfile.map { Set([$0.localDeviceID, $0.authoringDeviceID]) } ?? []
+        return model.screenDataPermissions.filter { permission in
+            if permission.key.target.screenId == screenID { return true }
+            let reader = permission.key.reader
+            guard reader.kind == .screen, reader.screenId == screenID, let readerDeviceID = reader.deviceId else { return false }
+            return localDeviceIDs.contains(readerDeviceID)
+        }
+    }
 
     var body: some View {
-        Form {
-            Section {
-                if model.screenDataPermissions.isEmpty {
-                    Text("No screen data access decisions yet.").foregroundStyle(.secondary)
-                }
-                ForEach(model.screenDataPermissions) { permission in
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(permission.readerLabel).font(.headline)
-                        Text("\(permission.targetTitle) · \(permission.key.target.exportName)")
-                        Text(permission.exportDescription).font(.subheadline).foregroundStyle(.secondary)
-                        if permission.decision == .allowed {
-                            Button("Revoke Access", role: .destructive) { model.revokeScreenDataPermission(permission) }
-                                .accessibilityLabel("Revoke \(permission.readerLabel)’s access to \(permission.key.target.exportName)")
-                        } else {
-                            Text(permission.decision == .revoked ? "Revoked" : "Denied")
-                                .font(.subheadline).foregroundStyle(.secondary)
-                            Button("Forget Decision") { model.forgetScreenDataDecision(permission) }
-                                .accessibilityHint("A future request can ask for permission again.")
-                        }
-                    }
-                    .padding(.vertical, 4)
-                }
-            } footer: {
-                Text("Only data a screen explicitly publishes can be shared. Access applies to the reader and screen version you approved. Forgetting a denied or revoked decision lets the reader ask again.")
+        Section {
+            let decisions = permissions
+            if decisions.isEmpty {
+                Text("No screen data access decisions for this screen.").foregroundStyle(.secondary)
             }
+            ForEach(decisions) { permission in
+                VStack(alignment: .leading, spacing: 8) {
+                    if permission.key.target.screenId == screenID {
+                        Text("Reader: \(permission.readerLabel)").font(.headline)
+                    } else {
+                        Text("Publisher: \(permission.targetTitle)").font(.headline)
+                    }
+                    Text(permission.key.target.exportName)
+                    Text(permission.exportDescription).font(.subheadline).foregroundStyle(.secondary)
+                    if permission.decision == .allowed {
+                        Button("Revoke Access", role: .destructive) { model.revokeScreenDataPermission(permission) }
+                            .accessibilityLabel("Revoke \(permission.readerLabel)’s access to \(permission.key.target.exportName)")
+                    } else {
+                        Text(permission.decision == .revoked ? "Revoked" : "Denied")
+                            .font(.subheadline).foregroundStyle(.secondary)
+                        Button("Forget Decision") { model.forgetScreenDataDecision(permission) }
+                            .accessibilityHint("A future request can ask for permission again.")
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+        } header: {
+            Text("Screen Data Access")
+        } footer: {
+            Text("Access applies to the reader and screen version you approved. Forgetting a denied or revoked decision lets the reader ask again.")
         }
     }
 }
 
+private enum ScreenSettingsRoute: Hashable {
+    case screen(String, owner: String)
+    case shared(DeviceSettingsPage)
+}
+
 struct DeviceSettingsView: View {
+    @State private var path: [ScreenSettingsRoute] = []
+    @State private var renameText = ""
+    @State private var renameTarget: ScreenSettingsRoute?
+    @State private var renameError: String?
     @ObservedObject var model: DeviceModel
     @ObservedObject var display: DeviceDisplayPreferences
     @Environment(\.dismiss) private var dismiss
@@ -1166,23 +1197,19 @@ struct DeviceSettingsView: View {
     }
     @State private var columns: NavigationSplitViewVisibility = .all
     @Environment(\.horizontalSizeClass) private var sizeClass
-    private var providers: [DeviceSettingsPage] {
-        var values: [DeviceSettingsPage] = []
-        if !model.manifests(requiring: ["home"]).isEmpty { values.append(.home) }
-        if !model.manifests(requiring: ["googleTV"]).isEmpty { values.append(.television) }
-        if !model.manifests(requiring: ["googleCalendar", "google-calendar"]).isEmpty { values.append(.calendar) }
-        if model.installedManifests.contains(where: { $0.connections.contains(where: { $0.publicHTTP != nil }) }) { values.append(.publicData) }
-        return values
-    }
     var body: some View {
         NavigationSplitView(columnVisibility: $columns) {
-            List(selection: $selection) {
+            List(selection: Binding(get: { selection }, set: { newPage in
+                if selection != newPage { path.removeAll() }; selection = newPage
+            })) {
                 Section {
                     row(.account)
                 }
-                Section("Device") { row(.display); row(.screens); row(.screenData) }
-                if !providers.isEmpty {
-                    Section("Connections") { ForEach(providers, id: \.self) { row($0) } }
+                Section("Device") { row(.display); row(.screens) }
+                Section("Shared Connections") {
+                    row(.home)
+                    row(.calendar)
+                    row(.television)
                 }
                 Section("Help") { row(.overview); row(.guidedAccess) }
             }
@@ -1191,8 +1218,17 @@ struct DeviceSettingsView: View {
             .toolbar { if sizeClass == .compact { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } } }
             .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 320)
         } detail: {
-            NavigationStack {
+            NavigationStack(path: $path) {
                 detail
+                    .navigationDestination(for: ScreenSettingsRoute.self) { route in
+                        switch route {
+                        case let .screen(id, owner):
+                            if owner == model.permissionOwner, let saved = model.installedScreens.first(where: { $0.id == id }) {
+                                screenDetails(saved, owner: owner)
+                            } else { Text("Screen unavailable") }
+                        case let .shared(provider): sharedProvider(provider)
+                        }
+                    }
                     .navigationTitle((selection ?? .overview).rawValue)
                     .navigationBarTitleDisplayMode(.inline)
                     .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
@@ -1217,24 +1253,46 @@ struct DeviceSettingsView: View {
         }
         .onAppear {
             selection = model.settingsPage
+            if let id = model.settingsScreenID {
+                path = [.screen(id, owner: model.permissionOwner)]
+                model.settingsScreenID = nil
+            }
             model.checkListenerStatusOnSettingsEntry()
         }
         .onChange(of: selection) {
             if let page = $0 { model.settingsPage = page }
             if $0 != .account { showBilling = false }
         }
+        .onChange(of: model.permissionOwner) { _ in
+            path.removeAll(); renameTarget = nil; screenToRemove = nil
+        }
+        .alert("Rename screen", isPresented: Binding(get: { renameTarget != nil }, set: { if !$0 { renameTarget = nil } }), presenting: renameTarget) { target in
+            TextField("Screen name", text: $renameText)
+            Button("Cancel", role: .cancel) {}
+            Button("Save") {
+                guard case let .screen(id, owner) = target else { return }
+                do { try model.renameScreen(id, to: renameText, owner: owner) }
+                catch { renameError = error.localizedDescription }
+            }
+        }
+        .alert("Couldn’t rename screen", isPresented: Binding(get: { renameError != nil }, set: { if !$0 { renameError = nil } })) {
+            Button("OK") {}
+        } message: { Text(renameError ?? "") }
         .alert("Remove screen?", isPresented: Binding(get: { screenToRemove != nil }, set: { if !$0 { screenToRemove = nil } })) {
             Button("Cancel", role: .cancel) { screenToRemove = nil }
             Button("Remove", role: .destructive) {
-                if let screen = screenToRemove { model.removeScreen(screen.id) }
+                if let screen = screenToRemove {
+                    model.removeScreen(screen.id)
+                    if !model.installedScreens.contains(where: { $0.id == screen.id }) {
+                        path.removeAll()
+                    }
+                }
                 screenToRemove = nil
             }
         } message: {
-            Text("Remove \(screenToRemove?.artifact.title ?? "this screen") from this iPad? This also removes its saved previous version.")
+            Text("Remove \(screenToRemove?.displayName ?? "this screen") from this iPad? This also removes its saved previous version.")
         }
-        .onChange(of: providers) { available in
-            if let selection, [.home, .television, .calendar, .publicData].contains(selection), !available.contains(selection) { self.selection = .overview }
-        }
+
     }
     private func row(_ page: DeviceSettingsPage) -> some View {
         NavigationLink(value: page) { Label(page.rawValue, systemImage: page.symbol) }
@@ -1284,8 +1342,6 @@ struct DeviceSettingsView: View {
                     DeviceAccountDeletionSection(device: model)
                 }
             }
-        case .screenData:
-            ScreenDataAccessSettings(model: model)
         case .screens:
             Form {
                 Section {
@@ -1295,11 +1351,7 @@ struct DeviceSettingsView: View {
                             .disabled(!model.canAddCatalogScreen)
                             .accessibilityIdentifier("screen.addFromCatalog")
                     }
-                    if model.screen != nil {
-                        Button("Edit this screen with keyboard") { sheet = .editKeyboardRequest }
-                            .disabled(model.needsAgentSetup || model.routeChangeBlocked || model.accountOperationInProgress)
-                    }
-                    Button("Restore previous version", action: model.rollback).disabled(model.needsAgentSetup || !model.canRollback)
+
                 }
                 DeviceCloudBackupsSection(model: model) {
                     selection = .account
@@ -1326,28 +1378,23 @@ struct DeviceSettingsView: View {
                     }
                     ForEach(model.needsAgentSetup ? [] : model.installedScreens) { saved in
                         let owner = model.permissionOwner
-                        let shown = !model.hiddenScreenIDs.contains(saved.id)
                         HStack {
-                            Button { model.selectScreen(saved.id) } label: {
-                                HStack { Text(saved.artifact.title); if saved.id == model.screen?.id { Image(systemName: "checkmark") } }
+                            Button {
+                                path.append(.screen(saved.id, owner: owner))
+                            } label: {
+                                HStack {
+                                    Text(saved.displayName)
+                                    if saved.id == model.screen?.id { Image(systemName: "checkmark") }
+                                    Spacer()
+                                    Image(systemName: "chevron.right").foregroundStyle(.secondary)
+                                }.frame(minHeight: 44).contentShape(Rectangle())
                             }.buttonStyle(.borderless)
-                                .disabled(!shown || model.accountOperationInProgress)
-                            Spacer()
-                            Button(role: .destructive) { screenToRemove = saved } label: {
-                                Image(systemName: "trash")
-                                    .frame(width: 44, height: 44)
-                                    .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.borderless)
-                            .padding(.trailing, 12)
-                            .accessibilityLabel("Remove \(saved.artifact.title)")
-                            .disabled(model.busy)
                             Toggle("Show", isOn: Binding(
                                 get: { !model.hiddenScreenIDs.contains(saved.id) },
                                 set: { model.setScreenShown($0, id: saved.id, owner: owner) }
                             ))
                             .fixedSize()
-                            .accessibilityLabel("Show \(saved.artifact.title)")
+                            .accessibilityLabel("Show \(saved.displayName)")
                             .disabled(owner.isEmpty || model.accountOperationInProgress)
                         }
                         if let issue = model.presentedManifestIssue(saved) {
@@ -1356,31 +1403,93 @@ struct DeviceSettingsView: View {
                     }
                 }
             }
-        case .publicData:
-            Form {
-                Section {
-                    ForEach(model.installedScreens) { saved in
-                        if let manifest = model.installedManifests.first(where: { $0.revision == saved.revision }),
-                           manifest.connections.contains(where: { $0.publicHTTP != nil }) {
-                            let owner = model.permissionOwner
-                            NavigationLink {
-                                DevicePublicDataDetails(model: model, screenID: saved.id, owner: owner)
-                            } label: {
-                                Label(StarterWeather.isSupported(saved.artifact) ? "Weather" : manifest.name, systemImage: "network")
-                            }
-                        }
-                    }
-                }
-            }
-        case .home:
-            DeviceHomeAssistantSettings(owner: model.permissionOwner, manifests: model.manifests(requiring: ["home"]), onChange: model.refreshConnections)
-        case .television:
-            DeviceGoogleTVSettings(onChange: model.refreshConnections)
-        case .calendar:
-            DeviceGoogleCalendarSettings(manifests: model.installedManifests, onChange: model.refreshConnections)
+        case .home, .television, .calendar:
+            sharedProvider(selection ?? .home)
         }
     }
 
+    @ViewBuilder private func sharedProvider(_ provider: DeviceSettingsPage) -> some View {
+        switch provider {
+        case .home:
+            DeviceHomeAssistantSettings(owner: model.permissionOwner, onChange: model.refreshConnections) {
+                sharedScreenLinks(aliases: ["home"])
+            }
+        case .calendar:
+            DeviceGoogleCalendarSettings(onChange: model.refreshConnections) {
+                sharedScreenLinks(aliases: ["googleCalendar", "google-calendar"])
+            }
+        case .television:
+            DeviceGoogleTVSettings(onChange: model.refreshConnections) {
+                sharedScreenLinks(aliases: ["googleTV"])
+            }
+        default: EmptyView()
+        }
+    }
+
+    @ViewBuilder private func sharedScreenLinks(aliases: Set<String>) -> some View {
+        let revisions = Set(model.manifests(requiring: aliases).map(\.revision))
+        let screens = model.installedScreens.filter { revisions.contains($0.revision) }
+        if screens.isEmpty { Text("No installed screens use this connection.").foregroundStyle(.secondary) }
+        ForEach(screens) { saved in
+            NavigationLink(saved.displayName, value: ScreenSettingsRoute.screen(saved.id, owner: model.permissionOwner))
+        }
+    }
+
+    private func screenDetails(_ saved: ScreenLibrary.Saved, owner: String) -> some View {
+        let manifest = model.installedManifests.first { $0.revision == saved.revision }
+        let aliases = Set(manifest?.connections.map(\.alias) ?? [])
+        return Form {
+            Section {
+                Button("Rename screen") {
+                    renameText = saved.displayName
+                    renameTarget = .screen(saved.id, owner: owner)
+                }
+                if !model.hiddenScreenIDs.contains(saved.id) {
+                    Button("Open screen") { model.selectScreen(saved.id) }
+                }
+                if saved.id == model.screen?.id {
+                    Button("Edit this screen with keyboard") { sheet = .editKeyboardRequest }
+                        .disabled(model.routeChangeBlocked || model.accountOperationInProgress)
+                }
+                if model.rollbackScreenID == saved.id {
+                    Button("Restore previous version", action: model.rollback)
+                }
+            }
+            if let manifest {
+                if manifest.connections.contains(where: { $0.publicHTTP != nil }) {
+                    Section("Public Data") {
+                        NavigationLink {
+                            DevicePublicDataDetails(model: model, screenID: saved.id, owner: owner)
+                        } label: {
+                            LabeledContent("Public data access", value: model.publicDataAllowed(manifest) ? "Allowed" : "Off")
+                        }
+                    }
+                }
+                if aliases.contains("home") {
+                    DeviceHomeAssistantScreenSettings(owner: owner, manifest: manifest, onChange: model.refreshConnections)
+                    sharedLink(.home)
+                }
+                if !aliases.isDisjoint(with: ["googleCalendar", "google-calendar"]) {
+                    DeviceGoogleCalendarScreenSettings(manifest: manifest, onChange: model.refreshConnections)
+                    sharedLink(.calendar)
+                }
+                if aliases.contains("googleTV") { sharedLink(.television) }
+            }
+            ScreenDataAccessSettings(model: model, screenID: saved.id)
+            Section {
+                Button("Delete from this device", role: .destructive) { screenToRemove = saved }
+                    .disabled(model.busy)
+            }
+        }
+        .navigationTitle(saved.displayName)
+        .disabled(model.accountOperationInProgress)
+    }
+
+    private func sharedLink(_ provider: DeviceSettingsPage) -> some View {
+        NavigationLink(value: ScreenSettingsRoute.shared(provider)) {
+            Label("Shared connection · " + provider.rawValue, systemImage: provider.symbol)
+        }
+    }
 }
 
 private struct AccountCreationAlert: ViewModifier {

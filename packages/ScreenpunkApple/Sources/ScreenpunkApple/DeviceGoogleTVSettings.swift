@@ -3,8 +3,13 @@ import SwiftUI
 
 /// Live device form. Uses the same pairing sessions and saved identities as the original setup UI.
 @MainActor
-public struct DeviceGoogleTVSettings: View {
-    public init(onChange: @escaping () -> Void = {}) { self.onChange = onChange }
+public struct DeviceGoogleTVSettings<ScreenLinks: View>: View {
+    public init(onChange: @escaping () -> Void = {}, @ViewBuilder screenLinks: () -> ScreenLinks) {
+        self.onChange = onChange
+        self.screenLinks = screenLinks()
+    }
+
+    private let screenLinks: ScreenLinks
 
     @StateObject private var basic = GoogleTVSetup()
     @StateObject private var developer = GoogleTVADBSetup()
@@ -106,6 +111,7 @@ public struct DeviceGoogleTVSettings: View {
             } header: { Text("Channels and power") } footer: {
                 Text("Wireless debugging grants this iPad debugging access to the TV. Screenpunk uses it for the channels and power controls defined by your screens.")
             }
+            Section("Screens using Google TV") { screenLinks }
             Section("Connection help") {
                 Button("Check connections") { if basicPaired { basic.check() }; if developerPaired { developer.host = basic.host; developer.check() } }.disabled(busy)
                 Text("If the TV’s address changed, update it above, then verify and save each connection. If only wireless debugging’s port changed, update Connection port and verify and save. Disconnect removes saved trust and permissions; it is not needed for an address change.").font(.footnote).foregroundStyle(.secondary)
