@@ -1209,56 +1209,25 @@ struct DeviceSettingsView: View {
     }
     @State private var columns: NavigationSplitViewVisibility = .all
     @Environment(\.horizontalSizeClass) private var sizeClass
-    var body: some View {
-        NavigationSplitView(columnVisibility: $columns) {
-            List(selection: Binding(get: { selection }, set: { newPage in
-                if selection != newPage { path.removeAll() }; selection = newPage
-            })) {
-                Section {
-                    row(.account)
-                }
-                Section("Device") { row(.display); row(.screens) }
-                Section("Shared Connections") {
-                    row(.home)
-                    row(.calendar)
-                    row(.television)
-                    row(.customConnections)
-                }
-                Section("Help") { row(.overview); row(.guidedAccess) }
+    @State private var promptDestination: ScreenSettingsRoute?
+
+    init(model: DeviceModel, display: DeviceDisplayPreferences) {
+        self.model = model
+        self.display = display
+        let destination = model.settingsScreenID.map { id -> ScreenSettingsRoute in
+            if let alias = model.settingsCustomConnectionAlias {
+                return .custom(id, alias: alias, owner: model.permissionOwner)
             }
-            .listStyle(.sidebar)
-            .navigationTitle("Settings")
-            .toolbar { if sizeClass == .compact { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } } }
-            .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 320)
-        } detail: {
-            NavigationStack(path: $path) {
-                detail
-                    .navigationDestination(for: ScreenSettingsRoute.self) { route in
-                        switch route {
-                        case let .screen(id, owner):
-                            if owner == model.permissionOwner, let saved = model.installedScreens.first(where: { $0.id == id }) {
-                                screenDetails(saved, owner: owner)
-                            } else { Text("Screen unavailable") }
-                        case let .shared(provider): sharedProvider(provider)
-                        case let .custom(id, alias, owner):
-                            if owner == model.permissionOwner,
-                               let use = model.customConnectionUses().first(where: { $0.screen.id == id && $0.alias == alias }) {
-                                DeviceCustomConnectionSettings(model: model, use: use, owner: owner, allowsApproval: true)
-                            } else { Text("Connection unavailable") }
-                        case let .sharedCustom(id, owner):
-                            if owner == model.permissionOwner { sharedCustomConnection(id, owner: owner) }
-                            else { Text("Connection unavailable") }
-                        }
-                    }
-                    .navigationTitle((selection ?? .overview).rawValue)
-                    .navigationBarTitleDisplayMode(.inline)
-                    .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
-                    .navigationDestination(isPresented: $showBilling) {
-                        DeviceBillingSettings(device: model, billing: model.billing)
-                    }
-            }
+            return .screen(id, owner: model.permissionOwner)
         }
-        .navigationSplitViewStyle(.balanced)
+        _promptDestination = State(initialValue: destination)
+    }
+
+    var body: some View {
+        Group {
+            if promptDestination != nil { settingsStack }
+            else { settingsBrowser }
+        }
         .modifier(AccountCreationAlert(model: model, isHost: model.settingsOpen))
         .modifier(ScreenDataConsentAlert(model: model, isHost: model.settingsOpen && sheet == nil && screenToRemove == nil))
         .modifier(BackupUpgradeAlert(model: model, billing: model.billing,
@@ -1274,13 +1243,8 @@ struct DeviceSettingsView: View {
         }
         .onAppear {
             selection = model.settingsPage
-            if let id = model.settingsScreenID {
-                let owner = model.permissionOwner
-                path = [.screen(id, owner: owner)]
-                if let alias = model.settingsCustomConnectionAlias { path.append(.custom(id, alias: alias, owner: owner)) }
-                model.settingsScreenID = nil
-                model.settingsCustomConnectionAlias = nil
-            }
+            model.settingsScreenID = nil
+            model.settingsCustomConnectionAlias = nil
             model.checkListenerStatusOnSettingsEntry()
         }
         .onChange(of: selection) {
@@ -1322,6 +1286,7 @@ struct DeviceSettingsView: View {
                 if let screen = screenToRemove {
                     model.removeScreen(screen.id)
                     if !model.installedScreens.contains(where: { $0.id == screen.id }) {
+                        if promptDestination != nil { dismiss() }
                         path.removeAll()
                     }
                 }
@@ -1331,6 +1296,67 @@ struct DeviceSettingsView: View {
             Text("Remove \(screenToRemove?.displayName ?? "this screen") from this iPad? This also removes its saved previous version.")
         }
 
+    }
+    private var settingsBrowser: some View {
+        NavigationSplitView(columnVisibility: $columns) {
+            List(selection: Binding(get: { selection }, set: { newPage in
+                if selection != newPage { path.removeAll() }; selection = newPage
+            })) {
+                Section {
+                    row(.account)
+                }
+                Section("Device") { row(.display); row(.screens) }
+                Section("Shared Connections") {
+                    row(.home)
+                    row(.calendar)
+                    row(.television)
+                    row(.customConnections)
+                }
+                Section("Help") { row(.overview); row(.guidedAccess) }
+            }
+            .listStyle(.sidebar)
+            .navigationTitle("Settings")
+            .toolbar { if sizeClass == .compact { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } } }
+            .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 320)
+        } detail: {
+            settingsStack
+        }
+        .navigationSplitViewStyle(.balanced)
+    }
+
+    private var settingsStack: some View {
+        NavigationStack(path: $path) {
+            Group {
+                if let promptDestination { destination(promptDestination) }
+                else { detail.navigationTitle((selection ?? .overview).rawValue) }
+            }
+                .navigationDestination(for: ScreenSettingsRoute.self) { route in
+                    destination(route)
+                }
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+                .navigationDestination(isPresented: $showBilling) {
+                    DeviceBillingSettings(device: model, billing: model.billing)
+                }
+        }
+    }
+
+    @ViewBuilder private func destination(_ route: ScreenSettingsRoute) -> some View {
+        switch route {
+        case let .screen(id, owner):
+            if owner == model.permissionOwner, let saved = model.installedScreens.first(where: { $0.id == id }) {
+                screenDetails(saved, owner: owner)
+            } else { Text("Screen unavailable") }
+        case let .shared(provider): sharedProvider(provider)
+        case let .custom(id, alias, owner):
+            if owner == model.permissionOwner,
+               let use = model.customConnectionUses().first(where: { $0.screen.id == id && $0.alias == alias }) {
+                DeviceCustomConnectionSettings(model: model, use: use, owner: owner, allowsApproval: true)
+            } else { Text("Connection unavailable") }
+        case let .sharedCustom(id, owner):
+            if owner == model.permissionOwner { sharedCustomConnection(id, owner: owner) }
+            else { Text("Connection unavailable") }
+        }
     }
     private func row(_ page: DeviceSettingsPage) -> some View {
         NavigationLink(value: page) { Label(page.rawValue, systemImage: page.symbol) }
