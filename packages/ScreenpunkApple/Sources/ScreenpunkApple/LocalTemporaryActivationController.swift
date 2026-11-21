@@ -34,8 +34,17 @@ public final class LocalTemporaryActivationController {
                          startedAt: Date = Date(), now: Date = Date()) throws -> String? {
         try apply { $0.activate(id: id, target: target, selected: selected, startedAt: startedAt, expiresAt: expiresAt, now: now) }
     }
+    public func receive(state: [String: Any], configuration: TemporaryActivationConfiguration,
+                        target: String, selected: String, now: Date, fallbackSelection: String? = nil) throws -> String? {
+        let wasActive = isActiveTarget(selected)
+        return try apply { navigation in
+            let proposal = navigation.receive(state: state, configuration: configuration, target: target, selected: selected,
+                                              now: now, source: target + ":" + configuration.entityId)
+            return proposal ?? (wasActive && navigation.dismissed ? fallbackSelection : nil)
+        }
+    }
     public func end(id: String, selected: String, fallbackSelection: String? = nil) throws -> String? {
-        guard checkpoint.navigation.alertId == id else { return nil }
+        guard checkpoint.navigation.alertId == id, checkpoint.navigation.activationSource == nil else { return nil }
         if checkpoint.navigation.dismissed { return checkpoint.pendingSelection }
         var next = checkpoint
         next.pendingSelection = next.navigation.end(id: id, selected: selected) ?? fallbackSelection
@@ -65,7 +74,9 @@ public final class LocalTemporaryActivationController {
     private func apply(_ change: (inout TemporaryActivationNavigation) -> String?) throws -> String? {
         var next = checkpoint
         if let proposal = change(&next.navigation) { next.pendingSelection = proposal }
-        try save(next)
+        if next.navigation != checkpoint.navigation || next.pendingSelection != checkpoint.pendingSelection {
+            try save(next)
+        }
         return next.pendingSelection
     }
     private func save(_ next: Checkpoint) throws {

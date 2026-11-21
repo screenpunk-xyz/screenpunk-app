@@ -392,7 +392,7 @@ public actor HomeAssistantDeviceRuntime: CameraStreamResolver {
     /// Native temporary activation observes one declared entity; a whole-house get_states
     /// snapshot can exceed the generic WebSocket limit before any event arrives.
     /// This is deliberately not an arbitrary URL or a page bridge operation.
-    func readTemporaryActivationState(revision: String) async throws -> Data {
+    public func readTemporaryActivationState(revision: String) async throws -> Data {
         guard let current = scope(), current.revision == revision,
               let activation = current.temporaryActivation else { throw ConnectionFailure.permissionRequired }
         try activation.validate()

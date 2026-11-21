@@ -30,6 +30,30 @@ final class ScreenLibraryCatalogTests: XCTestCase {
     private func artifact(_ title: String) -> ScreenArtifact { .init(title: title, files: [.init(path: "index.html", content: "<html><body>\(title)</body></html>")]) }
     private var binding: ScreenLibrary.CatalogBinding { .init(origin: "https://example.test", accountID: "account", userID: "user", deviceID: "device", libraryID: "library") }
 
+    @MainActor func testCatalogInventoryReportsExactAssociationForHiddenIndependentCopy() throws {
+        let root = directory()
+        defer { CatalogFixture.cleanup(root) }
+        let (item, package) = try linkedFixture(version: 1)
+        var version = item.latest
+        let catalogID = UUID().uuidString.lowercased()
+        version.catalogScreenID = catalogID
+        let library = try CatalogFixture.open(root, binding: binding)
+        try library.installCatalogScreen(.init(catalogScreenID: catalogID, latest: version, history: []), package: package)
+        let restored = try XCTUnwrap(library.state.screens.first)
+        XCTAssertTrue(library.linkedCatalogScreens.isEmpty)
+        try library.setScreenShown(false, id: restored.id)
+        try library.install(artifact("Other"), requestID: "other-inventory", replacing: "other")
+        try library.recordCatalogIdentity(catalogID.uppercased(), screenID: restored.id)
+        try library.recordCatalogIdentity("not-a-catalog-uuid", screenID: restored.id)
+
+        let reopened = try CatalogFixture.open(root, binding: binding)
+        let rows = reopened.state.screens.map { reopened.catalogInventoryRow(for: $0, includeCatalogIDs: true) }
+        XCTAssertEqual(rows.first { $0["id"] as? String == restored.id }?["catalogScreenIDs"] as? [String], [catalogID])
+        XCTAssertNil(rows.first { $0["id"] as? String == "other" }?["catalogScreenIDs"])
+        XCTAssertNil(reopened.catalogInventoryRow(for: restored, includeCatalogIDs: false)["catalogScreenIDs"])
+        XCTAssertFalse(reopened.isScreenShown(restored.id))
+    }
+
     @MainActor func testLinkedCatalogInstallReopensAndAppliesNewerVersionInPlace() throws {
         let root = directory()
         defer { CatalogFixture.cleanup(root) }

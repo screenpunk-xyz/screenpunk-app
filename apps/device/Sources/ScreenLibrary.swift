@@ -634,6 +634,15 @@ import ScreenpunkCore
         }
     }
 
+    func catalogInventoryRow(for screen: Saved, includeCatalogIDs: Bool) -> [String: Any] {
+        var row: [String: Any] = ["id": screen.id, "title": screen.artifact.title]
+        if includeCatalogIDs, let ids = state.catalogScreenIDs?[screen.id] {
+            let canonical = Set(ids.compactMap { UUID(uuidString: $0)?.uuidString.lowercased() })
+            if !canonical.isEmpty { row["catalogScreenIDs"] = Array(canonical.sorted().prefix(16)) }
+        }
+        return row
+    }
+
     func recordCatalogIdentity(_ catalogID: String, screenID: String) throws {
         guard state.screens.contains(where: { $0.id == screenID }) else { return }
         var next = state
@@ -1027,6 +1036,15 @@ import ScreenpunkCore
         }
         let selected = state.selectedID ?? (instructionsSelected ? Self.instructionsID : Self.neutralSelection)
         try applyTemporary(temporary.activate(id: id, target: screenID, expiresAt: expiresAt, selected: selected))
+    }
+
+    func receiveTemporaryHomeAssistantState(_ bytes: Data, screenID: String, revision: String,
+                                           configuration: TemporaryActivationConfiguration, now: Date = Date()) throws {
+        guard state.screens.contains(where: { $0.id == screenID && $0.revision == revision }),
+              let payload = try JSONSerialization.jsonObject(with: bytes) as? [String: Any] else { return }
+        let selected = state.selectedID ?? (instructionsSelected ? Self.instructionsID : Self.neutralSelection)
+        try applyTemporary(temporary.receive(state: payload, configuration: configuration, target: screenID,
+                                              selected: selected, now: now, fallbackSelection: temporaryFallback))
     }
 
     func endTemporary(id: String) throws {

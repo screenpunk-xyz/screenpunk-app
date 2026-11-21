@@ -43,6 +43,8 @@ struct AgentStatus: Decodable {
     private var enrolledToken: String?
     private let deviceNameWrites = DeviceNameWriteQueue()
     var session: DeviceSession? = SessionKeychain.load()
+    private static let catalogInventoryHeader = "X-Screenpunk-Catalog-Inventory"
+    private var catalogInventoryCapability: (token: String, validUntil: Date, supported: Bool)?
     var sessionRevoked: (() -> Void)?
     var deviceNameChanged: ((String, String?) -> Void)?
     private(set) var deviceNameSyncNotice: String?
@@ -564,18 +566,20 @@ struct AgentStatus: Decodable {
         throw DeviceError.message("The catalog asset could not be downloaded.")
     }
 
-    private func catalogBytes(_ path: String, method: String, bytes: Data?, token: String, requestLimit: Int, responseLimit: Int, contentType: String) async throws -> Data {
+    private func catalogBytes(_ path: String, method: String, bytes: Data?, token: String, requestLimit: Int, responseLimit: Int,
+                              contentType: String, timeout: TimeInterval = 60, onResponse: ((HTTPURLResponse) -> Void)? = nil) async throws -> Data {
         try Task.checkCancellation()
         guard path.hasPrefix("/api/catalog"), let relative = URLComponents(string: path), relative.scheme == nil, relative.host == nil, relative.fragment == nil,
               bytes?.count ?? 0 <= requestLimit, var target = URLComponents(url: Self.origin, resolvingAgainstBaseURL: false) else { throw DeviceError.message("Backup request exceeded its limit.") }
         target.path = relative.path; target.queryItems = relative.queryItems
         guard let url = target.url else { throw DeviceError.message("Invalid backup route.") }
         var request = URLRequest(url: url)
-        request.httpMethod = method; request.timeoutInterval = 60; request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.httpMethod = method; request.timeoutInterval = timeout; request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue(CatalogContract.version, forHTTPHeaderField: "X-Screenpunk-Catalog-Version")
         request.setValue(CatalogContract.assetBackupVersion, forHTTPHeaderField: "X-Screenpunk-Catalog-Assets")
         request.setValue("1", forHTTPHeaderField: "X-Screenpunk-Catalog-Links")
+        if path == CatalogContract.capabilitiesPath { request.setValue("1", forHTTPHeaderField: Self.catalogInventoryHeader) }
         if let bytes { request.httpBody = bytes; request.setValue(contentType, forHTTPHeaderField: "Content-Type") }
         let transport = URLSession(configuration: .ephemeral, delegate: NoRedirects(), delegateQueue: nil)
         defer { transport.invalidateAndCancel() }
@@ -590,14 +594,36 @@ struct AgentStatus: Decodable {
             let retry = http.value(forHTTPHeaderField: "Retry-After").flatMap(Int.init) ?? detail?.retryAfterSeconds
             throw CatalogHTTPError(status: http.statusCode, code: detail?.code ?? (http.statusCode == 401 ? "unauthorized" : "retry_later"), retryAfterSeconds: retry)
         }
+        onResponse?(http)
         return data
     }
-    func catalogCapability(token: String) async throws -> CatalogCapability? {
+
+    func catalogInventorySupported(token: String) async -> Bool {
+        if let cached = catalogInventoryCapability, cached.token == token, cached.validUntil > Date() { return cached.supported }
+        _ = try? await catalogCapability(token: token, timeout: 3)
+        return catalogInventoryCapability.map { $0.token == token && $0.validUntil > Date() && $0.supported } ?? false
+    }
+
+    func catalogCapability(token: String, timeout: TimeInterval = 60) async throws -> CatalogCapability? {
         do {
-            let capability: CatalogCapability = try await catalogRequest(CatalogContract.capabilitiesPath, token: token)
-            guard capability.version == CatalogContract.version, capability.feature == CatalogContract.feature else { return nil }
-            return capability
-        } catch let error as CatalogHTTPError where error.status == 404 || error.status == 405 { return nil }
+            var inventoryOptIn = false
+            let bytes = try await catalogBytes(CatalogContract.capabilitiesPath, method: "GET", bytes: nil, token: token,
+                                               requestLimit: 0, responseLimit: 64 * 1024, contentType: "application/json", timeout: timeout) {
+                inventoryOptIn = $0.value(forHTTPHeaderField: Self.catalogInventoryHeader) == "1"
+            }
+            let capability = try JSONDecoder().decode(CatalogCapability.self, from: bytes)
+            let understood = capability.version == CatalogContract.version && capability.feature == CatalogContract.feature
+            recordCatalogInventoryCapability(understood && inventoryOptIn, token: token)
+            return understood ? capability : nil
+        } catch let error as CatalogHTTPError where error.status == 404 || error.status == 405 {
+            recordCatalogInventoryCapability(false, token: token)
+            return nil
+        }
+    }
+
+    private func recordCatalogInventoryCapability(_ supported: Bool, token: String) {
+        guard session?.accessToken == token else { return }
+        catalogInventoryCapability = (token, Date().addingTimeInterval(supported ? 300 : 60), supported)
     }
     func pendingAccountDeletion() throws -> DeviceAccountDeletionIntent? {
         guard let data = try CloudKeychainVault().read(service: Self.originScope.keychainService, account: "account-deletion") else { return nil }
