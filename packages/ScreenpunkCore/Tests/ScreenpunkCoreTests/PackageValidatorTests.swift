@@ -155,6 +155,22 @@ final class PackageValidatorTests: XCTestCase {
         XCTAssertThrowsError(try PackageValidator.validate(sideways))
     }
 
+    func testManifestExpandedBudgetCanBeDisabledWithoutDisablingInventoryValidation() {
+        let sha256 = String(repeating: "a", count: 64)
+        let entry = ManifestFile(path: "index.html", bytes: 1, sha256: sha256)
+        let large = ManifestFile(path: "sound.wav", bytes: Int.max, sha256: sha256)
+        let oversized = manifest(files: [entry, large])
+        XCTAssertThrowsError(try PackageValidator.validate(oversized, maximumExpandedBytes: Int.max)) { error in
+            XCTAssertEqual((error as? PackageValidationError)?.issues, [.sizeLimit])
+        }
+        XCTAssertNoThrow(try PackageValidator.validate(oversized, maximumExpandedBytes: nil))
+
+        let negative = ManifestFile(path: "sound.wav", bytes: -1, sha256: sha256)
+        XCTAssertThrowsError(try PackageValidator.validate(manifest(files: [entry, negative]), maximumExpandedBytes: nil)) { error in
+            XCTAssertEqual((error as? PackageValidationError)?.issues, [.sizeLimit])
+        }
+    }
+
     func testStoreBoundsAndNativeChrome() throws {
         var store = DashboardStore(dashboardId: "dash")
         try store.set(key: "k", json: "1")

@@ -156,8 +156,12 @@ public enum AuthoringStore {
                   pin.revision == revision, pin.byteLength == request.context.currentScreen?.files.reduce(0, { $0 + $1.byteLength }) else { throw AuthoringStoreError.invalid("The immutable base package must be pinned before preparing delivery.") }
         } else if pin != nil { throw AuthoringStoreError.invalid("A new screen cannot pin an existing package.") }
         compactSources(in: &state)
+        let legacyPinnedBytes = state.revisionPins?.values.filter {
+            state.requestsV2?[$0.requestID]?.context.currentScreen?.packageSchema != 3
+        }.reduce(0, { $0 + $1.byteLength }) ?? 0
+        let legacyIncomingBytes = request.context.currentScreen?.packageSchema == 3 ? 0 : (pin?.byteLength ?? 0)
         guard state.requests.count + (state.requestsV2?.count ?? 0) < 32,
-              (state.revisionPins?.values.reduce(0, { $0 + $1.byteLength }) ?? 0) + (pin?.byteLength ?? 0) <= 32 * 204_800 else { throw AuthoringStoreError.invalid("Too many unfinished authoring snapshots are retained. Finish or cancel them before starting another.") }
+              legacyPinnedBytes + legacyIncomingBytes <= 32 * 204_800 else { throw AuthoringStoreError.invalid("Too many unfinished authoring snapshots are retained. Finish or cancel them before starting another.") }
         var requests = state.requestsV2 ?? [:]; requests[request.requestID] = request; state.requestsV2 = requests
         if let pin { var pins = state.revisionPins ?? [:]; pins[request.requestID] = pin; state.revisionPins = pins }
         state.knownScreenIDs = (state.knownScreenIDs ?? []).union([request.context.screenID])

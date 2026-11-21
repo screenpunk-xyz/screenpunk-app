@@ -6,14 +6,22 @@ import { authoringContentDigestV2, authoringMediaTypeV2 } from './authoring-v2';
 import { validateScreenDataDeclaration } from './screen-data';
 export const CATALOG_CAPABILITY = 'catalog-backup-v1';
 export const CATALOG_VERSION = '1';
+export const CATALOG_ASSET_BACKUP_VERSION = '1';
+export const CATALOG_ASSET_CHUNK_BYTES = 512 * 1024;
+export const CATALOG_ASSET_BEGIN_BYTES = 256 * 1024;
+export const CATALOG_ASSET_FILE_COUNT = 512;
 export const CATALOG_LIMITS = Object.freeze({ versionsPerScreen:3, screensPerAccount:20, packageBytes:10*1024*1024, previewBytes:512*1024, previewDimension:2048, accountBytes:1024*1024*1024, publicationOverlapBytes:20*1024*1024, queueRevisions:100, queueBytes:100*1024*1024, files:20, fileBytes:204800 });
 export const CATALOG_ROUTES = Object.freeze({ capabilities:'/api/catalog/capabilities', begin:'/api/catalog/backups/begin', uploads:'/api/catalog/backups/', operations:'/api/catalog/backups/operations/', list:'/api/catalog', screens:'/api/catalog/screens/', previewCandidates:'/api/catalog/preview-candidates', previewBegin:'/api/catalog/previews/begin', previewUploads:'/api/catalog/previews/', previewOperations:'/api/catalog/previews/operations/' });
 export type CatalogErrorCode = 'not_entitled'|'offline'|'quota_exceeded'|'invalid_package'|'conflict'|'deleted'|'retry_later'|'unauthorized'|'not_found';
 export interface CatalogError { code:CatalogErrorCode; message:string; retryAfterSeconds?:number; restartOperation?:true }
 export interface CatalogEntitlement { backupEnabled:boolean; reason:string; versionsPerScreen:number; screensPerAccount:number; packageBytes:number; previewBytes:number; previewDimension:number; accountBytes:number; publicationOverlapBytes:number }
-export interface CatalogCapability { version:'1'; feature:'catalog-backup-v1'; previewMediaTypes:('image/png'|'image/jpeg')[]; previewBackfillVersion?:'1'; entitlement:CatalogEntitlement }
+export interface CatalogCapability { version:'1'; feature:'catalog-backup-v1'; previewMediaTypes:('image/png'|'image/jpeg')[]; previewBackfillVersion?:'1'; assetBackupVersion?:'1'; entitlement:CatalogEntitlement }
 export interface CatalogPackageFile { path:string; mediaType:string; byteLength:number; digest:string; contentBase64:string }
 export interface CatalogPackage { schemaVersion:1|2; screen:{ title:string; entry:'index.html'; requiredAssets:string[]; externalDependencies:string[] }; files:CatalogPackageFile[] }
+export type CatalogAssetFile = Omit<CatalogPackageFile,'contentBase64'>;
+export interface CatalogAssetManifest { schemaVersion:1|2; screen:CatalogPackage['screen']; files:CatalogAssetFile[] }
+export interface CatalogAssetBeginBackup { backup:CatalogBeginBackup; manifest:CatalogAssetManifest }
+export interface CatalogAssetBackupStatus extends CatalogBackupStatus { missingFiles:{digest:string;offset:number}[] }
 export interface CatalogObjectDeclaration { byteLength:number; digest:string }
 export interface CatalogPreviewDeclaration extends CatalogObjectDeclaration { mediaType:'image/png'|'image/jpeg'; width:number; height:number }
 export interface CatalogGapDeclaration { checkpointCounter:number; checkpointRevisionID:string; skippedFromCounter:number; skippedThroughCounter:number; reason:'user_acknowledged_backup_pause' }
@@ -26,7 +34,8 @@ export type CatalogBackupState = 'pending'|'uploaded'|'completed'|'duplicate'|'s
 export interface CatalogBackupStatus { schemaVersion:1; operationID:string; state:CatalogBackupState; catalogScreenID:string; uploadID?:string; versionID?:string; displayVersion?:number; expiresAt?:string; error?:CatalogError }
 export interface CatalogCompleteBackup { schemaVersion:1; operationID:string }
 export type CatalogPreview = { status:'available'; source?:'exact_package'; capturedAt?:string; mediaType:'image/png'|'image/jpeg'; byteLength:number; digest:string; width:number; height:number } | { status:'unavailable'; reason:'not_provided'|'invalid'|'capture_failed' };
-export interface CatalogVersion { versionID:string; catalogScreenID:string; displayVersion:number; sourceRevisionID:string; parentRevisionIDs:string[]; copyID:string; commitCounter:number; screenName:string; versionName?:string; note?:string; sourceAppliedAt:string; backedUpAt:string; packageSchema:1|2; packageDigest:string; sizeBytes:number; deviceDisplayName:string; deviceLinked:boolean; integrity?:'missing'; preview:CatalogPreview }
+interface CatalogVersionMetadata { versionID:string; catalogScreenID:string; displayVersion:number; sourceRevisionID:string; parentRevisionIDs:string[]; copyID:string; commitCounter:number; screenName:string; versionName?:string; note?:string; sourceAppliedAt:string; backedUpAt:string; packageDigest:string; sizeBytes:number; deviceDisplayName:string; deviceLinked:boolean; integrity?:'missing'; preview:CatalogPreview }
+export type CatalogVersion = CatalogVersionMetadata & ({ packageSchema:1|2; packageStorage?:never } | { packageSchema:3; packageStorage:'assets' });
 export interface CatalogScreen { catalogScreenID:string; latest:CatalogVersion; history:CatalogVersion[] }
 export interface CatalogList { schemaVersion:1; catalogRevision:number; entitlement:CatalogEntitlement; usage:{storedBytes:number;reservedBytes:number;cleanupBytes:number}; screens:CatalogScreen[]; nextCursor?:string }
 export interface CatalogDeleteResult { schemaVersion:1; catalogScreenID:string; versionID:string; deleted:true; catalogRevision:number }
@@ -47,7 +56,7 @@ export function validateCatalogWire(name:keyof typeof CATALOG_SCHEMAS,value:unkn
  const v=value as any;if(name==='Error'&&v.restartOperation&&v.code!=='retry_later'||(name==='BackupStatus'||name==='PreviewStatus')&&v.error?.restartOperation&&(v.state!=='failed'||v.error.code!=='retry_later'))throw Error('Catalog restart requires expired failed operation');
 }
 export interface CatalogPNGPreviewDeclaration extends Omit<CatalogPreviewDeclaration,'mediaType'> { mediaType:'image/png' }
-export interface CatalogPreviewCandidate { catalogScreenID:string; versionID:string; libraryID:string; localScreenID:string; sourceRevisionID:string; packageDigest:string; packageBytes:number }
+export interface CatalogPreviewCandidate { catalogScreenID:string; versionID:string; libraryID:string; localScreenID:string; sourceRevisionID:string; packageDigest:string; packageBytes:number; packageStorage?:'assets' }
 export interface CatalogPreviewCandidates { schemaVersion:1; candidates:CatalogPreviewCandidate[]; nextCursor?:string }
 export interface CatalogPreviewBegin { schemaVersion:1; operationID:string; catalogScreenID:string; versionID:string; libraryID:string; localScreenID:string; sourceRevisionID:string; packageDigest:string; capturedAt:string; source:'exact_package'; preview:CatalogPNGPreviewDeclaration }
 export interface CatalogPreviewStatus { schemaVersion:1; operationID:string; catalogScreenID:string; versionID:string; state:'pending'|'uploaded'|'completed'|'duplicate'|'deleted'|'failed'; uploadID?:string; expiresAt?:string; error?:CatalogError }
@@ -61,9 +70,9 @@ const id = (v:unknown) => typeof v==='string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,12
 const integer = (v:unknown,max:number,min=1) => typeof v==='number'&&Number.isSafeInteger(v)&&v>=min&&v<=max;
 const digest = (v:unknown) => typeof v==='string'&&/^[a-f0-9]{64}$/.test(v);
 const timestamp = (v:unknown) => typeof v==='string'&&/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(v)&&Number.isFinite(Date.parse(v))&&new Date(v).toISOString()===v;
-export function validateCatalogObject(value:unknown,max=CATALOG_LIMITS.packageBytes):CatalogObjectDeclaration { keys(value,['byteLength','digest']);const v=value as CatalogObjectDeclaration;if(!integer(v.byteLength,max)||!digest(v.digest))fail('invalid object declaration');return v; }
-export function validateCatalogBeginBackup(value:unknown):CatalogBeginBackup {
- validateCatalogWire('BeginBackup',value);
+export function validateCatalogObject(value:unknown,max:number=CATALOG_LIMITS.packageBytes):CatalogObjectDeclaration { keys(value,['byteLength','digest']);const v=value as CatalogObjectDeclaration;if(!integer(v.byteLength,max)||!digest(v.digest))fail('invalid object declaration');return v; }
+export function validateCatalogBeginBackup(value:unknown, options:{assetManifest?:boolean}={}):CatalogBeginBackup {
+ validateCatalogWire(options.assetManifest ? 'AssetBackupMetadata' : 'BeginBackup',value);
  keys(value,['schemaVersion','operationID','libraryID','localScreenID','sourceRevisionID','parentRevisionIDs','predecessorRevisionID','commitCounter','origin','sourceAppliedAt','screenName','package'],['versionName','note','preview','gap']);
  const v=value as CatalogBeginBackup;
  if(v.schemaVersion!==1||![v.operationID,v.libraryID,v.localScreenID,v.sourceRevisionID].every(id)||!integer(v.commitCounter,Number.MAX_SAFE_INTEGER)||!['applied','seed'].includes(v.origin)||!timestamp(v.sourceAppliedAt)||!bounded(v.screenName,100))fail('invalid begin metadata');
@@ -71,7 +80,7 @@ export function validateCatalogBeginBackup(value:unknown):CatalogBeginBackup {
  if(v.predecessorRevisionID!==null&&!v.parentRevisionIDs.includes(v.predecessorRevisionID))fail('predecessor must be a parent');
  if(v.versionName!==undefined&&!bounded(v.versionName,100)||v.note!==undefined&&!bounded(v.note,1000))fail('invalid label');
  if(v.gap!==undefined){const g=v.gap;keys(g,['checkpointCounter','checkpointRevisionID','skippedFromCounter','skippedThroughCounter','reason']);if(v.origin!=='seed'||!integer(g.checkpointCounter,Number.MAX_SAFE_INTEGER)||!id(g.checkpointRevisionID)||!integer(g.skippedFromCounter,Number.MAX_SAFE_INTEGER)||!integer(g.skippedThroughCounter,Number.MAX_SAFE_INTEGER)||g.skippedFromCounter!==g.checkpointCounter+1||g.skippedThroughCounter<g.skippedFromCounter||v.commitCounter!==g.skippedThroughCounter+1||v.predecessorRevisionID!==g.checkpointRevisionID||g.reason!=='user_acknowledged_backup_pause')fail('invalid gap checkpoint');}
- validateCatalogObject(v.package);
+ validateCatalogObject(v.package, options.assetManifest ? Number.MAX_SAFE_INTEGER : CATALOG_LIMITS.packageBytes);
  if(v.preview!==undefined){ keys(v.preview,['byteLength','digest','mediaType','width','height']);validateCatalogObject({byteLength:v.preview.byteLength,digest:v.preview.digest},CATALOG_LIMITS.previewBytes);if(!['image/png','image/jpeg'].includes(v.preview.mediaType)||!integer(v.preview.width,2048)||!integer(v.preview.height,2048))fail('invalid preview'); }
  return v;
 }

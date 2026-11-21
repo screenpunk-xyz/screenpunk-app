@@ -8,6 +8,30 @@ final class CatalogContractTests: XCTestCase {
         return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("contracts/fixtures/conformance-catalog-v1.json"))) as? [String: Any])
     }
     private func data(_ value: Any) throws -> Data { try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys,.withoutEscapingSlashes]) }
+    func testAssetManifestAcceptsOpaqueMediaAndRequiresHTMLEntry() throws {
+        let emptyDigest = CatalogContract.digest(Data())
+        let bytes = Data([1, 2, 3])
+        let fileDigest = CatalogContract.digest(bytes)
+        let screen = CatalogPackageScreen(title: "Video", entry: "index.html", requiredAssets: ["movie.mp4"], externalDependencies: [])
+        var manifest = CatalogAssetManifest(schemaVersion: 2, screen: screen, files: [
+            .init(path: "index.html", mediaType: "text/html", byteLength: bytes.count, digest: fileDigest),
+            .init(path: "movie.mp4", mediaType: "video/mp4", byteLength: bytes.count, digest: fileDigest),
+            .init(path: "opaque.extension", mediaType: "application/octet-stream", byteLength: 0, digest: emptyDigest)
+        ])
+        XCTAssertEqual(try CatalogContract.validateAssetManifest(manifest), 2 * bytes.count)
+
+        manifest.files[0].mediaType = "text/plain"
+        XCTAssertThrowsError(try CatalogContract.validateAssetManifest(manifest))
+        manifest.files[0].mediaType = "text/html"
+        manifest.files[1].mediaType = "Video/mp4"
+        XCTAssertThrowsError(try CatalogContract.validateAssetManifest(manifest))
+        manifest.files[1].mediaType = "video/mp4"
+        manifest.files[2].digest = fileDigest
+        XCTAssertThrowsError(try CatalogContract.validateAssetManifest(manifest))
+        manifest.files[2].digest = emptyDigest
+        manifest.files.removeFirst()
+        XCTAssertThrowsError(try CatalogContract.validateAssetManifest(manifest))
+    }
     func testNativeMigrationPackagesWhenProvided() throws {
         guard let path = ProcessInfo.processInfo.environment["SCREENPUNK_CATALOG_PACKAGE_FIXTURES"] else { throw XCTSkip("No local migration packages supplied") }
         let root = URL(fileURLWithPath: path)

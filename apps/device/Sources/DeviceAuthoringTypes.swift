@@ -255,6 +255,7 @@ struct CloudAuthoringCapabilities: Codable, Equatable, Sendable {
     let contractVersions: [String]
     let features: [String]
     var supportsV2: Bool { contractVersions.contains("2") && features.contains("asset-references-v2") }
+    var supportsPackageAssets: Bool { supportsV2 && features.contains("package-assets-v2") }
     static let unavailable = CloudAuthoringCapabilities(contractVersions: [], features: [])
 }
 

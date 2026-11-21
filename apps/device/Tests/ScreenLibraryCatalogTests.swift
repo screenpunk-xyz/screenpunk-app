@@ -30,6 +30,144 @@ final class ScreenLibraryCatalogTests: XCTestCase {
     private func artifact(_ title: String) -> ScreenArtifact { .init(title: title, files: [.init(path: "index.html", content: "<html><body>\(title)</body></html>")]) }
     private var binding: ScreenLibrary.CatalogBinding { .init(origin: "https://example.test", accountID: "account", userID: "user", deviceID: "device", libraryID: "library") }
 
+    @MainActor func testAssetRestoreStagingSurvivesReopenAndKeepsLargeRawFiles() async throws {
+        let root = directory(); defer { CatalogFixture.cleanup(root) }
+        let entry = Data("<html><body>Large screen</body></html>".utf8)
+        let media = Data(repeating: 0, count: 5 * 1024 * 1024 + 1)
+        var repository = URL(fileURLWithPath: #filePath)
+        for _ in 0..<4 { repository.deleteLastPathComponent() }
+        let fixture = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: repository.appendingPathComponent("packages/contracts/fixtures/conformance-catalog-package-v2.json"))) as? [String: Any])
+        let legacy = try JSONDecoder().decode(CatalogPackage.self, from: JSONSerialization.data(withJSONObject: fixture["package"]!))
+        let legacyManifest = try XCTUnwrap(legacy.files.first { $0.path == "manifest.json" })
+        var sdk = try JSONDecoder().decode(DashboardManifest.self, from: XCTUnwrap(Data(base64Encoded: legacyManifest.contentBase64)))
+        let entryFile = CatalogAssetFile(path: "index.html", mediaType: "text/html", byteLength: entry.count, digest: CatalogContract.digest(entry))
+        let mediaFile = CatalogAssetFile(path: "media.mp4", mediaType: "video/mp4", byteLength: media.count, digest: CatalogContract.digest(media))
+        sdk.files = [entryFile, mediaFile].map { .init(path: $0.path, bytes: $0.byteLength, sha256: $0.digest) }
+        let sdkBytes = try CatalogContract.canonical(sdk)
+        let manifest = CatalogAssetManifest(schemaVersion: 2, screen: .init(title: "Large screen", entry: "index.html", requiredAssets: [], externalDependencies: []), files: [
+            entryFile,
+            .init(path: "manifest.json", mediaType: "application/json", byteLength: sdkBytes.count, digest: CatalogContract.digest(sdkBytes)),
+            mediaFile
+        ])
+        let packageBytes = entry.count + media.count + sdkBytes.count
+        var version = CatalogVersion(versionID: "assets-version", catalogScreenID: "catalog-large", displayVersion: 1, sourceRevisionID: "source",
+            parentRevisionIDs: [], copyID: "copy", commitCounter: 1, screenName: manifest.screen.title,
+            sourceAppliedAt: "2026-11-21T00:00:00.000Z", backedUpAt: "2026-11-21T00:00:00.000Z", packageSchema: 3,
+            packageDigest: CatalogContract.digest(try CatalogContract.canonical(manifest)), sizeBytes: packageBytes,
+            deviceDisplayName: "Test iPad", deviceLinked: true, preview: .init(), packageStorage: "assets")
+        var library = try CatalogFixture.open(root, binding: binding)
+        let staging = try library.openCatalogRestoreDirectory(binding: binding, version: version)
+        XCTAssertThrowsError(try library.openCatalogRestoreDirectory(binding: binding, version: version))
+        try entry.write(to: staging.appendingPathComponent("index.html"))
+        try sdkBytes.write(to: staging.appendingPathComponent("manifest.json"))
+        try media.prefix(CatalogContract.assetChunkBytes).write(to: staging.appendingPathComponent("media.mp4"))
+        library.closeCatalogRestoreDirectory(staging)
+
+        library = try CatalogFixture.open(root, binding: binding)
+        var differentBinding = binding
+        differentBinding.deviceID = "other-installation"
+        let otherEnrollment = try library.openCatalogRestoreDirectory(binding: differentBinding, version: version)
+        XCTAssertNotEqual(otherEnrollment, staging)
+        library.closeCatalogRestoreDirectory(otherEnrollment)
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 0)], ofItemAtPath: otherEnrollment.path)
+
+        let originalVersion = version
+        version.packageDigest = String(repeating: "a", count: 64)
+        let changedManifest = try library.openCatalogRestoreDirectory(binding: binding, version: version)
+        XCTAssertNotEqual(changedManifest, staging)
+        library.closeCatalogRestoreDirectory(changedManifest)
+
+        library = try CatalogFixture.open(root, binding: binding)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: otherEnrollment.path))
+        let reopened = try library.openCatalogRestoreDirectory(binding: binding, version: originalVersion)
+        XCTAssertEqual(reopened, staging)
+        XCTAssertEqual(try Data(contentsOf: reopened.appendingPathComponent("media.mp4")), media.prefix(CatalogContract.assetChunkBytes))
+        var offsets: [Int] = []
+        try await CatalogAssetDownload.restore(file: mediaFile, destination: reopened.appendingPathComponent("media.mp4"), current: {}) { offset, count in
+            offsets.append(offset)
+            return media.subdata(in: offset..<offset + count)
+        }
+        XCTAssertEqual(offsets.first, CatalogContract.assetChunkBytes)
+        XCTAssertEqual(offsets.last, 5 * 1024 * 1024)
+        try library.setCatalogBackupsEnabled(true, binding: binding)
+        try library.activateCatalog(binding: binding, maxBytes: 1, assetBackups: true)
+        let item = CatalogScreen(catalogScreenID: originalVersion.catalogScreenID, latest: originalVersion, history: [])
+        try library.installCatalogAssets(item, manifest: manifest, staged: reopened)
+        library.closeCatalogRestoreDirectory(reopened)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: staging.path))
+        XCTAssertTrue(library.containsCatalogScreen(item))
+        let installed = try XCTUnwrap(library.state.screens.first)
+        XCTAssertEqual(installed.catalogPackageSchema, 2)
+        XCTAssertEqual(installed.catalogAssetPaths, ["index.html", "manifest.json", "media.mp4"])
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent(installed.revision).appendingPathComponent("media.mp4")), media)
+        let intent = try XCTUnwrap(library.catalogQueue?.entries.first)
+        XCTAssertEqual(intent.packageStorage, "assets")
+        let exported = try await library.exportCatalogAssetIntent(intent, binding: binding)
+        XCTAssertEqual(exported.manifest, manifest)
+        XCTAssertEqual(exported.declaration.byteLength, packageBytes)
+        XCTAssertEqual(exported.declaration.digest, originalVersion.packageDigest)
+        XCTAssertEqual(try exported.chunk(file: mediaFile, offset: 5 * 1024 * 1024), Data([0]))
+
+        let request = try library.makeAuthoringRequestV2(from: .init(requestID: UUID().uuidString, createdAt: 1_000,
+            deadlineAt: 600_000, designGuidance: AuthoringContract.designGuidance, runtime: AuthoringContract.runtime,
+            services: [], context: .init(profileID: "profile", deviceID: "device", screenID: installed.id, baseRevision: installed.revision,
+                userRequest: "Edit the heading.", viewport: .init(width: 1_024, height: 768, orientation: "landscape")),
+            delivery: .init(route: "local")))
+        let source = try XCTUnwrap(request.context.currentScreen)
+        XCTAssertEqual(source.packageSchema, 3)
+        let files = source.files.map { file in
+            file.path == "index.html"
+                ? AuthoringFileMutationV2.write(path: file.path, content: "<html><body>Edited screen</body></html>")
+                : .retain(path: file.path, sourcePath: file.path, reference: file.reference, digest: file.digest)
+        }
+        try library.prepareAuthoringRequest(request, text: request.context.userRequest, screen: nil)
+        let result = AuthoringResultV2(requestID: request.requestID, inputDigest: request.delivery.snapshotDigest,
+            baseRevision: request.context.baseRevision, preferenceRevisions: [:], operationID: UUID().uuidString,
+            screen: .init(title: source.title, files: files))
+        XCTAssertEqual(try library.applyAuthoringResult(result, now: 2_000).status, "applied")
+        let edited = try XCTUnwrap(library.state.screens.first)
+        let pending = try XCTUnwrap(library.catalogQueue?.entries.first { $0.revision == edited.revision })
+        let backup = try await library.exportCatalogAssetIntent(pending, binding: binding)
+        XCTAssertEqual(backup.manifest.schemaVersion, 2)
+        XCTAssertEqual(backup.manifest.files.first { $0.path == mediaFile.path }, mediaFile)
+        XCTAssertNotEqual(backup.declaration.digest, originalVersion.packageDigest)
+    }
+
+    @MainActor func testAssetDownloadRechecksPersistedBytesAndDropsCorruptFile() async throws {
+        let root = directory(); defer { CatalogFixture.cleanup(root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let size = CatalogContract.assetChunkBytes
+        let bytes = Data(repeating: 7, count: 2 * size + 1)
+        let file = CatalogAssetFile(path: "media.bin", mediaType: "application/octet-stream", byteLength: bytes.count, digest: CatalogContract.digest(bytes))
+        let destination = root.appendingPathComponent(file.path)
+        try Data(repeating: 8, count: size + 3).write(to: destination)
+        var requested: [Int] = []
+        do {
+            try await CatalogAssetDownload.restore(file: file, destination: destination, current: {}) { offset, count in
+                requested.append(offset)
+                return bytes.subdata(in: offset..<offset + count)
+            }
+            XCTFail("A corrupt persisted chunk cannot be installed")
+        } catch {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+        }
+        XCTAssertEqual(requested, [size, 2 * size])
+
+        requested.removeAll()
+        try await CatalogAssetDownload.restore(file: file, destination: destination, current: {}) { offset, count in
+            requested.append(offset)
+            return bytes.subdata(in: offset..<offset + count)
+        }
+        XCTAssertEqual(requested, [0, size, 2 * size])
+        requested.removeAll()
+        try await CatalogAssetDownload.restore(file: file, destination: destination, current: {}) { offset, _ in
+            requested.append(offset)
+            return Data()
+        }
+        XCTAssertTrue(requested.isEmpty)
+        XCTAssertEqual(try Data(contentsOf: destination), bytes)
+    }
+
     @MainActor func testNativeCatalogImportRetainsAudioOnDiskReopenAndBackup() throws {
         let root = directory(); defer { CatalogFixture.cleanup(root) }
         var repository = URL(fileURLWithPath: #filePath)
@@ -56,6 +194,114 @@ final class ScreenLibraryCatalogTests: XCTestCase {
         XCTAssertEqual(exported.bytes, encoded)
         try reopened.remove(imported.id)
         XCTAssertFalse(reopened.containsCatalogScreen(item))
+    }
+
+    @MainActor func testNativeCatalogEditsRetainAudioAndLargeTextWithExplicitRemoval() throws {
+        var repository = URL(fileURLWithPath: #filePath)
+        for _ in 0..<4 { repository.deleteLastPathComponent() }
+        let fixture = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: repository.appendingPathComponent("packages/contracts/fixtures/conformance-catalog-package-v2.json"))) as? [String: Any])
+        var package = try JSONDecoder().decode(CatalogPackage.self, from: JSONSerialization.data(withJSONObject: fixture["package"]!))
+        let manifestIndex = try XCTUnwrap(package.files.firstIndex(where: { $0.path == "manifest.json" }))
+        let oldManifest = try XCTUnwrap(Data(base64Encoded: package.files[manifestIndex].contentBase64))
+        var manifest = try JSONDecoder().decode(DashboardManifest.self, from: oldManifest)
+        let largeText = Data(String(repeating: "Original text\r\n", count: 21_000).utf8)
+        let note = "large.txt"
+        manifest.files.append(.init(path: note, bytes: largeText.count, sha256: CatalogContract.digest(largeText)))
+        let connection = ManifestConnection(alias: "googleCalendar", required: false)
+        manifest.connections = [connection]
+        let manifestBytes = try JSONEncoder().encode(manifest)
+        package.files[manifestIndex] = .init(path: "manifest.json", mediaType: "application/json", byteLength: manifestBytes.count,
+                                           digest: CatalogContract.digest(manifestBytes), contentBase64: manifestBytes.base64EncodedString())
+        package.files.append(.init(path: note, mediaType: "text/plain", byteLength: largeText.count,
+                                   digest: CatalogContract.digest(largeText), contentBase64: largeText.base64EncodedString()))
+        package.files.sort { $0.path < $1.path }
+        try verifyNativeCatalogEdit(package, explicitlyRemoving: note)
+    }
+
+    @MainActor func testNativeMigrationPackageEditsWhenProvided() throws {
+        guard let path = ProcessInfo.processInfo.environment["SCREENPUNK_CATALOG_PACKAGE_FIXTURES"] else { throw XCTSkip("No local migration packages supplied") }
+        let directory = URL(fileURLWithPath: path)
+        let urls = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).filter { $0.pathExtension == "json" }
+        let packages = try urls.map { try JSONDecoder().decode(CatalogPackage.self, from: Data(contentsOf: $0)) }.filter { $0.schemaVersion == 2 }
+        XCTAssertFalse(packages.isEmpty)
+        for package in packages { try verifyNativeCatalogEdit(package) }
+    }
+
+    @MainActor private func verifyNativeCatalogEdit(_ package: CatalogPackage, explicitlyRemoving removedPath: String? = nil) throws {
+        let root = directory(); defer { CatalogFixture.cleanup(root) }
+        var library = try CatalogFixture.open(root, binding: binding)
+        try CatalogFixture.enable(library, binding: binding)
+        let encoded = try CatalogContract.encodePackage(package)
+        let version = CatalogVersion(versionID: "version", catalogScreenID: "editing-fixture", displayVersion: 1,
+            sourceRevisionID: "source", parentRevisionIDs: [], copyID: "copy", commitCounter: 1,
+            screenName: package.screen.title, sourceAppliedAt: "2026-11-21T00:00:00.000Z",
+            backedUpAt: "2026-11-21T00:00:00.000Z", packageSchema: package.schemaVersion,
+            packageDigest: CatalogContract.digest(encoded), sizeBytes: encoded.count,
+            deviceDisplayName: "Test Device", deviceLinked: false, preview: .init())
+        try library.installCatalogScreen(.init(catalogScreenID: version.catalogScreenID, latest: version, history: []), package: package)
+        let original = try XCTUnwrap(library.state.screens.first)
+        func makeRequest(_ base: ScreenLibrary.Saved) throws -> AuthoringRequestV2 {
+            try library.makeAuthoringRequestV2(from: .init(requestID: UUID().uuidString, createdAt: 1_000,
+                deadlineAt: 600_000, designGuidance: AuthoringContract.designGuidance, runtime: AuthoringContract.runtime,
+                services: [], context: .init(profileID: "profile", deviceID: "device", screenID: base.id, baseRevision: base.revision,
+                    userRequest: "Update the page.", viewport: .init(width: 1_024, height: 768, orientation: "landscape")),
+                delivery: .init(route: "local")))
+        }
+        func makeResult(_ request: AuthoringRequestV2, excluding excluded: String? = nil, deletedPaths: [String] = []) throws -> AuthoringResultV2 {
+            let source = try XCTUnwrap(request.context.currentScreen)
+            let files = source.files.filter { $0.path != excluded }.map { file in
+                file.path == "index.html"
+                    ? AuthoringFileMutationV2.write(path: file.path, content: (file.content ?? "") + "\n<!-- edit -->")
+                    : .retain(path: file.path, sourcePath: file.path, reference: file.reference, digest: file.digest)
+            }
+            return .init(requestID: request.requestID, inputDigest: request.delivery.snapshotDigest,
+                baseRevision: request.context.baseRevision, preferenceRevisions: [:], operationID: UUID().uuidString,
+                screen: .init(title: source.title, files: files, deletedPaths: deletedPaths))
+        }
+        let request = try makeRequest(original)
+        XCTAssertEqual(Set(request.context.currentScreen?.files.map(\.path) ?? []), Set(package.files.map(\.path)))
+        for file in package.files where file.mediaType.hasPrefix("audio/") || file.byteLength > 128 * 1024 {
+            let manifestAsset = try XCTUnwrap(request.context.currentScreen?.files.first { $0.path == file.path })
+            XCTAssertNil(manifestAsset.content)
+            XCTAssertEqual(manifestAsset.digest, file.digest)
+        }
+        try library.prepareAuthoringRequest(request, text: request.context.userRequest, screen: nil)
+        let result = try makeResult(request)
+        let receipt = try library.applyAuthoringResult(result, now: 2_000)
+        XCTAssertEqual(receipt.status, "applied", receipt.message ?? "")
+        let edited = try XCTUnwrap(library.state.screens.first)
+        XCTAssertNotEqual(edited.revision, original.revision)
+        library = try CatalogFixture.open(root, binding: binding)
+        XCTAssertEqual(try library.applyAuthoringResult(result, now: 3_000), receipt)
+        XCTAssertEqual(library.state.screens.first?.revision, edited.revision)
+        try library.activateCatalog(binding: binding)
+        let backup = try XCTUnwrap(library.catalogQueue?.entries.first { $0.revision == edited.revision })
+        let exported = try library.exportCatalogIntent(backup, binding: binding).package
+        let manifestFile = try XCTUnwrap(exported.files.first { $0.path == "manifest.json" })
+        let oldManifestFile = try XCTUnwrap(package.files.first { $0.path == "manifest.json" })
+        func decodeManifest(_ file: CatalogPackageFile) throws -> DashboardManifest {
+            try JSONDecoder().decode(DashboardManifest.self, from: XCTUnwrap(Data(base64Encoded: file.contentBase64)))
+        }
+        let old = try decodeManifest(oldManifestFile)
+        let new = try decodeManifest(manifestFile)
+        XCTAssertEqual(new.connections, old.connections)
+        XCTAssertEqual(new.dashboardId, old.dashboardId)
+        XCTAssertEqual(new.revision, old.revision)
+        for file in package.files where file.path != "index.html" && file.path != "manifest.json" {
+            XCTAssertEqual(exported.files.first { $0.path == file.path }, file)
+        }
+
+        if let removedPath {
+            let newerRequest = try makeRequest(edited)
+            try library.prepareAuthoringRequest(newerRequest, text: newerRequest.context.userRequest, screen: nil)
+            XCTAssertThrowsError(try library.applyAuthoringResult(makeResult(newerRequest, excluding: removedPath), now: 4_000))
+            XCTAssertEqual(library.state.screens.first?.revision, edited.revision)
+            let removal = try library.applyAuthoringResult(makeResult(newerRequest, excluding: removedPath, deletedPaths: [removedPath]), now: 5_000)
+            XCTAssertEqual(removal.status, "applied", removal.message ?? "")
+            let updated = try XCTUnwrap(library.state.screens.first)
+            XCTAssertFalse(updated.packagePaths.contains(removedPath))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent(updated.revision).appendingPathComponent(removedPath).path))
+        }
     }
 
     @MainActor func testCatalogImportPersistsIdentityExcludesHiddenAndAllowsReaddingAfterRemoval() throws {

@@ -2,6 +2,32 @@
 import Foundation
 import CryptoKit
 
+public struct CatalogAssetFile: Codable, Sendable, Equatable {
+    public var path: String
+    public var mediaType: String
+    public var byteLength: Int
+    public var digest: String
+
+    public init(path: String, mediaType: String, byteLength: Int, digest: String) {
+        self.path = path
+        self.mediaType = mediaType
+        self.byteLength = byteLength
+        self.digest = digest
+    }
+}
+
+public struct CatalogAssetManifest: Codable, Sendable, Equatable {
+    public var schemaVersion: Int
+    public var screen: CatalogPackageScreen
+    public var files: [CatalogAssetFile]
+
+    public init(schemaVersion: Int, screen: CatalogPackageScreen, files: [CatalogAssetFile]) {
+        self.schemaVersion = schemaVersion
+        self.screen = screen
+        self.files = files
+    }
+}
+
 public struct CatalogObjectDeclaration: Codable, Sendable, Equatable {
     public var byteLength: Int
     public var digest: String
@@ -165,13 +191,15 @@ public struct CatalogCapability: Codable, Sendable, Equatable {
     public var feature: String
     public var entitlement: CatalogEntitlement
     public var previewBackfillVersion: String?
+    public var assetBackupVersion: String?
     public var previewMediaTypes: [String]
-    public init(version: String = "1", feature: String = "catalog-backup-v1", entitlement: CatalogEntitlement, previewMediaTypes: [String], previewBackfillVersion: String? = nil) {
+    public init(version: String = "1", feature: String = "catalog-backup-v1", entitlement: CatalogEntitlement, previewMediaTypes: [String], previewBackfillVersion: String? = nil, assetBackupVersion: String? = nil) {
         self.version = version
         self.feature = feature
         self.entitlement = entitlement
         self.previewMediaTypes = previewMediaTypes
         self.previewBackfillVersion = previewBackfillVersion
+        self.assetBackupVersion = assetBackupVersion
     }
 }
 
@@ -221,13 +249,14 @@ public struct CatalogVersion: Codable, Sendable, Equatable {
     public var sourceAppliedAt: String
     public var backedUpAt: String
     public var packageSchema: Int
+    public var packageStorage: String?
     public var packageDigest: String
     public var sizeBytes: Int
     public var deviceDisplayName: String
     public var integrity: String?
     public var deviceLinked: Bool
     public var preview: CatalogPreview
-    public init(versionID: String, catalogScreenID: String, displayVersion: Int, sourceRevisionID: String, parentRevisionIDs: [String], copyID: String, commitCounter: Int, screenName: String, versionName: String? = nil, note: String? = nil, sourceAppliedAt: String, backedUpAt: String, packageSchema: Int = 1, packageDigest: String, sizeBytes: Int, deviceDisplayName: String, deviceLinked: Bool, preview: CatalogPreview, integrity: String? = nil) {
+    public init(versionID: String, catalogScreenID: String, displayVersion: Int, sourceRevisionID: String, parentRevisionIDs: [String], copyID: String, commitCounter: Int, screenName: String, versionName: String? = nil, note: String? = nil, sourceAppliedAt: String, backedUpAt: String, packageSchema: Int = 1, packageDigest: String, sizeBytes: Int, deviceDisplayName: String, deviceLinked: Bool, preview: CatalogPreview, integrity: String? = nil, packageStorage: String? = nil) {
         self.versionID = versionID
         self.catalogScreenID = catalogScreenID
         self.displayVersion = displayVersion
@@ -241,6 +270,7 @@ public struct CatalogVersion: Codable, Sendable, Equatable {
         self.sourceAppliedAt = sourceAppliedAt
         self.backedUpAt = backedUpAt
         self.packageSchema = packageSchema
+        self.packageStorage = packageStorage
         self.packageDigest = packageDigest
         self.sizeBytes = sizeBytes
         self.deviceDisplayName = deviceDisplayName
@@ -340,6 +370,10 @@ public enum CatalogContract {
     public static let uploadsPath = "/api/catalog/backups/"
     public static let operationsPath = "/api/catalog/backups/operations/"
     public static let packageBytes = 10 * 1024 * 1024
+    public static let assetBackupVersion = "1"
+    public static let assetManifestBytes = 256 * 1024
+    public static let assetChunkBytes = 512 * 1024
+    public static let assetFileCount = 512
     public static let previewBytes = 512 * 1024
     public static let previewDimension = 2048
     public static let queueRevisions = 100
@@ -411,12 +445,12 @@ public enum CatalogContract {
 }
 
 extension CatalogContract {
-    public static func validateBegin(_ value: CatalogBeginBackup) throws {
+    public static func validateBegin(_ value: CatalogBeginBackup, assetManifest: Bool = false) throws {
         func id(_ value: String) -> Bool { value.range(of: "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$", options: .regularExpression) != nil }
         func reject() throws { throw ValidationError.invalid("begin metadata") }
         guard value.schemaVersion == 1, [value.operationID,value.libraryID,value.localScreenID,value.sourceRevisionID].allSatisfy(id), value.commitCounter > 0, value.commitCounter <= 9_007_199_254_740_991, ["applied","seed"].contains(value.origin), !value.screenName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, value.screenName.utf16.count <= 100, value.parentRevisionIDs.count <= 8, value.parentRevisionIDs.allSatisfy(id), Set(value.parentRevisionIDs).count == value.parentRevisionIDs.count, !value.parentRevisionIDs.contains(value.sourceRevisionID) else { return try reject() }
         let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.timeZone = TimeZone(secondsFromGMT: 0); f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"; f.isLenient = false
-        guard let date = f.date(from: value.sourceAppliedAt), timestamp(date) == value.sourceAppliedAt, value.package.byteLength > 0, value.package.byteLength <= packageBytes, value.package.digest.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil else { return try reject() }
+        guard let date = f.date(from: value.sourceAppliedAt), timestamp(date) == value.sourceAppliedAt, value.package.byteLength > 0, value.package.byteLength <= (assetManifest ? 9_007_199_254_740_991 : packageBytes), value.package.digest.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil else { return try reject() }
         if let previous = value.predecessorRevisionID, !id(previous) || !value.parentRevisionIDs.contains(previous) || previous == value.sourceRevisionID { return try reject() }
         if let label = value.versionName, label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || label.utf16.count > 100 { return try reject() }
         if let note = value.note, note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || note.utf16.count > 1000 { return try reject() }
@@ -445,7 +479,8 @@ public struct CatalogPreviewCandidate: Codable, Sendable, Equatable {
     public var sourceRevisionID: String
     public var packageDigest: String
     public var packageBytes: Int
-    public init(catalogScreenID: String, versionID: String, libraryID: String, localScreenID: String, sourceRevisionID: String, packageDigest: String, packageBytes: Int) {
+    public var packageStorage: String?
+    public init(catalogScreenID: String, versionID: String, libraryID: String, localScreenID: String, sourceRevisionID: String, packageDigest: String, packageBytes: Int, packageStorage: String? = nil) {
         self.catalogScreenID = catalogScreenID
         self.versionID = versionID
         self.libraryID = libraryID
@@ -453,6 +488,7 @@ public struct CatalogPreviewCandidate: Codable, Sendable, Equatable {
         self.sourceRevisionID = sourceRevisionID
         self.packageDigest = packageDigest
         self.packageBytes = packageBytes
+        self.packageStorage = packageStorage
     }
 }
 
@@ -545,5 +581,51 @@ extension CatalogContract {
         if let restart = value.error?.restartOperation {
             guard restart, value.state == "failed", value.error?.code == "retry_later" else { throw ValidationError.invalid("restart requires failed expired preview") }
         }
+    }
+}
+
+extension CatalogContract {
+    @discardableResult
+    public static func validateAssetManifest(_ manifest: CatalogAssetManifest) throws -> Int {
+        let screen = manifest.screen
+        guard [1, 2].contains(manifest.schemaVersion), screen.entry == "index.html",
+              !screen.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, screen.title.utf16.count <= 100,
+              (1...assetFileCount).contains(manifest.files.count),
+              screen.requiredAssets.count <= assetFileCount, Set(screen.requiredAssets).count == screen.requiredAssets.count,
+              screen.externalDependencies.count <= assetFileCount, Set(screen.externalDependencies).count == screen.externalDependencies.count,
+              screen.externalDependencies.allSatisfy({ dependency in
+                  guard dependency.utf16.count <= 160, let url = URLComponents(string: dependency),
+                        let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
+                        let host = url.host, !host.isEmpty else { return false }
+                  return (url.user ?? "").isEmpty && (url.password ?? "").isEmpty
+              }) else { throw ValidationError.invalid("asset manifest metadata") }
+
+        let emptyDigest = digest(Data())
+        var previous = ""
+        var total = 0
+        var paths = Set<String>()
+        var folded = Set<String>()
+        var lengthsByDigest: [String: Int] = [:]
+        for file in manifest.files {
+            guard safePath(file.path), file.path > previous, folded.insert(file.path.lowercased()).inserted,
+                  !containsCredentials(path: file.path, content: ""),
+                  file.digest.utf8.count == 64, file.digest.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil,
+                  (0...9_007_199_254_740_991).contains(file.byteLength),
+                  file.byteLength > 0 || file.digest == emptyDigest,
+                  file.mediaType.range(of: #"\A[a-z0-9][a-z0-9.+_-]{0,62}/[a-z0-9][a-z0-9.+_-]{0,62}\z"#, options: .regularExpression) != nil,
+                  file.path != "index.html" || file.mediaType == "text/html",
+                  (lengthsByDigest[file.digest] ?? file.byteLength) == file.byteLength
+            else { throw ValidationError.invalid("asset declaration") }
+            previous = file.path
+            paths.insert(file.path)
+            lengthsByDigest[file.digest] = file.byteLength
+            total += file.byteLength
+            guard total <= 9_007_199_254_740_991 else { throw ValidationError.invalid("asset manifest length") }
+        }
+        guard total > 0, paths.contains("index.html"), Set(screen.requiredAssets).isSubset(of: paths),
+              try canonical(manifest).count <= assetManifestBytes else {
+            throw ValidationError.invalid("asset manifest bounds")
+        }
+        return total
     }
 }
