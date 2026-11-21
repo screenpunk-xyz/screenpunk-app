@@ -1183,6 +1183,7 @@ private struct ScreenDataAccessSettings: View {
 }
 
 private enum ScreenSettingsRoute: Hashable {
+    case instructions(owner: String)
     case screen(String, owner: String)
     case shared(DeviceSettingsPage)
     case custom(String, alias: String, owner: String)
@@ -1306,11 +1307,10 @@ struct DeviceSettingsView: View {
                     row(.account)
                 }
                 Section("Device") { row(.display); row(.screens) }
-                Section("Shared Connections") {
-                    row(.home)
-                    row(.calendar)
-                    row(.television)
-                    row(.customConnections)
+                if !usedSharedProviders.isEmpty {
+                    Section("Shared Connections") {
+                        ForEach(usedSharedProviders, id: \.self) { row($0) }
+                    }
                 }
                 Section("Help") { row(.overview); row(.guidedAccess) }
             }
@@ -1343,6 +1343,14 @@ struct DeviceSettingsView: View {
 
     @ViewBuilder private func destination(_ route: ScreenSettingsRoute) -> some View {
         switch route {
+        case let .instructions(owner):
+            if owner == model.permissionOwner {
+                Form {
+                    Button("Open screen") { model.selectScreen(ScreenLibrary.instructionsID) }
+                        .disabled(model.needsAgentSetup || model.hiddenScreenIDs.contains(ScreenLibrary.instructionsID) || model.accountOperationInProgress)
+                }
+                .navigationTitle("Add a screen")
+            } else { Text("Screen unavailable") }
         case let .screen(id, owner):
             if owner == model.permissionOwner, let saved = model.installedScreens.first(where: { $0.id == id }) {
                 screenDetails(saved, owner: owner)
@@ -1358,6 +1366,15 @@ struct DeviceSettingsView: View {
             else { Text("Connection unavailable") }
         }
     }
+    private var usedSharedProviders: [DeviceSettingsPage] {
+        var pages: [DeviceSettingsPage] = []
+        if !model.manifests(requiring: ["home"]).isEmpty { pages.append(.home) }
+        if !model.manifests(requiring: ["googleCalendar", "google-calendar"]).isEmpty { pages.append(.calendar) }
+        if !model.manifests(requiring: ["googleTV"]).isEmpty { pages.append(.television) }
+        if !model.customConnectionUses().isEmpty { pages.append(.customConnections) }
+        return pages
+    }
+
     private func row(_ page: DeviceSettingsPage) -> some View {
         NavigationLink(value: page) { Label(page.rawValue, systemImage: page.symbol) }
     }
@@ -1423,44 +1440,15 @@ struct DeviceSettingsView: View {
                 }
                 Section("On this device") {
                     let instructionOwner = model.permissionOwner
-                    HStack {
-                        Button(model.needsAgentSetup ? "Connect an agent" : "Add a screen") { model.selectScreen(ScreenLibrary.instructionsID) }
-                            .buttonStyle(.borderless)
-                            .disabled(model.needsAgentSetup || model.hiddenScreenIDs.contains(ScreenLibrary.instructionsID) || model.accountOperationInProgress)
-                        Spacer()
-                        Color.clear.frame(width: 44, height: 44)
-                            .padding(.trailing, 12)
-                            .accessibilityHidden(true)
-                            .allowsHitTesting(false)
-                        Toggle("Show", isOn: Binding(
-                            get: { !model.hiddenScreenIDs.contains(ScreenLibrary.instructionsID) },
-                            set: { model.setScreenShown($0, id: ScreenLibrary.instructionsID, owner: instructionOwner) }
-                        ))
-                        .fixedSize().accessibilityLabel("Show Add a screen")
-                        .disabled(instructionOwner.isEmpty || model.accountOperationInProgress || model.needsAgentSetup ||
-                                  (!model.hiddenScreenIDs.contains(ScreenLibrary.instructionsID) && !model.canHideInstructions))
-                    }
+                    screenSettingsRow(model.needsAgentSetup ? "Connect an agent" : "Add a screen",
+                                      id: ScreenLibrary.instructionsID, owner: instructionOwner,
+                                      route: .instructions(owner: instructionOwner),
+                                      toggleDisabled: model.needsAgentSetup ||
+                                        (!model.hiddenScreenIDs.contains(ScreenLibrary.instructionsID) && !model.canHideInstructions))
                     ForEach(model.needsAgentSetup ? [] : model.installedScreens) { saved in
                         let owner = model.permissionOwner
-                        HStack {
-                            Button {
-                                path.append(.screen(saved.id, owner: owner))
-                            } label: {
-                                HStack {
-                                    Text(saved.displayName)
-                                    if saved.id == model.screen?.id { Image(systemName: "checkmark") }
-                                    Spacer()
-                                    Image(systemName: "chevron.right").foregroundStyle(.secondary)
-                                }.frame(minHeight: 44).contentShape(Rectangle())
-                            }.buttonStyle(.borderless)
-                            Toggle("Show", isOn: Binding(
-                                get: { !model.hiddenScreenIDs.contains(saved.id) },
-                                set: { model.setScreenShown($0, id: saved.id, owner: owner) }
-                            ))
-                            .fixedSize()
-                            .accessibilityLabel("Show \(saved.displayName)")
-                            .disabled(owner.isEmpty || model.accountOperationInProgress)
-                        }
+                        screenSettingsRow(saved.displayName, id: saved.id, owner: owner,
+                                          route: .screen(saved.id, owner: owner))
                         if let issue = model.presentedManifestIssue(saved) {
                             DismissibleMessage(issue, color: .orange, onDismiss: { model.dismissManifestIssue(issue, saved: saved) }).id(saved.revision).font(.caption)
                         }
@@ -1471,6 +1459,34 @@ struct DeviceSettingsView: View {
             customConnections
         case .home, .television, .calendar:
             sharedProvider(selection ?? .home)
+        }
+    }
+
+    private func screenSettingsRow(_ title: String, id: String, owner: String, route: ScreenSettingsRoute,
+                                   toggleDisabled: Bool = false) -> some View {
+        HStack {
+            Button {
+                path.append(route)
+            } label: {
+                HStack {
+                    Text(title)
+                    if id == model.screen?.id { Image(systemName: "checkmark") }
+                    Spacer(minLength: 0)
+                }
+                .frame(minHeight: 44).contentShape(Rectangle())
+            }
+            .buttonStyle(.borderless)
+            Toggle("Show", isOn: Binding(
+                get: { !model.hiddenScreenIDs.contains(id) },
+                set: { model.setScreenShown($0, id: id, owner: owner) }
+            ))
+            .fixedSize().accessibilityLabel("Show " + title)
+            .disabled(owner.isEmpty || model.accountOperationInProgress || toggleDisabled)
+            Button { path.append(route) } label: {
+                Image(systemName: "chevron.right").foregroundStyle(.secondary)
+                    .frame(width: 32, height: 44, alignment: .trailing).contentShape(Rectangle())
+            }
+            .buttonStyle(.borderless).accessibilityHidden(true)
         }
     }
 
@@ -1504,7 +1520,7 @@ struct DeviceSettingsView: View {
     private var customConnections: some View {
         let uses = model.customConnectionUses()
         let saved = model.savedCustomConnections
-        let serviceIDs = Set(uses.map { $0.declaration.id } + saved.map(\.id))
+        let serviceIDs = Set(uses.map { $0.declaration.id })
         return Form {
             if serviceIDs.isEmpty { Text("No custom connections on this device.").foregroundStyle(.secondary) }
             ForEach(serviceIDs.sorted(), id: \.self) { id in
