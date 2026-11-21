@@ -2,7 +2,8 @@
 export default {
   "schemaVersion": 2,
   "features": [
-    "asset-references-v2"
+    "asset-references-v2",
+    "package-assets-v2"
   ],
   "schemas": {
     "Request": {
@@ -746,25 +747,19 @@ export default {
             "path": {
               "type": "string",
               "minLength": 1,
-              "maxLength": 160,
-              "maxBytes": 160,
-              "pattern": "^[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)*\\.(?:html|css|js|json|svg|txt)$"
+              "maxLength": 512,
+              "maxBytes": 512,
+              "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]*(?:/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$"
             },
             "mediaType": {
               "type": "string",
-              "enum": [
-                "text/html",
-                "text/css",
-                "text/javascript",
-                "application/json",
-                "image/svg+xml",
-                "text/plain"
-              ]
+              "maxLength": 127,
+              "pattern": "^[a-z0-9][a-z0-9.+-]*/[a-z0-9][a-z0-9.+-]*$"
             },
             "byteLength": {
               "type": "integer",
               "minimum": 0,
-              "maximum": 204800
+              "maximum": 9007199254740991
             },
             "digest": {
               "type": "string",
@@ -814,8 +809,12 @@ export default {
               "items": {
                 "$ref": "#/$defs/SourceFile"
               },
-              "maxItems": 20,
+              "maxItems": 512,
               "minItems": 1
+            },
+            "packageSchema": {
+              "type": "integer",
+              "const": 3
             }
           },
           "required": [
@@ -836,9 +835,9 @@ export default {
                 "path": {
                   "type": "string",
                   "minLength": 1,
-                  "maxLength": 160,
-                  "maxBytes": 160,
-                  "pattern": "^[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)*\\.(?:html|css|js|json|svg|txt)$"
+                  "maxLength": 512,
+                  "maxBytes": 512,
+                  "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]*(?:/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$"
                 },
                 "content": {
                   "type": "string",
@@ -863,16 +862,16 @@ export default {
                 "path": {
                   "type": "string",
                   "minLength": 1,
-                  "maxLength": 160,
-                  "maxBytes": 160,
-                  "pattern": "^[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)*\\.(?:html|css|js|json|svg|txt)$"
+                  "maxLength": 512,
+                  "maxBytes": 512,
+                  "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]*(?:/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$"
                 },
                 "sourcePath": {
                   "type": "string",
                   "minLength": 1,
-                  "maxLength": 160,
-                  "maxBytes": 160,
-                  "pattern": "^[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)*\\.(?:html|css|js|json|svg|txt)$"
+                  "maxLength": 512,
+                  "maxBytes": 512,
+                  "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]*(?:/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$"
                 },
                 "reference": {
                   "type": "string",
@@ -916,31 +915,31 @@ export default {
             "files": {
               "type": "array",
               "minItems": 1,
-              "maxItems": 20,
+              "maxItems": 512,
               "items": {
                 "$ref": "#/$defs/FileMutation"
               }
             },
             "deletedPaths": {
               "type": "array",
-              "maxItems": 20,
+              "maxItems": 512,
               "items": {
                 "type": "string",
                 "minLength": 1,
-                "maxLength": 160,
-                "maxBytes": 160,
-                "pattern": "^[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)*\\.(?:html|css|js|json|svg|txt)$"
+                "maxLength": 512,
+                "maxBytes": 512,
+                "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]*(?:/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$"
               }
             },
             "requiredAssets": {
               "type": "array",
-              "maxItems": 20,
+              "maxItems": 512,
               "items": {
                 "type": "string",
                 "minLength": 1,
-                "maxLength": 160,
-                "maxBytes": 160,
-                "pattern": "^[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)*\\.(?:html|css|js|json|svg|txt)$"
+                "maxLength": 512,
+                "maxBytes": 512,
+                "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]*(?:/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$"
               }
             }
           },
@@ -1695,25 +1694,19 @@ export default {
             "path": {
               "type": "string",
               "minLength": 1,
-              "maxLength": 160,
-              "maxBytes": 160,
-              "pattern": "^[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)*\\.(?:html|css|js|json|svg|txt)$"
+              "maxLength": 512,
+              "maxBytes": 512,
+              "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]*(?:/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$"
             },
             "mediaType": {
               "type": "string",
-              "enum": [
-                "text/html",
-                "text/css",
-                "text/javascript",
-                "application/json",
-                "image/svg+xml",
-                "text/plain"
-              ]
+              "maxLength": 127,
+              "pattern": "^[a-z0-9][a-z0-9.+-]*/[a-z0-9][a-z0-9.+-]*$"
             },
             "byteLength": {
               "type": "integer",
               "minimum": 0,
-              "maximum": 204800
+              "maximum": 9007199254740991
             },
             "digest": {
               "type": "string",
@@ -1763,8 +1756,12 @@ export default {
               "items": {
                 "$ref": "#/$defs/SourceFile"
               },
-              "maxItems": 20,
+              "maxItems": 512,
               "minItems": 1
+            },
+            "packageSchema": {
+              "type": "integer",
+              "const": 3
             }
           },
           "required": [
@@ -1785,9 +1782,9 @@ export default {
                 "path": {
                   "type": "string",
                   "minLength": 1,
-                  "maxLength": 160,
-                  "maxBytes": 160,
-                  "pattern": "^[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)*\\.(?:html|css|js|json|svg|txt)$"
+                  "maxLength": 512,
+                  "maxBytes": 512,
+                  "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]*(?:/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$"
                 },
                 "content": {
                   "type": "string",
@@ -1812,16 +1809,16 @@ export default {
                 "path": {
                   "type": "string",
                   "minLength": 1,
-                  "maxLength": 160,
-                  "maxBytes": 160,
-                  "pattern": "^[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)*\\.(?:html|css|js|json|svg|txt)$"
+                  "maxLength": 512,
+                  "maxBytes": 512,
+                  "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]*(?:/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$"
                 },
                 "sourcePath": {
                   "type": "string",
                   "minLength": 1,
-                  "maxLength": 160,
-                  "maxBytes": 160,
-                  "pattern": "^[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)*\\.(?:html|css|js|json|svg|txt)$"
+                  "maxLength": 512,
+                  "maxBytes": 512,
+                  "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]*(?:/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$"
                 },
                 "reference": {
                   "type": "string",
@@ -1865,31 +1862,31 @@ export default {
             "files": {
               "type": "array",
               "minItems": 1,
-              "maxItems": 20,
+              "maxItems": 512,
               "items": {
                 "$ref": "#/$defs/FileMutation"
               }
             },
             "deletedPaths": {
               "type": "array",
-              "maxItems": 20,
+              "maxItems": 512,
               "items": {
                 "type": "string",
                 "minLength": 1,
-                "maxLength": 160,
-                "maxBytes": 160,
-                "pattern": "^[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)*\\.(?:html|css|js|json|svg|txt)$"
+                "maxLength": 512,
+                "maxBytes": 512,
+                "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]*(?:/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$"
               }
             },
             "requiredAssets": {
               "type": "array",
-              "maxItems": 20,
+              "maxItems": 512,
               "items": {
                 "type": "string",
                 "minLength": 1,
-                "maxLength": 160,
-                "maxBytes": 160,
-                "pattern": "^[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)*\\.(?:html|css|js|json|svg|txt)$"
+                "maxLength": 512,
+                "maxBytes": 512,
+                "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]*(?:/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$"
               }
             }
           },

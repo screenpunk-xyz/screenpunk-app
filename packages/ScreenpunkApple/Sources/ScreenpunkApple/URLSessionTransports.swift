@@ -19,7 +19,7 @@ public final class URLSessionHTTPTransport: HTTPTransport, @unchecked Sendable {
     private let session: URLSession
     private let delegate: RedirectDenyingDelegate
 
-    public init(bounds: HTTPAdapterBounds = .production) {
+    public init(bounds: HTTPAdapterBounds = .production, privateRequests: Bool = false) {
         self.bounds = bounds
         let delegate = RedirectDenyingDelegate()
         self.delegate = delegate
@@ -29,6 +29,11 @@ public final class URLSessionHTTPTransport: HTTPTransport, @unchecked Sendable {
         configuration.httpShouldSetCookies = false
         configuration.httpCookieAcceptPolicy = .never
         configuration.httpMaximumConnectionsPerHost = 2
+        if privateRequests {
+            configuration.urlCache = nil
+            configuration.urlCredentialStorage = nil
+            configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        }
         self.session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
     }
 

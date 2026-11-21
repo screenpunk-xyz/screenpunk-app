@@ -16,7 +16,7 @@ export interface DurablePreferenceAuthorizationV1 { requestID: string; quote: st
 export interface AuthoringRequestV1 { schemaVersion: 1; requestID: string; createdAt: number; deadlineAt: number; designGuidance: AuthoringDesignGuidanceV1; runtime: AuthoringRuntimeV1; services: AuthoringServiceV1[]; preferences: PreferenceRecordV1[]; context: { profileID: string; deviceID: string; screenID: string; baseRevision: string | null; userRequest: string; currentScreen?: AuthoringScreen; viewport: { width: number; height: number; scale: number; orientation: "portrait" | "landscape" } }; delivery: { route: "cloud" | "fixture" | "local"; contractVersion: "1"; snapshotDigest: string } }
 export interface AuthoringResultV1 { schemaVersion: 1; requestID: string; inputDigest: string; baseRevision: string | null; preferenceRevisions: Record<string, number>; operationID: string; screen?: AuthoringScreen; answer?: string; preferenceMutations?: PreferenceMutationV1[]; durablePreferenceAuthorization?: DurablePreferenceAuthorizationV1 }
 export interface ApplicationReceiptV1 { schemaVersion: 1; requestID: string; operationID: string; inputDigest: string; status: "applied" | "conflict" | "rejected"; appliedAt: number; message?: string }
-export interface AuthoringDefinitionV1 { schemaVersion: 1; designGuidance: AuthoringDesignGuidanceV1; runtime: AuthoringRuntimeV1; browser: {designGuidance: AuthoringDesignGuidanceV1; runtime: AuthoringRuntimeV1}; serviceCatalog: AuthoringServiceDefinitionV1[]; schemas: Record<"Request" | "Result" | "Preference" | "Receipt", JSONSchema>; screenData: { version: 1; features: string[]; rules: string[]; manifestSchema: JSONSchema } }
+export interface AuthoringDefinitionV1 { schemaVersion: 1; designGuidance: AuthoringDesignGuidanceV1; runtime: AuthoringRuntimeV1; browser: {designGuidance: AuthoringDesignGuidanceV1; runtime: AuthoringRuntimeV1}; serviceCatalog: AuthoringServiceDefinitionV1[]; schemas: Record<"Request" | "Result" | "Preference" | "Receipt", JSONSchema>; screenData: { version: 1; features: string[]; rules: string[]; manifestSchema: JSONSchema }; customHTTP: { rules: string[] } }
 const baseDefinition = definition as unknown as AuthoringDefinitionV1;
 function deepFreeze<T>(value: T): T {
   if (value !== null && typeof value === "object") { for (const item of Object.values(value)) deepFreeze(item); Object.freeze(value); }
@@ -33,13 +33,13 @@ export function browserAuthoringDesignGuidance(): AuthoringDesignGuidanceV1 {
 function isBrowserRuntime(runtime: AuthoringRuntimeV1): boolean {
   return canonicalJSON(runtime) === canonicalJSON(AUTHORING_DEFINITION.browser.runtime);
 }
-export function authoringRuntime(supportsScreenData: boolean): AuthoringRuntimeV1 {
+export function authoringRuntime(supportsScreenData: boolean, supportsCustomHTTP = false): AuthoringRuntimeV1 {
   const { runtime, screenData } = AUTHORING_DEFINITION;
-  return { ...runtime, features: [...runtime.features, ...(supportsScreenData ? screenData.features : [])] };
+  return { ...runtime, features: [...runtime.features, ...(supportsScreenData ? screenData.features : []), ...(supportsCustomHTTP ? [CUSTOM_HTTP_FEATURE] : [])] };
 }
-export function authoringDesignGuidance(supportsScreenData: boolean): AuthoringDesignGuidanceV1 {
+export function authoringDesignGuidance(supportsScreenData: boolean, supportsCustomHTTP = false): AuthoringDesignGuidanceV1 {
   const { designGuidance, screenData } = AUTHORING_DEFINITION;
-  return { ...designGuidance, rules: [...designGuidance.rules, ...(supportsScreenData ? screenData.rules : [])] };
+  return { ...designGuidance, rules: [...designGuidance.rules, ...(supportsScreenData ? screenData.rules : []), ...(supportsCustomHTTP ? AUTHORING_DEFINITION.customHTTP.rules : [])] };
 }
 function inlineSchema(schema: JSONSchema, defs: JSONSchema = schema.$defs): JSONSchema {
   if (schema.$ref) return inlineSchema(defs[schema.$ref.split("/").pop()!], defs);
@@ -127,7 +127,100 @@ function screenBounds(screen: AuthoringScreen): void {
   const manifest = screen.files.find(f => f.path === "manifest.json");
   if (manifest) checkAuthoringManifestScreenData(manifest.content);
 }
-export function checkAuthoringManifestScreenData(content: string, previous?: string, supportsScreenData = true): void {
+export const CUSTOM_HTTP_FEATURE = "custom-http-v1";
+const customReservedAliases = new Set(["home", "googletv", "googlecalendar", "applemaps"]);
+const customReservedParameters = new Set([
+  "authorization", "x-api-key", "token", "password", "access_token", "api_key", "apikey", "secret",
+  "path", "url", "host", "origin", "method", "headers", "scheme", "port"
+]);
+const customName = (value: unknown) => typeof value === "string" && /^[A-Za-z][A-Za-z0-9_-]{0,63}$/u.test(value) && !/\s/u.test(value);
+const customText = (value: unknown, max: number): value is string =>
+  typeof value === "string" && value.trim().length > 0 && utf8(value) <= max && !/[\p{Cc}\p{Cf}]/u.test(value);
+const customPath = (value: unknown): boolean => typeof value === "string" && (
+  value === "/" || (
+    value.length <= 512 && value.startsWith("/") &&
+    value.slice(1).split("/").every(part => part.length > 0 && part.length <= 256 && part !== "." && part !== ".." && !/[^A-Za-z0-9._~-]/u.test(part))
+  )
+);
+
+function checkCustomHTTPManifest(content: string, previous: string | undefined, supported: boolean): void {
+  const path = "$.screen.files.manifest.json";
+  const reject = () => fail("invalid custom HTTP declaration", path);
+  function object(value: unknown, required: string[], optional: string[] = []): Record<string, any> {
+    if (!plain(value) || !required.every(key => Object.hasOwn(value, key)) ||
+        !Object.keys(value).every(key => required.includes(key) || optional.includes(key))) return reject();
+    return value;
+  }
+  function checkType(value: Record<string, any>, fields: boolean): void {
+    if (value.type === "choice") {
+      if (!Array.isArray(value.options) || value.options.length < 1 || value.options.length > 32 ||
+          new Set(value.options).size !== value.options.length || !value.options.every(option => customText(option, 128))) reject();
+    } else {
+      const types = fields ? ["text", "number", "toggle", "url", "secret"] : ["text", "number", "toggle"];
+      if (!types.includes(value.type) || Object.hasOwn(value, "options")) reject();
+    }
+  }
+  function declarations(source: string): Record<string, any>[] {
+    const manifest: unknown = JSON.parse(source);
+    if (!plain(manifest) || !Array.isArray(manifest.connections)) return [];
+    const custom = manifest.connections.filter(value => plain(value) && Object.hasOwn(value, "customHTTP"));
+    if (custom.length > 8) reject();
+    const ids = new Set<string>();
+    for (const value of custom) {
+      const connection = object(value, ["alias", "required", "customHTTP"]);
+      if (!customName(connection.alias) || customReservedAliases.has(connection.alias.toLowerCase()) ||
+          typeof connection.required !== "boolean" || manifest.connections.filter(other =>
+            plain(other) && typeof other.alias === "string" && other.alias.toLowerCase() === connection.alias.toLowerCase()
+          ).length !== 1) reject();
+      const declaration = object(connection.customHTTP, ["id", "version", "label", "fields", "originField", "operations"], ["auth"]);
+      if (typeof declaration.id !== "string" || declaration.id.length > 64 ||
+          !/^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/u.test(declaration.id) || /\s/u.test(declaration.id) || ids.has(declaration.id) ||
+          !Number.isSafeInteger(declaration.version) || declaration.version < 1 || declaration.version > 2147483647 ||
+          !customText(declaration.label, 96) || !Array.isArray(declaration.fields) || declaration.fields.length < 1 || declaration.fields.length > 12 ||
+          !Array.isArray(declaration.operations) || declaration.operations.length < 1 || declaration.operations.length > 16) reject();
+      ids.add(declaration.id);
+      const fields = new Map<string, Record<string, any>>();
+      for (const raw of declaration.fields) {
+        const field = object(raw, ["id", "label", "type"], ["options"]);
+        if (!customName(field.id) || !customText(field.label, 96) || fields.has(field.id)) reject();
+        checkType(field, true);
+        fields.set(field.id, field);
+      }
+      const origin = [...fields.values()].filter(field => field.type === "url");
+      const secrets = [...fields.values()].filter(field => field.type === "secret");
+      if (origin.length !== 1 || origin[0].id !== declaration.originField) reject();
+      if (Object.hasOwn(declaration, "auth")) {
+        const auth = object(declaration.auth, ["mode", "field"]);
+        if (auth.mode !== "bearer" || secrets.length !== 1 || secrets[0].id !== auth.field) reject();
+      } else if (secrets.length) reject();
+      const names = new Set<string>();
+      for (const raw of declaration.operations) {
+        const operation = object(raw, ["name", "method", "path", "response", "parameters"]);
+        if (!customName(operation.name) || names.has(operation.name) || operation.method !== "GET" ||
+            operation.response !== "json" || !customPath(operation.path) || !plain(operation.parameters) ||
+            Object.keys(operation.parameters).length > 12) reject();
+        names.add(operation.name);
+        for (const [name, rawParameter] of Object.entries(operation.parameters)) {
+          if (!customName(name) || customReservedParameters.has(name.toLowerCase())) reject();
+          const parameter = object(rawParameter, ["type"], ["options", "field"]);
+          checkType(parameter, false);
+          if (Object.hasOwn(parameter, "field")) {
+            const field = fields.get(parameter.field);
+            if (!field || field.type !== parameter.type ||
+                canonicalJSON(field.options ?? null) !== canonicalJSON(parameter.options ?? null)) reject();
+          }
+        }
+      }
+    }
+    return custom;
+  }
+  const current = declarations(content);
+  if (!supported && current.length && canonicalJSON(current) !== canonicalJSON(previous === undefined ? [] : declarations(previous))) {
+    fail("target runtime does not advertise custom HTTP", path);
+  }
+}
+
+export function checkAuthoringManifestScreenData(content: string, previous?: string, supportsScreenData = true, supportsCustomHTTP = true): void {
   const read = (source: string) => {
     try { return validateManifestScreenData(source); } catch { return fail("invalid manifest or screenData declaration", "$.screen.files.manifest.json"); }
   };
@@ -135,6 +228,7 @@ export function checkAuthoringManifestScreenData(content: string, previous?: str
   if (current && !supportsScreenData && canonicalJSON(current) !== canonicalJSON((previous === undefined ? undefined : read(previous)) ?? null)) {
     fail("target runtime does not advertise screen data", "$.screen.files.manifest.json");
   }
+  checkCustomHTTPManifest(content, previous, supportsCustomHTTP);
 }
 export function makeAuthoringServices(observedAt: number): AuthoringServiceV1[] {
   return AUTHORING_DEFINITION.serviceCatalog.map(service => ({id:service.id,provider:service.provider,operations:structuredClone(service.operations),supported:{state:"yes",observedAt},configured:{state:service.provider === "googleCalendar" ? "no" : "unknown",observedAt},authorized:{state:"unknown",observedAt},entitled:{state:"unknown",observedAt},reachable:{state:"unknown",observedAt}}));
@@ -144,10 +238,11 @@ export function validateAuthoringRequest(value: unknown): AuthoringRequestV1 {
   validate("Request", value); const request = value as AuthoringRequestV1;
   if (request.deadlineAt <= request.createdAt) fail("deadline must follow creation");
   const runtime = canonicalJSON(request.runtime);
-  const screenData = runtime === canonicalJSON(authoringRuntime(true));
+  const screenData = AUTHORING_DEFINITION.screenData.features.every(feature => request.runtime.features.includes(feature));
+  const customHTTP = request.runtime.features.includes(CUSTOM_HTTP_FEATURE);
   const browser = isBrowserRuntime(request.runtime);
-  const expectedRuntime = browser ? browserAuthoringRuntime() : authoringRuntime(screenData);
-  const expectedGuidance = browser ? browserAuthoringDesignGuidance() : authoringDesignGuidance(screenData);
+  const expectedRuntime = browser ? browserAuthoringRuntime() : authoringRuntime(screenData, customHTTP);
+  const expectedGuidance = browser ? browserAuthoringDesignGuidance() : authoringDesignGuidance(screenData, customHTTP);
   if (runtime !== canonicalJSON(expectedRuntime) || canonicalJSON(request.designGuidance) !== canonicalJSON(expectedGuidance)) fail("unsupported guidance/runtime definition");
   if (browser && (request.services.length || request.preferences.length)) fail("browser runtime requires empty services and preferences");
   const seen = new Set<string>();
@@ -189,7 +284,7 @@ export function validateAuthoringResult(value: unknown, request?: AuthoringReque
     if (isBrowserRuntime(request.runtime) && mutations.length) fail("browser runtime does not support preference mutations");
     const manifest = result.screen?.files.find(f => f.path === "manifest.json");
     if (manifest) checkAuthoringManifestScreenData(manifest.content, request.context.currentScreen?.files.find(f => f.path === "manifest.json")?.content,
-      canonicalJSON(request.runtime) === canonicalJSON(authoringRuntime(true)));
+      AUTHORING_DEFINITION.screenData.features.every(feature => request.runtime.features.includes(feature)), request.runtime.features.includes(CUSTOM_HTTP_FEATURE));
     if (result.requestID !== request.requestID || result.inputDigest !== request.delivery.snapshotDigest || result.baseRevision !== request.context.baseRevision) fail("result is not bound to request snapshot");
     const revisions = Object.fromEntries(request.preferences.map(p => [p.id,p.revision]));
     if (canonicalJSON(revisions) !== canonicalJSON(result.preferenceRevisions)) fail("preference revisions differ from snapshot");

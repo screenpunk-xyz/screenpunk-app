@@ -30,10 +30,19 @@ import ScreenpunkCore
     var instructionsSelected: Bool { state.selectedID == Self.instructionsID || (state.selectedID == nil && isScreenShown(Self.instructionsID)) }
     func containsRotationScreen(_ id: String) -> Bool { id == Self.instructionsID || state.screens.contains { $0.id == id } }
 
-    struct Saved: Codable, Identifiable { let id: String; let revision: String; let artifact: ScreenArtifact }
-    struct State: Codable { var screens: [Saved] = []; var selectedID: String?; var previous: Saved?; var lastRequest: String?; var pendingID: String?; var pendingScreenID: String?; var consumedID: String?; var cancelledRequests: [String]?; var cancelIntents: [String]?; var lastInstruction: String?; var keyboardDrafts: [String: String]?; var submissionKey: String?; var submissionText: String?; var submissionScreen: ScreenArtifact?; var requestDeadline: Double?; var authoring: AuthoringStoreState?; var linkedProfile: LocalProfileDescriptor?; var localRequestIDs: Set<String>?; var bundledScreenSeeds: Set<String>?; var catalog: CatalogQueue?; var hiddenScreenIDs: Set<String>?; var onboarding: Onboarding?; var publicDataRevocations: Set<String>?; var screenDataGenerations: [String: String]?; var catalogScreenIDs: [String: Set<String>]? }
+    struct Saved: Codable, Identifiable {
+        let id: String; let revision: String; let artifact: ScreenArtifact
+        var catalogPackageSchema: Int? = nil
+        var catalogAssetPaths: [String]? = nil
+        var displayNameOverride: String? = nil
+        var displayName: String { displayNameOverride ?? artifact.title }
+        var packagePaths: [String] { catalogAssetPaths ?? artifact.files.map(\.path) }
+        var hasNativeAssets: Bool { catalogAssetPaths != nil || catalogPackageSchema == 2 }
+    }
+    struct State: Codable { var screens: [Saved] = []; var selectedID: String?; var previous: Saved?; var lastRequest: String?; var pendingID: String?; var pendingScreenID: String?; var consumedID: String?; var cancelledRequests: [String]?; var cancelIntents: [String]?; var lastInstruction: String?; var keyboardDrafts: [String: String]?; var submissionKey: String?; var submissionText: String?; var submissionScreen: ScreenArtifact?; var requestDeadline: Double?; var authoring: AuthoringStoreState?; var linkedProfile: LocalProfileDescriptor?; var localRequestIDs: Set<String>?; var bundledScreenSeeds: Set<String>?; var catalog: CatalogQueue?; var hiddenScreenIDs: Set<String>?; var onboarding: Onboarding?; var publicDataRevocations: Set<String>?; var screenDataGenerations: [String: String]?; var catalogScreenIDs: [String: Set<String>]?; var catalogLinks: [String: LinkedCatalogInstall]?; var catalogUnlinks: [LinkedCatalogInstall]?; var catalogLinkLibraryID: String?; var linkedEdits: [String: LinkedCatalogEdit]?; var linkedRollback: [String: Saved]?; var catalogForks: [String: CatalogForkPublication]?; var linkedConflictPins: [String: [String]]? }
     private(set) var state = State()
     var onCatalogRevisionCommitted: (() -> Void)?
+    var onCatalogLinksChanged: (() -> Void)?
     private let root: URL
     let screenDataArchive: DeviceScreenDataArchive
     private let screenDataLocalDeviceIds: Set<String>
@@ -44,6 +53,7 @@ import ScreenpunkCore
     private var catalogBackupValidUntil: Date?
     private var catalogConsentGeneration = UUID()
     private var catalogCapabilityChecked = false
+    private var activeCatalogRestoreDirectories = Set<String>()
     private var temporary: LocalTemporaryActivationController!
     private var journal: AuthoringJournal!
     init(accountID: String, rootDirectory: URL? = nil, permissionOwner: String? = nil, catalogDefaults: UserDefaults = .standard, journalFault: AuthoringJournal.Fault? = nil, onboardNewLibrary: Bool = false, screenDataLocalDeviceIds: Set<String> = []) throws {
@@ -102,7 +112,7 @@ import ScreenpunkCore
               let file = screen.artifact.files.first(where: { $0.path == "manifest.json" }),
               let manifest = try? JSONDecoder().decode(DashboardManifest.self, from: Data(file.content.utf8)),
               let declarations = manifest.screenData,
-              (try? PackageValidator.validate(manifest)) != nil else { return nil }
+              (try? PackageValidator.validate(manifest, maximumExpandedBytes: screen.catalogAssetPaths == nil ? PackageLimits.expandedBytes : nil)) != nil else { return nil }
         return .init(screen: screen, generation: generation, declarations: declarations)
     }
 
@@ -322,9 +332,298 @@ import ScreenpunkCore
             pruneUnusedRevisions()
         } catch { if !committing { try? FileManager.default.removeItem(at: directory) }; throw error }
     }
+    enum LinkedCatalogEditScope: String, Codable { case all, thisDevice }
+
+    struct LinkedCatalogInstall: Codable, Equatable {
+        let screenID: String
+        let catalogScreenID: String
+        let localScreenID: String
+        let libraryID: String
+        let binding: CatalogBinding
+        var versionID: String
+        var displayVersion: Int
+        var sourceRevisionID: String
+        var packageDigest: String
+        var localRevision: String
+        var commitCounter = 1
+        var copyID: String?
+        var registered: Bool { copyID != nil }
+        var pendingRevision: String?
+        var operationID: String?
+        var pendingAppliedAt: Int64?
+        var conflict = false
+        var discardAfterRefresh: Bool?
+
+        init(screenID: String, version: CatalogVersion, libraryID: String, binding: CatalogBinding, localRevision: String,
+             localScreenID: String? = nil) {
+            self.init(screenID: screenID, catalogScreenID: version.catalogScreenID, libraryID: libraryID,
+                binding: binding, localRevision: localRevision, localScreenID: localScreenID ?? screenID,
+                versionID: version.versionID, displayVersion: version.displayVersion,
+                sourceRevisionID: version.sourceRevisionID, packageDigest: version.packageDigest)
+        }
+
+        init(screenID: String, catalogScreenID: String, libraryID: String, binding: CatalogBinding,
+             localRevision: String, localScreenID: String, versionID: String, displayVersion: Int,
+             sourceRevisionID: String, packageDigest: String) {
+            self.screenID = screenID; self.catalogScreenID = catalogScreenID
+            self.localScreenID = localScreenID; self.libraryID = libraryID; self.binding = binding
+            self.versionID = versionID; self.displayVersion = displayVersion; self.sourceRevisionID = sourceRevisionID
+            self.packageDigest = packageDigest; self.localRevision = localRevision
+        }
+    }
+
+    struct CatalogForkPublication: Codable, Equatable {
+        let saved: Saved
+        let libraryID: String
+        let binding: CatalogBinding
+        let appliedAt: Int64
+        var operationID = UUID().uuidString
+        var blockedReason: String?
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.saved.id == rhs.saved.id && lhs.saved.revision == rhs.saved.revision &&
+                lhs.binding == rhs.binding && lhs.operationID == rhs.operationID && lhs.blockedReason == rhs.blockedReason
+        }
+    }
+
+    var pendingCatalogForks: [CatalogForkPublication] {
+        (state.catalogForks ?? [:]).values.sorted { $0.appliedAt < $1.appliedAt }
+    }
+
+    func exportCatalogFork(_ fork: CatalogForkPublication) async throws -> CatalogPackageExporter.AssetExport {
+        guard state.catalogForks?[fork.saved.id] == fork, fork.blockedReason == nil else {
+            throw DeviceError.message("This catalog copy changed before it could be backed up.")
+        }
+        return try await exportLinkedAssets(fork.saved)
+    }
+
+    func catalogForkBegin(_ fork: CatalogForkPublication, declaration: CatalogObjectDeclaration) throws -> CatalogBeginBackup {
+        guard state.catalogForks?[fork.saved.id] == fork, fork.blockedReason == nil else {
+            throw DeviceError.message("This catalog copy changed before it could be backed up.")
+        }
+        let begin = CatalogBeginBackup(operationID: fork.operationID, libraryID: fork.libraryID, localScreenID: fork.saved.id,
+            sourceRevisionID: fork.saved.revision, parentRevisionIDs: [], predecessorRevisionID: nil, commitCounter: 1,
+            origin: "seed", sourceAppliedAt: CatalogContract.timestamp(Date(timeIntervalSince1970: Double(fork.appliedAt) / 1000)),
+            screenName: fork.saved.artifact.title, package: declaration)
+        try CatalogContract.validateBegin(begin, assetManifest: true)
+        return begin
+    }
+
+    func acknowledgeCatalogFork(_ fork: CatalogForkPublication, catalogScreenID: String) throws {
+        guard state.catalogForks?[fork.saved.id] == fork else { return }
+        var next = state
+        next.catalogForks?.removeValue(forKey: fork.saved.id)
+        if next.screens.contains(where: { $0.id == fork.saved.id }) {
+            if next.catalogScreenIDs == nil { next.catalogScreenIDs = [:] }
+            next.catalogScreenIDs?[fork.saved.id, default: []].insert(catalogScreenID)
+            // If ordinary backups are enabled, extend the explicit fork's actual copy
+            // sequence rather than replay its seed through the normal backup path.
+            if next.catalog == nil {
+                next.catalog = CatalogQueue(binding: fork.binding, libraryID: fork.libraryID, captureAllowed: false)
+                next.catalog?.knownSavedRevisions = []
+            }
+            if next.catalog?.binding == fork.binding, next.catalog?.libraryID == fork.libraryID {
+                var copy = CatalogCopy()
+                copy.localScreenID = fork.saved.id; copy.counter = 1; copy.lastQueuedCounter = 1
+                copy.head = fork.saved.revision; copy.acknowledgedCounter = 1; copy.acknowledgedRevision = fork.saved.revision
+                next.catalog?.copies[fork.saved.id] = copy
+                next.catalog?.knownSavedRevisions?.insert(fork.saved.revision)
+            }
+        }
+        try commit(next, captureCatalog: false)
+        pruneUnusedRevisions()
+    }
+
+    func failCatalogFork(_ fork: CatalogForkPublication, reason: String) throws {
+        guard state.catalogForks?[fork.saved.id] == fork else { return }
+        var next = state
+        next.catalogForks?[fork.saved.id]?.blockedReason = reason
+        try commit(next, captureCatalog: false)
+    }
+
+    func restartCatalogFork(_ fork: CatalogForkPublication) throws {
+        guard state.catalogForks?[fork.saved.id] == fork else { return }
+        var next = state
+        next.catalogForks?[fork.saved.id]?.operationID = UUID().uuidString
+        next.catalogForks?[fork.saved.id]?.blockedReason = nil
+        try commit(next, captureCatalog: false)
+    }
+
+    struct LinkedCatalogEdit: Codable, Equatable {
+        var scope: LinkedCatalogEditScope
+        var base: LinkedCatalogInstall
+        var forkName: String?
+    }
+
+    var linkedCatalogScreens: [LinkedCatalogInstall] { state.screens.compactMap { state.catalogLinks?[$0.id] } }
+    var pendingCatalogUnlinks: [LinkedCatalogInstall] { state.catalogUnlinks ?? [] }
+
+    func hasDiscoverableCatalogProducerCopies(binding: CatalogBinding) -> Bool {
+        guard state.catalog?.binding == binding else { return false }
+        return state.screens.contains { saved in
+            state.catalogLinks?[saved.id] == nil && state.catalog?.copies[saved.id]?.acknowledgedRevision != nil
+        }
+    }
+
+    func adoptCatalogProducerLink(catalogScreenID: String, libraryID: String, localScreenID: String, localRevisionID: String,
+                                  commitCounter: Int, copyID: String, versionID: String, sourceRevisionID: String, displayVersion: Int,
+                                  packageDigest: String, binding: CatalogBinding) throws -> LinkedCatalogInstall? {
+        guard state.pendingID == nil, state.submissionKey == nil,
+              let queue = state.catalog, queue.binding == binding, queue.libraryID == libraryID,
+              let copy = queue.copies.first(where: { $0.value.localScreenID == localScreenID }),
+              copy.value.acknowledgedRevision == localRevisionID, copy.value.acknowledgedCounter == commitCounter,
+              state.catalogScreenIDs?[copy.key]?.contains(catalogScreenID) == true,
+              state.catalogLinks?[copy.key] == nil,
+              let saved = state.screens.first(where: { $0.id == copy.key }) else { return nil }
+        var link = LinkedCatalogInstall(screenID: copy.key, catalogScreenID: catalogScreenID,
+            libraryID: libraryID, binding: binding, localRevision: localRevisionID, localScreenID: localScreenID,
+            versionID: versionID, displayVersion: displayVersion, sourceRevisionID: sourceRevisionID, packageDigest: packageDigest)
+        link.copyID = copyID
+        link.commitCounter = commitCounter
+        var next = state
+        if saved.revision != localRevisionID {
+            // This edit predates discovery of the shared subscription. Never use
+            // the ordinary backup queue to publish it to the newly shared screen.
+            link.pendingRevision = saved.revision
+            link.conflict = true
+            let pending = queue.entries.filter { $0.screenID == saved.id }.map(\.revision)
+            if !pending.isEmpty {
+                if next.linkedConflictPins == nil { next.linkedConflictPins = [:] }
+                next.linkedConflictPins?[saved.id] = pending
+            }
+            if let previous = state.previous, previous.id == saved.id, previous.revision == localRevisionID {
+                if next.linkedRollback == nil { next.linkedRollback = [:] }
+                next.linkedRollback?[saved.id] = previous
+            }
+        }
+        next.catalog?.entries.removeAll { $0.screenID == saved.id }
+        if next.catalogLinks == nil { next.catalogLinks = [:] }
+        next.catalogLinks?[copy.key] = link
+        try commit(next, captureCatalog: false)
+        return link
+    }
+
+    func linkedCatalogScreen(id: String) -> LinkedCatalogInstall? { state.catalogLinks?[id] }
+
+    func markLinkedCatalogRegistered(expecting link: LinkedCatalogInstall, copyID: String) throws {
+        guard var current = state.catalogLinks?[link.screenID], current == link, !current.registered else { return }
+        current.copyID = copyID
+        var next = state
+        next.catalogLinks?[link.screenID] = current
+        try commit(next, captureCatalog: false)
+    }
+
+    func exportLinkedCatalogEdit(_ link: LinkedCatalogInstall) async throws -> CatalogPackageExporter.AssetExport {
+        guard state.catalogLinks?[link.screenID] == link, let revision = link.pendingRevision, !link.conflict,
+              let saved = state.screens.first(where: { $0.id == link.screenID && $0.revision == revision }) else {
+            throw DeviceError.message("This linked edit changed before it could be published.")
+        }
+        return try await exportLinkedAssets(saved)
+    }
+
+    private func exportLinkedAssets(_ saved: Saved) async throws -> CatalogPackageExporter.AssetExport {
+        let directory = root.appendingPathComponent(saved.revision, isDirectory: true)
+        let title = saved.artifact.title, entry = saved.artifact.entry, paths = saved.packagePaths, schemaVersion = saved.catalogPackageSchema ?? 1
+        let work = Task.detached(priority: .utility) {
+            try CatalogPackageExporter.exportAssets(directory: directory, title: title, entry: entry, paths: paths, schemaVersion: schemaVersion)
+        }
+        return try await withTaskCancellationHandler(operation: { try await work.value }, onCancel: { work.cancel() })
+    }
+
+    func linkedCatalogBegin(_ link: LinkedCatalogInstall, declaration: CatalogObjectDeclaration) throws -> CatalogBeginBackup {
+        guard state.catalogLinks?[link.screenID] == link, link.registered, !link.conflict,
+              let revision = link.pendingRevision, let operation = link.operationID, let applied = link.pendingAppliedAt,
+              let saved = state.screens.first(where: { $0.id == link.screenID && $0.revision == revision }),
+              link.commitCounter < 9_007_199_254_740_991 else { throw DeviceError.message("This linked edit changed before it could be published.") }
+        let begin = CatalogBeginBackup(operationID: operation, libraryID: link.libraryID, localScreenID: link.localScreenID,
+            sourceRevisionID: revision, parentRevisionIDs: [link.localRevision], predecessorRevisionID: link.localRevision,
+            commitCounter: link.commitCounter + 1, origin: "applied",
+            sourceAppliedAt: CatalogContract.timestamp(Date(timeIntervalSince1970: Double(applied) / 1000)),
+            screenName: saved.artifact.title, package: declaration)
+        try CatalogContract.validateBegin(begin, assetManifest: true)
+        return begin
+    }
+
+    func acknowledgeLinkedCatalogPublication(_ link: LinkedCatalogInstall, versionID: String, displayVersion: Int, packageDigest: String) throws {
+        guard var current = state.catalogLinks?[link.screenID], current == link, let revision = link.pendingRevision,
+              displayVersion > current.displayVersion, current.commitCounter < 9_007_199_254_740_991 else { return }
+        current.versionID = versionID; current.displayVersion = displayVersion; current.sourceRevisionID = revision
+        current.localRevision = revision; current.packageDigest = packageDigest; current.commitCounter += 1
+        current.pendingRevision = nil; current.operationID = nil; current.pendingAppliedAt = nil; current.conflict = false
+        var next = state
+        next.catalogLinks?[link.screenID] = current
+        next.linkedRollback?.removeValue(forKey: link.screenID)
+        if next.previous?.id == link.screenID { next.previous = nil }
+        try commit(next, captureCatalog: false)
+        pruneUnusedRevisions()
+    }
+
+    func recordLinkedCatalogConflict(_ link: LinkedCatalogInstall) throws {
+        guard var current = state.catalogLinks?[link.screenID], current == link, current.pendingRevision != nil else { return }
+        current.conflict = true
+        var next = state
+        next.catalogLinks?[link.screenID] = current
+        try commit(next, captureCatalog: false)
+    }
+
+    func restartLinkedCatalogPublication(_ link: LinkedCatalogInstall) throws {
+        guard var current = state.catalogLinks?[link.screenID], current == link, current.pendingRevision != nil, !current.conflict else { return }
+        current.operationID = UUID().uuidString
+        var next = state
+        next.catalogLinks?[link.screenID] = current
+        try commit(next, captureCatalog: false)
+    }
+
+    func acknowledgeCatalogUnlink(_ link: LinkedCatalogInstall) throws {
+        var next = state
+        next.catalogUnlinks?.removeAll { $0.screenID == link.screenID && $0.binding == link.binding && $0.catalogScreenID == link.catalogScreenID }
+        try commit(next, captureCatalog: false)
+    }
+
+    private func detachCatalogLink(_ id: String, in next: inout State) {
+        guard let link = next.catalogLinks?.removeValue(forKey: id) else { return }
+        // Registration may have completed before its response reached this device.
+        if !(next.catalogUnlinks ?? []).contains(link) { next.catalogUnlinks = (next.catalogUnlinks ?? []) + [link] }
+        next.catalogScreenIDs?.removeValue(forKey: id)
+        next.linkedRollback?.removeValue(forKey: id)
+        next.linkedConflictPins?.removeValue(forKey: id)
+    }
+
+    private func linkedUpdateAllowed(_ screen: CatalogScreen, expecting link: LinkedCatalogInstall) -> Bool {
+        state.catalogLinks?[link.screenID] == link && screen.catalogScreenID == link.catalogScreenID &&
+            screen.latest.catalogScreenID == link.catalogScreenID &&
+            (screen.latest.displayVersion > link.displayVersion || (link.discardAfterRefresh == true && screen.latest.versionID == link.versionID)) &&
+            state.screens.contains(where: { $0.id == link.screenID && ($0.revision == link.localRevision || link.discardAfterRefresh == true) }) &&
+            link.pendingRevision == nil && !link.conflict && state.pendingID == nil && state.submissionKey == nil
+    }
+
+    private func commitCatalogInstallation(_ saved: Saved, screen: CatalogScreen, linkedBinding: CatalogBinding?, replacing link: LinkedCatalogInstall?) throws {
+        var next = state
+        if let link, let index = next.screens.firstIndex(where: { $0.id == link.screenID }) {
+            next.screens[index] = saved
+            if next.previous?.id == saved.id { next.previous = nil }
+            var updated = LinkedCatalogInstall(screenID: saved.id, version: screen.latest, libraryID: link.libraryID, binding: link.binding, localRevision: saved.revision, localScreenID: link.localScreenID)
+            updated.commitCounter = link.commitCounter
+            next.catalogLinks?[saved.id] = updated
+        } else {
+            next.screens.append(saved)
+            if let linkedBinding {
+                let libraryID = next.catalogLinkLibraryID ?? next.catalog?.libraryID ?? UUID().uuidString
+                next.catalogLinkLibraryID = libraryID
+                var links = next.catalogLinks ?? [:]
+                links[saved.id] = .init(screenID: saved.id, version: screen.latest, libraryID: libraryID, binding: linkedBinding, localRevision: saved.revision)
+                next.catalogLinks = links
+            }
+        }
+        if next.catalogScreenIDs == nil { next.catalogScreenIDs = [:] }
+        next.catalogScreenIDs?[saved.id, default: []].insert(screen.catalogScreenID)
+        try commit(next, stagedDirectory: saved.revision, captureCatalog: linkedBinding == nil && link == nil)
+        pruneUnusedRevisions()
+    }
+
     func containsCatalogScreen(_ screen: CatalogScreen) -> Bool {
         let versions = [screen.latest] + screen.history
-        return state.screens.contains { saved in
+        return (state.catalogUnlinks ?? []).contains { $0.catalogScreenID == screen.catalogScreenID } || state.screens.contains { saved in
             state.catalogScreenIDs?[saved.id]?.contains(screen.catalogScreenID) == true ||
                 versions.contains { version in
                     version.sourceRevisionID == saved.revision ||
@@ -343,21 +642,136 @@ import ScreenpunkCore
         try commit(next, captureCatalog: false)
     }
 
-    func installCatalogScreen(_ screen: CatalogScreen, package: CatalogPackage) throws {
+    func installCatalogScreen(_ screen: CatalogScreen, package: CatalogPackage, linkedBinding: CatalogBinding? = nil) throws {
         guard !containsCatalogScreen(screen) else { throw DeviceError.message("This screen is already on this device.") }
         guard state.pendingID == nil, state.submissionKey == nil else {
             throw DeviceError.message("Finish or cancel the current request before adding a screen.")
         }
-        _ = try CatalogContract.encodePackage(package)
-        let files: [ScreenFile] = try package.files.map { file in
-            guard let bytes = Data(base64Encoded: file.contentBase64), let content = String(data: bytes, encoding: .utf8) else {
-                throw DeviceError.message("The catalog screen contains an invalid file.")
-            }
-            return .init(path: file.path, content: content)
+        try stageCatalogPackage(screen, package: package, linkedBinding: linkedBinding, replacing: nil)
+    }
+
+    func updateLinkedCatalogScreen(_ screen: CatalogScreen, package: CatalogPackage, expecting link: LinkedCatalogInstall) throws -> Bool {
+        guard linkedUpdateAllowed(screen, expecting: link) else { return false }
+        try stageCatalogPackage(screen, package: package, linkedBinding: nil, replacing: link)
+        return true
+    }
+
+    private func stageCatalogPackage(_ screen: CatalogScreen, package: CatalogPackage, linkedBinding: CatalogBinding?, replacing link: LinkedCatalogInstall?) throws {
+        let encoded = try CatalogContract.encodePackage(package)
+        if linkedBinding != nil || link != nil {
+            guard screen.latest.catalogScreenID == screen.catalogScreenID, encoded.count == screen.latest.sizeBytes,
+                  CatalogContract.digest(encoded) == screen.latest.packageDigest else { throw DeviceError.message("The catalog package did not match this version.") }
         }
-        try install(.init(title: package.screen.title, entry: package.screen.entry, files: files),
-                    requestID: UUID().uuidString, replacing: nil, selectInstalled: false,
-                    preserveRequestHistory: true, catalogScreenID: screen.catalogScreenID)
+        guard package.schemaVersion == screen.latest.packageSchema else { throw DeviceError.message("The catalog package format changed.") }
+        if package.schemaVersion == 1, linkedBinding == nil, link == nil {
+            let files: [ScreenFile] = try package.files.map { file in
+                guard let bytes = Data(base64Encoded: file.contentBase64), let content = String(data: bytes, encoding: .utf8) else { throw DeviceError.message("The catalog screen contains an invalid file.") }
+                return .init(path: file.path, content: content)
+            }
+            try install(.init(title: package.screen.title, entry: package.screen.entry, files: files), requestID: UUID().uuidString, replacing: nil, selectInstalled: false, preserveRequestHistory: true, catalogScreenID: screen.catalogScreenID)
+            return
+        }
+        // The committed directory owns the exact package bytes.
+        let revision = UUID().uuidString
+        let directory = root.appendingPathComponent(revision, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var committing = false
+        do {
+            var textFiles: [ScreenFile] = []
+            for file in package.files {
+                guard let bytes = Data(base64Encoded: file.contentBase64) else { throw DeviceError.message("Invalid catalog asset.") }
+                let destination = directory.appendingPathComponent(file.path)
+                try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try bytes.write(to: destination, options: .atomic)
+                if !file.mediaType.hasPrefix("audio/"), let text = String(data: bytes, encoding: .utf8) { textFiles.append(.init(path: file.path, content: text)) }
+            }
+            _ = try PackageAssetStore.load(directory: directory)
+            let saved = Saved(id: link?.screenID ?? UUID().uuidString, revision: revision,
+                              artifact: .init(title: package.screen.title, entry: package.screen.entry, files: textFiles),
+                              catalogPackageSchema: package.schemaVersion,
+                              catalogAssetPaths: package.schemaVersion == 2 ? package.files.map(\.path) : nil)
+            committing = true
+            try commitCatalogInstallation(saved, screen: screen, linkedBinding: linkedBinding, replacing: link)
+        } catch { if !committing { try? FileManager.default.removeItem(at: directory) }; throw error }
+    }
+
+    func openCatalogRestoreDirectory(binding: CatalogBinding, version: CatalogVersion) throws -> URL {
+        let identity = [binding.origin, binding.accountID, binding.userID, binding.deviceID, binding.libraryID,
+                        version.catalogScreenID, version.versionID, version.sourceRevisionID, version.packageDigest]
+        let key = CatalogContract.digest(try CatalogContract.canonical(identity))
+        let directory = root.appendingPathComponent(".catalog-restore-" + key, isDirectory: true)
+        guard activeCatalogRestoreDirectories.insert(directory.lastPathComponent).inserted else {
+            throw DeviceError.message("This screen is already being downloaded.")
+        }
+        do {
+            if FileManager.default.fileExists(atPath: directory.path) {
+                let info = try directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+                guard info.isDirectory == true, info.isSymbolicLink != true else {
+                    throw DeviceError.message("The partial catalog download is unsafe.")
+                }
+            } else {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+            }
+            try FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: directory.path)
+            return directory
+        } catch {
+            activeCatalogRestoreDirectories.remove(directory.lastPathComponent)
+            throw error
+        }
+    }
+
+    func closeCatalogRestoreDirectory(_ directory: URL) {
+        guard activeCatalogRestoreDirectories.remove(directory.lastPathComponent) != nil else { return }
+        // A completed restore has moved the directory into its committed revision.
+        try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: directory.path)
+    }
+
+    func installCatalogAssets(_ screen: CatalogScreen, manifest: CatalogAssetManifest, staged directory: URL, linkedBinding: CatalogBinding? = nil) throws {
+        guard !containsCatalogScreen(screen) else { throw DeviceError.message("This screen is already on this device.") }
+        guard state.pendingID == nil, state.submissionKey == nil else {
+            throw DeviceError.message("Finish or cancel the current request before adding a screen.")
+        }
+        try stageCatalogAssets(screen, manifest: manifest, directory: directory, linkedBinding: linkedBinding, replacing: nil)
+    }
+
+    func updateLinkedCatalogAssets(_ screen: CatalogScreen, manifest: CatalogAssetManifest, staged directory: URL, expecting link: LinkedCatalogInstall) throws -> Bool {
+        guard linkedUpdateAllowed(screen, expecting: link) else { return false }
+        try stageCatalogAssets(screen, manifest: manifest, directory: directory, linkedBinding: nil, replacing: link)
+        return true
+    }
+
+    private func stageCatalogAssets(_ screen: CatalogScreen, manifest: CatalogAssetManifest, directory: URL,
+                                    linkedBinding: CatalogBinding?, replacing link: LinkedCatalogInstall?) throws {
+        guard activeCatalogRestoreDirectories.contains(directory.lastPathComponent),
+              screen.latest.packageSchema == 3, screen.latest.packageStorage == "assets",
+              try CatalogContract.validateAssetManifest(manifest) == screen.latest.sizeBytes,
+              CatalogContract.digest(try CatalogContract.canonical(manifest)) == screen.latest.packageDigest else {
+            throw DeviceError.message("The catalog package format changed.")
+        }
+        var metadata: [ScreenFile] = []
+        if let source = manifest.files.first(where: { $0.path == "manifest.json" }) {
+            // Keep the small SDK declaration in the index for permissions and account lookup.
+            let bytes = try Data(contentsOf: directory.appendingPathComponent(source.path))
+            let sdk = try JSONDecoder().decode(DashboardManifest.self, from: bytes)
+            guard sdk.entrypoint == manifest.screen.entry,
+                  sdk.files.count == manifest.files.count - 1,
+                  sdk.files.allSatisfy({ $0.bytes >= 0 && $0.bytes <= screen.latest.sizeBytes }) else {
+                throw DeviceError.message("The restored SDK manifest does not match the saved screen.")
+            }
+            let files = Dictionary(uniqueKeysWithValues: manifest.files.map { ($0.path, $0) })
+            guard sdk.files.allSatisfy({ file in
+                file.path != "manifest.json" && files[file.path]?.byteLength == file.bytes && files[file.path]?.digest == file.sha256
+            }) else { throw DeviceError.message("The restored SDK manifest does not match the saved screen.") }
+            try PackageValidator.validate(sdk, maximumExpandedBytes: nil)
+            metadata.append(.init(path: source.path, content: String(decoding: bytes, as: UTF8.self)))
+        } else if manifest.schemaVersion == 2 {
+            throw DeviceError.message("The restored screen is missing its SDK manifest.")
+        }
+        let revision = UUID().uuidString
+        let saved = Saved(id: link?.screenID ?? UUID().uuidString, revision: revision, artifact: .init(title: manifest.screen.title, entry: manifest.screen.entry, files: metadata),
+                          catalogPackageSchema: manifest.schemaVersion, catalogAssetPaths: manifest.files.map(\.path))
+        try FileManager.default.moveItem(at: directory, to: root.appendingPathComponent(revision, isDirectory: true))
+        try commitCatalogInstallation(saved, screen: screen, linkedBinding: linkedBinding, replacing: link)
     }
 
     /// Upgrade only the exact pristine shipped Weather package. A committed replacement
@@ -508,6 +922,23 @@ import ScreenpunkCore
         clearTerminalDelivery(id, in: &next)
         try commit(next); pruneUnusedRevisions()
     }
+    func renameScreen(_ id: String, to name: String) throws {
+        guard let index = state.screens.firstIndex(where: { $0.id == id }) else {
+            throw DeviceError.message("This screen is no longer installed.")
+        }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.count <= 100,
+              trimmed.rangeOfCharacter(from: .newlines) == nil,
+              !trimmed.unicodeScalars.contains(where: { $0.value < 32 || $0.value == 127 }) else {
+            throw DeviceError.message("Enter a single-line screen name between 1 and 100 characters.")
+        }
+        guard trimmed != state.screens[index].displayName else { return }
+        var next = state
+        next.screens[index].displayNameOverride = trimmed
+        if next.previous?.id == id { next.previous?.displayNameOverride = trimmed }
+        try commit(next, captureCatalog: false)
+    }
+
     func isScreenShown(_ id: String) -> Bool { state.hiddenScreenIDs?.contains(id) != true }
 
     private func selectsInstalledRevision(_ id: String) -> Bool {
@@ -568,6 +999,7 @@ import ScreenpunkCore
         var next = state
         var authoring = next.authoring ?? .init(); var knownScreens = authoring.knownScreenIDs ?? []; knownScreens.insert(id); authoring.knownScreenIDs = knownScreens; next.authoring = authoring
         next.screens.removeAll { $0.id == id }
+        detachCatalogLink(id, in: &next)
         next.hiddenScreenIDs?.remove(id)
         if next.hiddenScreenIDs?.isEmpty == true { next.hiddenScreenIDs = nil }
         if next.selectedID == id {
@@ -628,7 +1060,7 @@ import ScreenpunkCore
     }
 
     func rollback() throws {
-        guard !needsAgentSetup, let previous = state.previous, let position = state.screens.firstIndex(where: { $0.id == previous.id }) else { return }
+        guard !needsAgentSetup, let previous = state.previous, state.catalogLinks?[previous.id] == nil, let position = state.screens.firstIndex(where: { $0.id == previous.id }) else { return }
         try temporary.manualSelection()
         var next = state; next.previous = next.screens[position]; next.screens[position] = previous
         if isScreenShown(previous.id) { next.selectedID = previous.id }
@@ -636,6 +1068,7 @@ import ScreenpunkCore
         try commit(next)
     }
     private func clearTerminalDelivery(_ id: String, in next: inout State) {
+        next.linkedEdits?.removeValue(forKey: id)
         if next.submissionKey == id {
             next.submissionKey = nil; next.submissionText = nil; next.submissionScreen = nil
             next.requestDeadline = nil
@@ -646,13 +1079,21 @@ import ScreenpunkCore
     }
     private func commit(_ proposed: State, stagedDirectory: String? = nil, captureCatalog: Bool = true) throws {
         let previousCatalogRevision = state.catalog?.entries.last?.id
+        let previousLinks = state.catalogLinks
+        let previousUnlinks = state.catalogUnlinks
+        let previousForks = state.catalogForks
         defer {
+            if previousLinks != state.catalogLinks || previousUnlinks != state.catalogUnlinks || previousForks != state.catalogForks { onCatalogLinksChanged?() }
             if let latest = state.catalog?.entries.last?.id, latest != previousCatalogRevision,
                captureCatalog, stagedDirectory != nil {
                 onCatalogRevisionCommitted?()
             }
         }
         var next = proposed
+        if let stagedDirectory, let index = next.screens.firstIndex(where: { $0.revision == stagedDirectory }),
+           let current = state.screens.first(where: { $0.id == next.screens[index].id }) {
+            next.screens[index].displayNameOverride = current.displayNameOverride
+        }
         let currentRevisions = Dictionary(state.screens.map { ($0.id, $0.revision) }, uniquingKeysWith: { first, _ in first })
         let generations = Dictionary(next.screens.map { screen in
             let retained = currentRevisions[screen.id] == screen.revision ? state.screenDataGenerations?[screen.id] : nil
@@ -716,9 +1157,21 @@ import ScreenpunkCore
         return state
     }
     private func pruneUnusedRevisions() {
-        let retained = Set(state.screens.map(\.revision) + [state.previous?.revision].compactMap { $0 } + (state.authoring?.revisionPins?.values.map(\.revision) ?? []) + (state.catalog?.entries.map(\.revision) ?? []))
+        var retained = Set(state.screens.map(\.revision) + [state.previous?.revision].compactMap { $0 } + (state.authoring?.revisionPins?.values.map(\.revision) ?? []) + (state.catalog?.entries.map(\.revision) ?? []))
+        if let rollback = state.linkedRollback { retained.formUnion(rollback.values.map(\.revision)) }
+        if let forks = state.catalogForks { retained.formUnion(forks.values.map { $0.saved.revision }) }
+        if let pins = state.linkedConflictPins { retained.formUnion(pins.values.joined()) }
         for url in (try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? [] {
-            if UUID(uuidString: url.lastPathComponent) != nil && !retained.contains(url.lastPathComponent) { try? FileManager.default.removeItem(at: url) }
+            let name = url.lastPathComponent
+            if UUID(uuidString: name) != nil && !retained.contains(name) { try? FileManager.default.removeItem(at: url) }
+            let prefix = ".catalog-restore-"
+            if name.hasPrefix(prefix), name.dropFirst(prefix.count).range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil,
+               !activeCatalogRestoreDirectories.contains(name),
+               let updated = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
+               updated < Date().addingTimeInterval(-7 * 24 * 60 * 60) {
+                try? FileManager.default.removeItem(at: url)
+            }
+
         }
         let images = root.appendingPathComponent("catalog-previews", isDirectory: true)
         let referenced = Set((state.catalog?.previews ?? []).map { $0.id + ".png" })
@@ -817,32 +1270,62 @@ import ScreenpunkCore
     func makeAuthoringRequestV2(from request: AuthoringRequestV1, libraryID: String? = nil) throws -> AuthoringRequestV2 {
         guard libraryID == nil || libraryID == libraryOwner else { throw DeviceError.message("The request belongs to another library.") }
         var input = request
-        if let revision = request.context.baseRevision {
-            guard let saved = state.screens.first(where: { $0.id == request.context.screenID }), saved.revision == revision else { throw DeviceError.message("The screen changed before the request was prepared.") }
+        let saved = state.screens.first(where: { $0.id == request.context.screenID })
+        guard saved?.revision == request.context.baseRevision else { throw DeviceError.message("The screen changed before the request was prepared.") }
+        guard let saved else {
+            input.context.currentScreen = nil
+            return try AuthoringV2Contract.makeRequest(from: AuthoringContract.seal(input), libraryID: libraryOwner)
+        }
+        let directory = root.appendingPathComponent(saved.revision)
+        if !saved.hasNativeAssets {
             let files = try saved.artifact.files.map { file -> AuthoringScreenFile in
                 let expected = Data(file.content.utf8)
-                let raw = try AuthoringPinnedPackage.read(directory: root.appendingPathComponent(revision), path: file.path, byteLength: expected.count, digest: AuthoringContract.contentDigest(expected))
+                let raw = try AuthoringPinnedPackage.read(directory: directory, path: file.path, byteLength: expected.count, digest: AuthoringContract.contentDigest(expected))
                 guard let content = String(data: raw, encoding: .utf8) else { throw DeviceError.message("The base asset is not supported UTF8.") }
                 return .init(path: file.path, content: content)
             }
             input.context.currentScreen = .init(title: saved.artifact.title, entry: saved.artifact.entry, files: files)
-        } else {
-            guard !state.screens.contains(where: { $0.id == request.context.screenID }) else { throw DeviceError.message("The screen revision is missing from this request.") }
-            input.context.currentScreen = nil
+            return try AuthoringV2Contract.makeRequest(from: AuthoringContract.seal(input), libraryID: libraryOwner)
         }
-        input = try AuthoringContract.seal(input)
-        return try AuthoringV2Contract.makeRequest(from: input, libraryID: libraryOwner)
+
+        // Prioritize editable entry and manifest. The remaining files can be retained
+        // by reference even if their text is too large for the agent snapshot.
+        let primaryPaths = ["manifest.json", saved.artifact.entry]
+        let paths = primaryPaths.filter { saved.packagePaths.contains($0) }
+            + saved.packagePaths.filter { !primaryPaths.contains($0) }.sorted()
+        var inlineBytesRemaining = 128 * 1024
+        let files = try paths.map { path -> AuthoringSourceFileV2 in
+            let asset = try AuthoringPinnedPackage.inspectNative(directory: directory, path: path,
+                inlineLimit: AuthoringV2Contract.isEditableText(path: path) ? inlineBytesRemaining : -1)
+            let media = try AuthoringV2Contract.mediaType(path: path, extended: true)
+            var inline: String?
+            if let raw = asset.content, let content = String(data: raw, encoding: .utf8),
+               !(media == "image/svg+xml" && (content.range(of: "data:image/", options: .caseInsensitive) != nil || content.range(of: "base64,", options: .caseInsensitive) != nil)),
+               let encodedBytes = try? AuthoringContract.encodedCanonical(content).count, encodedBytes <= inlineBytesRemaining {
+                inlineBytesRemaining -= encodedBytes
+                inline = content
+            }
+            return .init(path: path, mediaType: media, byteLength: asset.byteLength, digest: asset.digest, content: inline)
+        }
+        return try AuthoringV2Contract.seal(.init(requestID: request.requestID, createdAt: request.createdAt, deadlineAt: request.deadlineAt,
+            designGuidance: request.designGuidance, runtime: request.runtime, services: request.services, preferences: request.preferences,
+            context: .init(profileID: request.context.profileID, libraryID: libraryOwner, deviceID: request.context.deviceID, screenID: saved.id,
+                baseRevision: saved.revision, userRequest: request.context.userRequest,
+                currentScreen: .init(title: saved.artifact.title, entry: saved.artifact.entry, files: files, packageSchema: 3),
+                viewport: request.context.viewport), delivery: .init(route: request.delivery.route)))
     }
     /// Persist and pin the sealed request before a transport is allowed to prepare or send it.
     func saveAuthoringRequest(_ request: AuthoringRequestV2) throws {
         try saveAuthoringRequestV2(request, text: nil, screen: nil)
     }
     /// Preparation is one durable transaction: no orphan pin can exist without visible pending work.
-    func prepareAuthoringRequest(_ request: AuthoringRequestV2, text: String, screen: ScreenArtifact?) throws {
+    func prepareAuthoringRequest(_ request: AuthoringRequestV2, text: String, screen: ScreenArtifact?,
+                                 linkedEdit: LinkedCatalogEditScope? = nil, forkName: String? = nil) throws {
         guard text == request.context.userRequest else { throw DeviceError.message("The prepared instructions differ from the sealed request.") }
-        try saveAuthoringRequestV2(request, text: text, screen: screen)
+        try saveAuthoringRequestV2(request, text: text, screen: screen, linkedEdit: linkedEdit, forkName: forkName)
     }
-    private func saveAuthoringRequestV2(_ request: AuthoringRequestV2, text: String?, screen: ScreenArtifact?) throws {
+    private func saveAuthoringRequestV2(_ request: AuthoringRequestV2, text: String?, screen: ScreenArtifact?,
+                                        linkedEdit: LinkedCatalogEditScope? = nil, forkName: String? = nil) throws {
         _ = try AuthoringV2Contract.validateRequest(JSONEncoder().encode(request))
         guard request.context.libraryID == libraryOwner else { throw DeviceError.message("The request belongs to another library.") }
         if let existing = state.authoring?.requestDigests[request.requestID] {
@@ -852,6 +1335,7 @@ import ScreenpunkCore
                   state.authoring?.receipts.values.contains(where: { $0.requestID == request.requestID }) != true,
                   !(state.authoring?.cancelledRequestIDs ?? []).contains(request.requestID) else { throw DeviceError.message("This authoring request has already ended.") }
             var next = state
+            try recordLinkedEdit(request, scope: linkedEdit, forkName: forkName, in: &next)
             try prepareDelivery(request, text: text, screen: screen, in: &next)
             try commit(next); return
         }
@@ -861,9 +1345,15 @@ import ScreenpunkCore
                   let saved = state.screens.first(where: { $0.id == request.context.screenID }), saved.revision == revision,
                   let source = request.context.currentScreen,
                   source.title == saved.artifact.title, source.entry == saved.artifact.entry,
-                  Set(source.files.map(\.path)) == Set(saved.artifact.files.map(\.path)) else { throw DeviceError.message("The screen changed before the request was prepared.") }
+                  (source.packageSchema == 3) == saved.hasNativeAssets,
+                  Set(source.files.map(\.path)) == Set(saved.packagePaths) else { throw DeviceError.message("The screen changed before the request was prepared.") }
             for file in source.files {
-                let raw = try AuthoringPinnedPackage.read(directory: root.appendingPathComponent(revision), path: file.path, byteLength: file.byteLength, digest: file.digest)
+                let directory = root.appendingPathComponent(revision)
+                if saved.hasNativeAssets {
+                    try AuthoringPinnedPackage.verifyNative(directory: directory, path: file.path, byteLength: file.byteLength, digest: file.digest, content: file.content)
+                    continue
+                }
+                let raw = try AuthoringPinnedPackage.read(directory: directory, path: file.path, byteLength: file.byteLength, digest: file.digest)
                 if let content = file.content { guard Data(content.utf8) == raw else { throw DeviceError.message("The editable source differs from its pinned bytes.") } }
             }
             pin = .init(requestID: request.requestID, profileID: request.context.profileID, libraryID: libraryOwner, screenID: request.context.screenID, revision: revision, byteLength: source.files.reduce(0, { $0 + $1.byteLength }))
@@ -874,9 +1364,88 @@ import ScreenpunkCore
         try AuthoringStore.saveRequest(request, pin: pin, in: &authoring)
         if request.delivery.route == "local" { next.localRequestIDs = (next.localRequestIDs ?? []).union([request.requestID]) }
         next.authoring = authoring
-        if let text { try prepareDelivery(request, text: text, screen: screen, in: &next) }
+        if let text {
+            try recordLinkedEdit(request, scope: linkedEdit, forkName: forkName, in: &next)
+            try prepareDelivery(request, text: text, screen: screen, in: &next)
+        }
         try commit(next)
     }
+    private func recordLinkedEdit(_ request: AuthoringRequestV2, scope: LinkedCatalogEditScope?, forkName: String?, in next: inout State) throws {
+        guard let link = next.catalogLinks?[request.context.screenID] else {
+            if scope != nil { throw DeviceError.message("This screen no longer follows the catalog.") }
+            return
+        }
+        guard let scope, link.localRevision == request.context.baseRevision, link.pendingRevision == nil, !link.conflict else {
+            throw DeviceError.message("Choose how to edit this linked screen once it is up to date.")
+        }
+        let name = try scope == .thisDevice ? validatedForkName(forkName) : nil
+        let edit = LinkedCatalogEdit(scope: scope, base: link, forkName: name)
+        var edits = next.linkedEdits ?? [:]
+        if let previous = edits[request.requestID] {
+            guard previous.scope == scope, previous.forkName == name, previous.base.localRevision == link.localRevision,
+                  previous.base.versionID == link.versionID, previous.base.binding == link.binding else {
+                throw DeviceError.message("This request is already bound to a different edit choice.")
+            }
+        } else { edits[request.requestID] = edit }
+        next.linkedEdits = edits
+    }
+
+    private func validatedForkName(_ name: String?) throws -> String {
+        let normalized = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !normalized.isEmpty, normalized.utf16.count <= 100,
+              !normalized.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
+            throw DeviceError.message("Choose a screen name with 1 to 100 characters.")
+        }
+        return normalized
+    }
+
+    private func replacingLinkedScreen(_ current: Saved, with saved: Saved, name: String, appliedAt: Int64, in next: inout State) {
+        let fork = Saved(id: UUID().uuidString, revision: saved.revision,
+                         artifact: .init(title: name, entry: saved.artifact.entry, files: saved.artifact.files),
+                         catalogPackageSchema: saved.catalogPackageSchema, catalogAssetPaths: saved.catalogAssetPaths)
+        guard let index = next.screens.firstIndex(where: { $0.id == current.id }) else { return }
+        next.screens[index] = fork
+        if let link = next.catalogLinks?[current.id] {
+            if next.catalogForks == nil { next.catalogForks = [:] }
+            next.catalogForks?[fork.id] = .init(saved: fork, libraryID: link.libraryID, binding: link.binding, appliedAt: appliedAt)
+        }
+        detachCatalogLink(current.id, in: &next)
+        if next.hiddenScreenIDs?.remove(current.id) != nil { next.hiddenScreenIDs?.insert(fork.id) }
+        if next.selectedID == current.id { next.selectedID = fork.id }
+        if next.previous?.id == current.id { next.previous = nil }
+    }
+
+    func resolveLinkedCatalogConflictAsFork(id: String, name: String) throws {
+        guard state.pendingID == nil, state.submissionKey == nil,
+              let link = state.catalogLinks?[id], link.conflict, let saved = state.screens.first(where: { $0.id == id && $0.revision == link.pendingRevision }) else { return }
+        let name = try validatedForkName(name)
+        var next = state
+        replacingLinkedScreen(saved, with: saved, name: name, appliedAt: Int64(Date().timeIntervalSince1970 * 1000), in: &next)
+        try commit(next, stagedDirectory: saved.revision)
+        pruneUnusedRevisions()
+    }
+
+    func discardLinkedCatalogConflict(id: String) throws {
+        guard state.pendingID == nil, state.submissionKey == nil,
+              var link = state.catalogLinks?[id], link.conflict,
+              let index = state.screens.firstIndex(where: { $0.id == id && $0.revision == link.pendingRevision }) else { return }
+        var next = state
+        if let base = state.linkedRollback?[id], base.id == id, base.revision == link.localRevision {
+            next.screens[index] = base
+        } else {
+            // Legacy producer history may have rotated its only rollback slot.
+            // Keep displaying the local edit until the authorized fetch succeeds.
+            link.discardAfterRefresh = true
+        }
+        if next.previous?.id == id { next.previous = nil }
+        next.linkedRollback?.removeValue(forKey: id)
+        next.linkedConflictPins?.removeValue(forKey: id)
+        link.pendingRevision = nil; link.operationID = nil; link.pendingAppliedAt = nil; link.conflict = false
+        next.catalogLinks?[id] = link
+        try commit(next, captureCatalog: false)
+        pruneUnusedRevisions()
+    }
+
     private func prepareDelivery(_ request: AuthoringRequestV2, text: String, screen: ScreenArtifact?, in next: inout State) throws {
         guard (next.pendingID == nil || next.pendingID == request.requestID),
               (next.submissionKey == nil || next.submissionKey == request.requestID) else { throw DeviceError.message("Resolve the current request before preparing another.") }
@@ -898,6 +1467,27 @@ import ScreenpunkCore
         clearTerminalDelivery(receipt.requestID, in: &next)
         try commit(next); pruneUnusedRevisions()
     }
+    private func legacyGeneratorDescriptor(for saved: Saved?) -> ManifestConnection? {
+        guard let saved, let metadata = saved.artifact.files.first(where: { $0.path == "manifest.json" }),
+              let manifest = try? JSONDecoder().decode(DashboardManifest.self, from: Data(metadata.content.utf8)),
+              let app = manifest.files.first(where: { $0.path == "app.js" }),
+              manifest.connections.first?.customHTTP == nil,
+              let connection = LegacyGeneratorConnection.enrich(manifest, appDigest: app.sha256).connections.first,
+              connection.customHTTP != nil,
+              let stored = try? AuthoringPinnedPackage.inspectNative(directory: root.appendingPathComponent(saved.revision), path: app.path),
+              stored.digest == app.sha256, stored.byteLength == app.bytes else { return nil }
+        return connection
+    }
+
+    private func carryingForwardGenerator(from saved: Saved?, into files: [AuthoringScreenFile]) throws -> [AuthoringScreenFile] {
+        guard let descriptor = legacyGeneratorDescriptor(for: saved),
+              let index = files.firstIndex(where: { $0.path == "manifest.json" }) else { return files }
+        var updated = files
+        let bytes = try LegacyGeneratorConnection.carryForward(descriptor, into: Data(files[index].content.utf8))
+        updated[index] = .init(path: files[index].path, content: String(decoding: bytes, as: UTF8.self))
+        return updated
+    }
+
     /// The complete next index (screen, CAS mutations, receipt, outbox) is one redo transaction.
     func applyAuthoringResult(_ result: AuthoringResultV1, now: Int64 = Int64(Date().timeIntervalSince1970 * 1000)) throws -> ApplicationReceiptV1 {
         if let old = state.authoring?.receipts[result.operationID] {
@@ -911,14 +1501,20 @@ import ScreenpunkCore
         guard let request = state.authoring?.requests[result.requestID] else { throw DeviceError.message("The original authoring snapshot is missing.") }
         var next = state; var authoring = next.authoring ?? .init()
         let current = next.screens.first { $0.id == request.context.screenID }
+        if let current, (current.hasNativeAssets || state.catalogLinks?[current.id] != nil),
+           current.revision == request.context.baseRevision, result.screen != nil {
+            return try rejectAuthoringResult(result, reason: "This screen requires an agent that supports package assets.", now: now)
+        }
         let receipt = try AuthoringStore.apply(result, to: &authoring, currentScreenRevision: current?.revision, cancelled: (state.cancelledRequests ?? []).contains(result.requestID), now: now)
         next.authoring = authoring
         var stagedRevision: String?
         if receipt.status == "applied", let screen = result.screen {
-            let artifact = ScreenArtifact(title: screen.title, entry: screen.entry, files: screen.files.map { ScreenFile(path: $0.path, content: $0.content) })
+            let artifact: ScreenArtifact
             let revision = UUID().uuidString
             let directory = root.appendingPathComponent(revision, isDirectory: true)
             do {
+                let files = try carryingForwardGenerator(from: current, into: screen.files)
+                artifact = ScreenArtifact(title: screen.title, entry: screen.entry, files: files.map { ScreenFile(path: $0.path, content: $0.content) })
                 try Self.validate(artifact)
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
                 for file in artifact.files {
@@ -958,6 +1554,14 @@ import ScreenpunkCore
         guard let request = state.authoring?.requestsV2?[result.requestID], request.context.libraryID == libraryOwner else { throw DeviceError.message("The original authoring snapshot is missing or belongs to another library.") }
         var next = state; var authoring = next.authoring ?? .init()
         let current = next.screens.first { $0.id == request.context.screenID }
+        let linkedEdit = state.linkedEdits?[result.requestID]
+        if result.screen != nil, let current, let link = state.catalogLinks?[current.id] {
+            guard let linkedEdit, linkedEdit.base.localRevision == link.localRevision,
+                  linkedEdit.base.versionID == link.versionID, linkedEdit.base.binding == link.binding,
+                  linkedEdit.base.screenID == link.screenID, link.pendingRevision == nil, !link.conflict else {
+                return try rejectAuthoringResult(result, reason: "The catalog version changed before this edit could be applied.", now: now)
+            }
+        }
         let receipt = try AuthoringStore.apply(result, to: &authoring, currentScreenRevision: current?.revision, cancelled: (state.cancelledRequests ?? []).contains(result.requestID), now: now)
         next.authoring = authoring
         var stagedRevision: String?
@@ -965,35 +1569,62 @@ import ScreenpunkCore
             let revision = UUID().uuidString
             let directory = root.appendingPathComponent(revision, isDirectory: true)
             do {
-                var retained: [String: Data] = [:]
-                let materialized = try AuthoringV2Contract.materialize(result, request: request) { source in
-                    guard let pin = self.state.authoring?.revisionPins?[request.requestID],
-                          pin.requestID == request.requestID, pin.libraryID == self.libraryOwner,
+                let saved: Saved
+                if request.context.currentScreen?.packageSchema == 3 {
+                    guard let current, current.hasNativeAssets,
+                          let pin = state.authoring?.revisionPins?[request.requestID],
+                          pin.requestID == request.requestID, pin.libraryID == libraryOwner,
                           pin.profileID == request.context.profileID, pin.screenID == request.context.screenID,
-                          pin.revision == request.context.baseRevision, UUID(uuidString: pin.revision) != nil else { throw DeviceError.message("The immutable base package pin is missing.") }
-                    let raw = try AuthoringPinnedPackage.read(directory: self.root.appendingPathComponent(pin.revision), path: source.path, byteLength: source.byteLength, digest: source.digest)
-                    retained[source.path] = raw
-                    return raw
+                          pin.revision == current.revision, UUID(uuidString: pin.revision) != nil else {
+                        throw DeviceError.message("The immutable base package pin is missing.")
+                    }
+                    saved = try stageNativeAuthoringScreen(mutation, request: request, current: current,
+                                                           revision: revision, directory: directory)
+                } else {
+                    var retained: [String: Data] = [:]
+                    let materialized = try AuthoringV2Contract.materialize(result, request: request) { source in
+                        guard let pin = self.state.authoring?.revisionPins?[request.requestID],
+                              pin.requestID == request.requestID, pin.libraryID == self.libraryOwner,
+                              pin.profileID == request.context.profileID, pin.screenID == request.context.screenID,
+                              pin.revision == request.context.baseRevision, UUID(uuidString: pin.revision) != nil else { throw DeviceError.message("The immutable base package pin is missing.") }
+                        let raw = try AuthoringPinnedPackage.read(directory: self.root.appendingPathComponent(pin.revision), path: source.path, byteLength: source.byteLength, digest: source.digest)
+                        retained[source.path] = raw
+                        return raw
+                    }
+                    let files = try carryingForwardGenerator(from: current, into: materialized.files)
+                    try AuthoringPackageDependencies.validateManifest(files: files)
+                    let artifact = ScreenArtifact(title: materialized.title, entry: materialized.entry, files: files.map { .init(path: $0.path, content: $0.content) })
+                    try Self.validate(artifact)
+                    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                    for file in mutation.files {
+                        let data: Data
+                        if file.path == "manifest.json", let manifest = files.first(where: { $0.path == file.path }) { data = Data(manifest.content.utf8) }
+                        else if file.kind == "retain", let path = file.sourcePath, let raw = retained[path] { data = raw }
+                        else if file.kind == "write", let content = file.content { data = Data(content.utf8) }
+                        else { throw DeviceError.message("The materialized asset is missing.") }
+                        let url = directory.appendingPathComponent(file.path)
+                        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                        try data.write(to: url, options: .atomic)
+                    }
+                    _ = try PackageAssetStore.load(directory: directory)
+                    saved = Saved(id: request.context.screenID, revision: revision, artifact: artifact)
                 }
-                try AuthoringPackageDependencies.validateManifest(files: materialized.files)
-                let artifact = ScreenArtifact(title: materialized.title, entry: materialized.entry, files: materialized.files.map { .init(path: $0.path, content: $0.content) })
-                try Self.validate(artifact)
-                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                for file in mutation.files {
-                    let data: Data
-                    if file.kind == "retain", let path = file.sourcePath, let raw = retained[path] { data = raw }
-                    else if file.kind == "write", let content = file.content { data = Data(content.utf8) }
-                    else { throw DeviceError.message("The materialized asset is missing.") }
-                    let url = directory.appendingPathComponent(file.path)
-                    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-                    try data.write(to: url, options: .atomic)
-                }
-                _ = try PackageAssetStore.load(directory: directory)
                 stagedRevision = revision
-                let saved = Saved(id: request.context.screenID, revision: revision, artifact: artifact)
-                if let index = next.screens.firstIndex(where: { $0.id == saved.id }) { next.previous = next.screens[index]; next.screens[index] = saved }
-                else { next.screens.append(saved) }
-                if selectsInstalledRevision(saved.id) { next.selectedID = saved.id }; next.lastRequest = result.requestID
+                if let linkedEdit, linkedEdit.scope == .thisDevice, let current, let name = linkedEdit.forkName {
+                    replacingLinkedScreen(current, with: saved, name: name, appliedAt: now, in: &next)
+                } else {
+                    if let index = next.screens.firstIndex(where: { $0.id == saved.id }) { next.previous = next.screens[index]; next.screens[index] = saved }
+                    else { next.screens.append(saved) }
+                    if linkedEdit?.scope == .all, let current {
+                        if next.linkedRollback == nil { next.linkedRollback = [:] }
+                        next.linkedRollback?[saved.id] = current
+                        next.catalogLinks?[saved.id]?.pendingRevision = revision
+                        next.catalogLinks?[saved.id]?.operationID = UUID().uuidString
+                        next.catalogLinks?[saved.id]?.pendingAppliedAt = now
+                    }
+                    if selectsInstalledRevision(saved.id) { next.selectedID = saved.id }
+                }
+                next.lastRequest = result.requestID
             } catch {
                 try? FileManager.default.removeItem(at: directory)
                 return try rejectAuthoringResult(result, reason: "The screen package could not be installed: " + error.localizedDescription, now: now)
@@ -1004,6 +1635,71 @@ import ScreenpunkCore
         pruneUnusedRevisions()
         return receipt
     }
+    private func stageNativeAuthoringScreen(_ mutation: AuthoringScreenMutationV2, request: AuthoringRequestV2,
+                                            current: Saved, revision: String, directory: URL) throws -> Saved {
+        let base = Dictionary(uniqueKeysWithValues: (request.context.currentScreen?.files ?? []).map { ($0.path, $0) })
+        let paths = mutation.files.map(\.path)
+        guard paths.allSatisfy(CatalogContract.safePath) else { throw DeviceError.message("The screen contains an unsafe package path.") }
+        var declarations: [ManifestFile] = []
+        let packageDirectory = root.appendingPathComponent(current.revision, isDirectory: true)
+        for file in mutation.files {
+            let destination = directory.appendingPathComponent(file.path)
+            try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if file.kind == "retain", let path = file.sourcePath, let source = base[path] {
+                try AuthoringPinnedPackage.verifyNative(directory: packageDirectory, path: source.path, byteLength: source.byteLength,
+                                                        digest: source.digest, destination: destination)
+                declarations.append(.init(path: file.path, bytes: source.byteLength, sha256: source.digest))
+            } else if file.kind == "write", let content = file.content {
+                let bytes = Data(content.utf8)
+                try bytes.write(to: destination, options: .atomic)
+                declarations.append(.init(path: file.path, bytes: bytes.count, sha256: AuthoringContract.contentDigest(bytes)))
+            } else { throw DeviceError.message("The materialized asset is missing.") }
+        }
+
+        try AuthoringPackageDependencies.validateAssetReferences(paths: paths) { path in
+            let bytes = try Data(contentsOf: directory.appendingPathComponent(path), options: .mappedIfSafe)
+            guard let text = String(data: bytes, encoding: .utf8) else { throw DeviceError.message("The screen contains invalid markup or CSS.") }
+            return text
+        }
+
+        var metadata: [ScreenFile] = []
+        if let declaration = declarations.first(where: { $0.path == "manifest.json" }) {
+            guard declaration.bytes <= CatalogContract.assetManifestBytes else { throw DeviceError.message("The screen manifest is too large.") }
+            let url = directory.appendingPathComponent(declaration.path)
+            var bytes = try Data(contentsOf: url)
+            guard var document = try JSONSerialization.jsonObject(with: bytes) as? [String: Any] else {
+                throw DeviceError.message("The screen manifest must be a JSON object.")
+            }
+            let files = declarations.filter { $0.path != declaration.path }.sorted { $0.path < $1.path }
+            // Recompute derived integrity fields from staged bytes. Preserve other
+            // metadata and leave the entire original file intact when it is valid.
+            let manifestFiles = try? JSONDecoder().decode(DashboardManifest.self, from: bytes).files
+            if manifestFiles?.sorted(by: { $0.path < $1.path }) != files {
+                document["files"] = files.map { ["path": $0.path, "bytes": $0.bytes, "sha256": $0.sha256] as [String: Any] }
+                bytes = try JSONSerialization.data(withJSONObject: document, options: [.sortedKeys, .withoutEscapingSlashes])
+                guard bytes.count <= CatalogContract.assetManifestBytes else { throw DeviceError.message("The screen manifest is too large.") }
+                try bytes.write(to: url, options: .atomic)
+            }
+            if let descriptor = legacyGeneratorDescriptor(for: current) {
+                let migrated = try LegacyGeneratorConnection.carryForward(descriptor, into: bytes)
+                if migrated != bytes {
+                    guard migrated.count <= CatalogContract.assetManifestBytes else { throw DeviceError.message("The screen manifest is too large.") }
+                    try migrated.write(to: url, options: .atomic)
+                    bytes = migrated
+                }
+            }
+            let manifest = try JSONDecoder().decode(DashboardManifest.self, from: bytes)
+            guard manifest.entrypoint == mutation.entry else { throw DeviceError.message("The manifest entrypoint differs from the screen entry.") }
+            try PackageValidator.validate(manifest, maximumExpandedBytes: nil)
+            metadata.append(.init(path: declaration.path, content: String(decoding: bytes, as: UTF8.self)))
+        } else if current.catalogPackageSchema == 2, base["manifest.json"] != nil {
+            throw DeviceError.message("This screen package requires its manifest.")
+        }
+        let artifact = ScreenArtifact(title: mutation.title, entry: mutation.entry, files: metadata)
+        return Saved(id: current.id, revision: revision, artifact: artifact, catalogPackageSchema: current.catalogPackageSchema,
+                     catalogAssetPaths: paths)
+    }
+
     func rejectAuthoringResult(_ result: AuthoringResultV2, reason: String, now: Int64 = Int64(Date().timeIntervalSince1970 * 1000)) throws -> ApplicationReceiptV1 {
         var next = state; var authoring = next.authoring ?? .init()
         let receipt = try AuthoringStore.reject(result, reason: reason, in: &authoring, now: now)
@@ -1102,7 +1798,7 @@ extension ScreenLibrary {
         var gapFrom: Int?
         var gapThrough: Int?
     }
-    struct CatalogIntent: Codable, Identifiable {
+    struct CatalogIntent: Codable, Identifiable, Sendable {
         var id: String = UUID().uuidString
         var operationID: String = UUID().uuidString
         var screenID: String
@@ -1123,6 +1819,8 @@ extension ScreenLibrary {
         var beginDigest: String?
         var blockedReason: String?
         var gap: CatalogGapDeclaration?
+        var packageSchema: Int?
+        var packageStorage: String?
     }
     struct CatalogQueue: Codable {
         var binding: CatalogBinding
@@ -1137,6 +1835,7 @@ extension ScreenLibrary {
         var acknowledgedCount: Int = 0
         var maxRevisions: Int = 100
         var maxBytes: Int = 100 * 1024 * 1024
+        var assetBackups: Bool?
         var previews: [CatalogCapturedPreview]?
         var previewFinishedSources: [String]?
         // Bounded to revisions still visible in the saved library or rollback.
@@ -1203,7 +1902,7 @@ extension ScreenLibrary {
 
     /// Only call after an authenticated capability response for this exact library.
     /// Existing content is an honestly labelled current-screen seed, never history.
-    func activateCatalog(binding: CatalogBinding, maxRevisions: Int = 100, maxBytes: Int = 100 * 1024 * 1024) throws {
+    func activateCatalog(binding: CatalogBinding, maxRevisions: Int = 100, maxBytes: Int = 100 * 1024 * 1024, assetBackups: Bool = false) throws {
         guard catalogWorkAllowed(binding: binding), !binding.origin.isEmpty, !binding.accountID.isEmpty,
               !binding.userID.isEmpty, !binding.deviceID.isEmpty else { throw DeviceError.message("The backup account binding is incomplete.") }
         guard state.catalog == nil || state.catalog?.binding == binding else {
@@ -1212,10 +1911,27 @@ extension ScreenLibrary {
         var next = state
         var changed = state.catalog == nil || state.catalog?.captureAllowed == false
         if next.catalog == nil {
-            next.catalog = CatalogQueue(binding: binding, maxRevisions: max(1, min(100, maxRevisions)), maxBytes: max(1, min(100 * 1024 * 1024, maxBytes)))
+            next.catalog = CatalogQueue(binding: binding, libraryID: next.catalogLinkLibraryID ?? UUID().uuidString,
+                                        maxRevisions: max(1, min(100, maxRevisions)), maxBytes: max(1, min(100 * 1024 * 1024, maxBytes)))
             next.catalog?.knownSavedRevisions = []
             next.catalog?.seedAnnounced = true
             next.catalog?.status = "Current screens are queued for backup."
+        }
+        if next.catalog?.assetBackups != assetBackups {
+            next.catalog?.assetBackups = assetBackups
+            changed = true
+        }
+        if assetBackups, var queue = next.catalog {
+            for index in queue.entries.indices where queue.entries[index].packageStorage == nil && queue.entries[index].beginDigest == nil && queue.entries[index].uploadID == nil {
+                let source = queue.entries[index]
+                queue.previews?.removeAll { $0.revision == source.revision && $0.packageDigest == source.packageDigest }
+                queue.entries[index].packageStorage = "assets"
+                queue.entries[index].packageDigest = nil
+                queue.entries[index].blockedReason = nil
+                queue.entries[index].retryAt = 0
+                changed = true
+            }
+            next.catalog = queue
         }
         next.catalog?.captureAllowed = true
         if next.catalog?.paused != true {
@@ -1229,6 +1945,7 @@ extension ScreenLibrary {
     }
 
     private func needsCatalogSeed(_ saved: Saved, in state: State) -> Bool {
+        guard state.catalogLinks?[saved.id] == nil, state.catalogForks?[saved.id] == nil else { return false }
         guard let queue = state.catalog, let copy = queue.copies[saved.id] else { return true }
         if saved.revision == copy.head || saved.revision == copy.acknowledgedRevision || queue.knownSavedRevisions?.contains(saved.revision) == true ||
             queue.entries.contains(where: { $0.screenID == saved.id && $0.revision == saved.revision }) { return false }
@@ -1236,7 +1953,7 @@ extension ScreenLibrary {
     }
 
     private func captureCatalogRevision(_ saved: Saved, origin: String, in next: inout State) {
-        guard var queue = next.catalog, catalogWorkAllowed(binding: queue.binding), !queue.authPaused else { return }
+        guard next.catalogLinks?[saved.id] == nil, next.catalogForks?[saved.id] == nil, var queue = next.catalog, catalogWorkAllowed(binding: queue.binding), !queue.authPaused else { return }
         var copy = queue.copies[saved.id] ?? CatalogCopy()
         // Journal recovery/replay must not assign a new operation or counter.
         guard copy.head != saved.revision else { return }
@@ -1249,32 +1966,35 @@ extension ScreenLibrary {
         var bytes = 0
         var admissionError: String?
         var packageDigest: String?
-        for path in saved.artifact.files.map(\.path) {
+        let usesAssets = queue.assetBackups == true
+        if !usesAssets {
+            for path in saved.packagePaths {
+                do {
+                    let values = try directory.appendingPathComponent(path).resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey, .isSymbolicLinkKey])
+                    guard values.isRegularFile == true, values.isSymbolicLink != true, let size = values.fileSize, size >= 0, size <= (saved.catalogPackageSchema == 2 ? CatalogContract.extendedFileBytes : 204_800) else { throw DeviceError.message("A backup asset is missing or unsafe.") }
+                    bytes += size
+                } catch { admissionError = "A backup asset is missing or unsafe. Review this screen before resuming backups." }
+            }
+            // Base64 plus manifest overhead; budget conservatively before export.
+            bytes = ((bytes + 2) / 3) * 4 + saved.packagePaths.count * 512 + 8192
             do {
-                let values = try directory.appendingPathComponent(path).resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey, .isSymbolicLinkKey])
-                guard values.isRegularFile == true, values.isSymbolicLink != true, let size = values.fileSize, size >= 0, size <= 204_800 else { throw DeviceError.message("A backup asset is missing or unsafe.") }
-                bytes += size
-            } catch { admissionError = "A backup asset is missing or unsafe. Review this screen before resuming backups." }
-        }
-        // Base64 plus manifest overhead; budget conservatively before export.
-        bytes = ((bytes + 2) / 3) * 4 + saved.artifact.files.count * 512 + 8192
-        do {
-            let exported = try CatalogPackageExporter.export(directory: directory, title: saved.artifact.title, entry: saved.artifact.entry, paths: saved.artifact.files.map(\.path))
-            bytes = exported.bytes.count
-            packageDigest = exported.declaration.digest
-        } catch {
-            admissionError = "Backups paused: this committed package is unsafe, incomplete, or contains credential markers. Keep the installed screen and contact support to reconcile its pending backup."
+                let exported = try CatalogPackageExporter.export(directory: directory, title: saved.artifact.title, entry: saved.artifact.entry, paths: saved.packagePaths, schemaVersion: saved.catalogPackageSchema ?? 1)
+                bytes = exported.bytes.count
+                packageDigest = exported.declaration.digest
+            } catch {
+                admissionError = "Backups paused: this committed package is unsafe, incomplete, or contains credential markers. Keep the installed screen and contact support to reconcile its pending backup."
+            }
         }
         let outstanding = Set(queue.entries.map(\.revision) + (queue.previews ?? []).map(\.revision))
-        if queue.paused || !queue.captureAllowed || outstanding.count >= queue.maxRevisions || bytes > queue.maxBytes - queue.entries.reduce(0, { $0 + $1.packageBytes }) - (queue.previews ?? []).reduce(0, { $0 + $1.declaration.byteLength }) {
+        if queue.paused || !queue.captureAllowed || outstanding.count >= queue.maxRevisions || (!usesAssets && bytes > queue.maxBytes - queue.entries.filter { $0.packageStorage != "assets" }.reduce(0, { $0 + $1.packageBytes }) - (queue.previews ?? []).reduce(0, { $0 + $1.declaration.byteLength })) {
             queue.paused = true
             copy.gapFrom = copy.gapFrom ?? copy.counter
             copy.gapThrough = copy.counter
             queue.status = "Backups paused: capture is unavailable or the saved queue is full. Further edits stay on this device and are not queued. After queued backups finish, choose Resume backups to save each current screen."
         } else {
             queue.entries.append(CatalogIntent(screenID: saved.id, revision: saved.revision, copyID: copy.id, counter: copy.counter,
-                parentIDs: parents, title: saved.artifact.title, entry: saved.artifact.entry, paths: saved.artifact.files.map(\.path),
-                appliedAt: Int64(Date().timeIntervalSince1970 * 1000), origin: origin, packageBytes: bytes, packageDigest: packageDigest, blockedReason: admissionError))
+                parentIDs: parents, title: saved.artifact.title, entry: saved.artifact.entry, paths: saved.packagePaths,
+                appliedAt: Int64(Date().timeIntervalSince1970 * 1000), origin: origin, packageBytes: bytes, packageDigest: packageDigest, blockedReason: admissionError, packageSchema: saved.catalogPackageSchema, packageStorage: usesAssets ? "assets" : nil))
             copy.lastQueuedCounter = copy.counter
             queue.knownSavedRevisions?.insert(saved.revision)
         }
@@ -1309,10 +2029,25 @@ extension ScreenLibrary {
 extension ScreenLibrary {
     func exportCatalogIntent(_ intent: CatalogIntent, binding: CatalogBinding) throws -> CatalogPackageExporter.Export {
         guard catalogCaptureAllowed(binding: binding), state.catalog?.entries.contains(where: { $0.id == intent.id && $0.revision == intent.revision }) == true else { throw DeviceError.message("The backup connection changed.") }
-        let exported = try CatalogPackageExporter.export(directory: root.appendingPathComponent(intent.revision), title: intent.title, entry: intent.entry, paths: intent.paths)
+        let exported = try CatalogPackageExporter.export(directory: root.appendingPathComponent(intent.revision), title: intent.title, entry: intent.entry, paths: intent.paths, schemaVersion: intent.packageSchema ?? 1)
         guard intent.packageDigest == nil || intent.packageDigest == exported.declaration.digest else { throw DeviceError.message("The immutable backup package changed. Backups are paused for review.") }
         return exported
     }
+    func exportCatalogAssetIntent(_ intent: CatalogIntent, binding: CatalogBinding) async throws -> CatalogPackageExporter.AssetExport {
+        guard catalogCaptureAllowed(binding: binding), state.catalog?.entries.contains(where: { $0.id == intent.id && $0.revision == intent.revision }) == true else {
+            throw DeviceError.message("The backup connection changed.")
+        }
+        let directory = root.appendingPathComponent(intent.revision, isDirectory: true)
+        let work = Task.detached(priority: .utility) {
+            try CatalogPackageExporter.exportAssets(directory: directory, title: intent.title, entry: intent.entry, paths: intent.paths, schemaVersion: intent.packageSchema ?? 1)
+        }
+        let exported = try await withTaskCancellationHandler(operation: { try await work.value }, onCancel: { work.cancel() })
+        guard intent.packageDigest == nil || exported.declaration.digest == intent.packageDigest else {
+            throw DeviceError.message("The immutable backup package changed.")
+        }
+        return exported
+    }
+
     func catalogBegin(_ intent: CatalogIntent, declaration: CatalogObjectDeclaration, binding: CatalogBinding) throws -> CatalogBeginBackup {
         guard catalogCaptureAllowed(binding: binding), let queue = state.catalog,
               let copy = queue.copies[intent.screenID], copy.id == intent.copyID else { throw DeviceError.message("The backup connection changed.") }
@@ -1320,7 +2055,7 @@ extension ScreenLibrary {
             sourceRevisionID: intent.revision, parentRevisionIDs: intent.parentIDs, predecessorRevisionID: intent.parentIDs.first,
             commitCounter: intent.counter, origin: intent.origin == "apply" ? "applied" : "seed",
             sourceAppliedAt: CatalogContract.timestamp(Date(timeIntervalSince1970: Double(intent.appliedAt) / 1000)), screenName: intent.title, gap: intent.gap, package: declaration)
-        try CatalogContract.validateBegin(begin)
+        try CatalogContract.validateBegin(begin, assetManifest: intent.packageStorage == "assets")
         return begin
     }
     /// Explicit user acknowledgement excludes the recorded intermediate edits.
@@ -1403,7 +2138,7 @@ extension ScreenLibrary {
             guard exported.declaration.digest == digest else { throw DeviceError.message("The preview source changed.") }; return exported
         }
         guard let saved = (state.screens + [state.previous].compactMap { $0 }).first(where: { $0.revision == revision }) else { throw DeviceError.message("This exact source revision is no longer stored on this device.") }
-        let exported = try CatalogPackageExporter.export(directory: root.appendingPathComponent(revision), title: saved.artifact.title, entry: saved.artifact.entry, paths: saved.artifact.files.map(\.path))
+        let exported = try CatalogPackageExporter.export(directory: root.appendingPathComponent(revision), title: saved.artifact.title, entry: saved.artifact.entry, paths: saved.packagePaths, schemaVersion: saved.catalogPackageSchema ?? 1)
         guard exported.declaration.digest == digest else { throw DeviceError.message("The preview source changed.") }; return exported
     }
     func captureCatalogPreview(bytes: Data, declaration: CatalogPNGPreviewDeclaration, revision: String, packageDigest: String, capturedAt: String, binding: CatalogBinding, candidate: CatalogPreviewCandidate? = nil) throws {
@@ -1418,7 +2153,7 @@ extension ScreenLibrary {
         let ownsRecovered = candidate.map { target in target.libraryID == queue.libraryID && target.sourceRevisionID == revision && target.packageDigest == packageDigest && queue.copies.values.contains(where: { $0.localScreenID == target.localScreenID }) } ?? false
         guard (try? catalogPackage(revision: revision, digest: packageDigest, binding: binding)) != nil || ownsRecovered else { throw DeviceError.message("This screenshot does not belong to an exact saved revision.") }
         if queue.previewFinishedSources?.contains(revision + ":" + packageDigest) == true || queue.previews?.contains(where: { $0.revision == revision && $0.packageDigest == packageDigest }) == true { return }
-        let used = queue.entries.reduce(0) { $0 + $1.packageBytes } + (queue.previews ?? []).reduce(0) { $0 + $1.declaration.byteLength }
+        let used = queue.entries.filter { $0.packageStorage != "assets" }.reduce(0) { $0 + $1.packageBytes } + (queue.previews ?? []).reduce(0) { $0 + $1.declaration.byteLength }
         let outstanding = Set(queue.entries.map(\.revision) + (queue.previews ?? []).map(\.revision))
         guard outstanding.contains(revision) || outstanding.count < queue.maxRevisions,
               (queue.previews?.count ?? 0) < queue.maxRevisions, bytes.count <= queue.maxBytes - used else { throw DeviceError.message("Preview capture is paused until queued previews finish.") }

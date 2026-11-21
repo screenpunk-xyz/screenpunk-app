@@ -258,3 +258,11 @@ a **current rendering of that exact saved source**, not a historical snapshot of
 external runtime data at sourceAppliedAt or backedUpAt. Never label missing or
 failed captures as a screenshot. The synthetic one-pixel conformance raster is
 protocol test evidence only and must never be served as a production preview.
+
+### Catalog native package v2
+
+Catalog transport still uses `catalog-backup-v1`. Package `schemaVersion: 2` and version metadata `packageSchema: 2` preserve native WAV/MP3 assets and larger UTF8 source files. Each file is bounded to 2 MiB; expanded files total at most 4 MiB and canonical base64 transport remains bounded to 10 MiB. Native packages require a complete SDK manifest with exact raw-byte sizes and SHA256 digests. Audio headers, paths, media types, dependency declarations and credential markers are validated. Package v1 remains byte-for-byte compatible with its existing UTF8-only limits.
+
+Native catalog imports install exact decoded bytes atomically and persist the full asset inventory. Clients advertising `package-assets-v2` can edit imported screens, including package-v2 backups. Each edit binds to an immutable revision and explicitly writes, retains, or deletes each base path. A retained file uses its original bytes. The device refreshes the SDK manifest’s file hashes and sizes from the staged revision before saving. Connection credentials and permission grants are device-specific.
+
+Device backups negotiated with `assetBackupVersion: "1"` publish a manifest and upload missing file bytes in resumable chunks. Asset-backed catalog versions carry `packageSchema: 3` and `packageStorage: "assets"`. The manifest has its own schema version. The account quota counts each distinct file once across retained versions in that account. Legacy inline packages retain their original wire format and limits.

@@ -2,6 +2,32 @@
 import Foundation
 import CryptoKit
 
+public struct CatalogAssetFile: Codable, Sendable, Equatable {
+    public var path: String
+    public var mediaType: String
+    public var byteLength: Int
+    public var digest: String
+
+    public init(path: String, mediaType: String, byteLength: Int, digest: String) {
+        self.path = path
+        self.mediaType = mediaType
+        self.byteLength = byteLength
+        self.digest = digest
+    }
+}
+
+public struct CatalogAssetManifest: Codable, Sendable, Equatable {
+    public var schemaVersion: Int
+    public var screen: CatalogPackageScreen
+    public var files: [CatalogAssetFile]
+
+    public init(schemaVersion: Int, screen: CatalogPackageScreen, files: [CatalogAssetFile]) {
+        self.schemaVersion = schemaVersion
+        self.screen = screen
+        self.files = files
+    }
+}
+
 public struct CatalogObjectDeclaration: Codable, Sendable, Equatable {
     public var byteLength: Int
     public var digest: String
@@ -165,13 +191,28 @@ public struct CatalogCapability: Codable, Sendable, Equatable {
     public var feature: String
     public var entitlement: CatalogEntitlement
     public var previewBackfillVersion: String?
+    public var assetBackupVersion: String?
+    public var linkedInstallVersion: String?
     public var previewMediaTypes: [String]
-    public init(version: String = "1", feature: String = "catalog-backup-v1", entitlement: CatalogEntitlement, previewMediaTypes: [String], previewBackfillVersion: String? = nil) {
+    public init(version: String = "1", feature: String = "catalog-backup-v1", entitlement: CatalogEntitlement, previewMediaTypes: [String], previewBackfillVersion: String? = nil, assetBackupVersion: String? = nil, linkedInstallVersion: String? = nil) {
         self.version = version
         self.feature = feature
         self.entitlement = entitlement
         self.previewMediaTypes = previewMediaTypes
         self.previewBackfillVersion = previewBackfillVersion
+        self.assetBackupVersion = assetBackupVersion
+        self.linkedInstallVersion = linkedInstallVersion
+    }
+}
+
+/// A shared publication compares the current catalog head with the immutable version originally edited.
+public struct CatalogLinkedPublication: Codable, Sendable, Equatable {
+    public var catalogScreenID: String
+    public var baseVersionID: String
+
+    public init(catalogScreenID: String, baseVersionID: String) {
+        self.catalogScreenID = catalogScreenID
+        self.baseVersionID = baseVersionID
     }
 }
 
@@ -221,13 +262,14 @@ public struct CatalogVersion: Codable, Sendable, Equatable {
     public var sourceAppliedAt: String
     public var backedUpAt: String
     public var packageSchema: Int
+    public var packageStorage: String?
     public var packageDigest: String
     public var sizeBytes: Int
     public var deviceDisplayName: String
     public var integrity: String?
     public var deviceLinked: Bool
     public var preview: CatalogPreview
-    public init(versionID: String, catalogScreenID: String, displayVersion: Int, sourceRevisionID: String, parentRevisionIDs: [String], copyID: String, commitCounter: Int, screenName: String, versionName: String? = nil, note: String? = nil, sourceAppliedAt: String, backedUpAt: String, packageSchema: Int = 1, packageDigest: String, sizeBytes: Int, deviceDisplayName: String, deviceLinked: Bool, preview: CatalogPreview, integrity: String? = nil) {
+    public init(versionID: String, catalogScreenID: String, displayVersion: Int, sourceRevisionID: String, parentRevisionIDs: [String], copyID: String, commitCounter: Int, screenName: String, versionName: String? = nil, note: String? = nil, sourceAppliedAt: String, backedUpAt: String, packageSchema: Int = 1, packageDigest: String, sizeBytes: Int, deviceDisplayName: String, deviceLinked: Bool, preview: CatalogPreview, integrity: String? = nil, packageStorage: String? = nil) {
         self.versionID = versionID
         self.catalogScreenID = catalogScreenID
         self.displayVersion = displayVersion
@@ -241,6 +283,7 @@ public struct CatalogVersion: Codable, Sendable, Equatable {
         self.sourceAppliedAt = sourceAppliedAt
         self.backedUpAt = backedUpAt
         self.packageSchema = packageSchema
+        self.packageStorage = packageStorage
         self.packageDigest = packageDigest
         self.sizeBytes = sizeBytes
         self.deviceDisplayName = deviceDisplayName
@@ -340,6 +383,10 @@ public enum CatalogContract {
     public static let uploadsPath = "/api/catalog/backups/"
     public static let operationsPath = "/api/catalog/backups/operations/"
     public static let packageBytes = 10 * 1024 * 1024
+    public static let assetBackupVersion = "1"
+    public static let assetManifestBytes = 256 * 1024
+    public static let assetChunkBytes = 512 * 1024
+    public static let assetFileCount = 512
     public static let previewBytes = 512 * 1024
     public static let previewDimension = 2048
     public static let queueRevisions = 100
@@ -357,18 +404,50 @@ public enum CatalogContract {
         let patterns = ["(?:^|/)(?:credentials|secrets?|id_rsa|id_ed25519|keychain)(?:[./_-]|$)", "-----BEGIN (?:[A-Z ]*PRIVATE KEY|OPENSSH PRIVATE KEY)-----", "\\b(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{16,})\\b"]
         return path.range(of: patterns[0], options: [.regularExpression,.caseInsensitive]) != nil || patterns.dropFirst().contains { content.range(of: $0, options: .regularExpression) != nil }
     }
+    public static let extendedFileBytes = 2 * 1024 * 1024
+    public static let expandedPackageBytes = 4 * 1024 * 1024
+    public static func mediaType(path: String, extended: Bool = false) throws -> String {
+        if extended, let audio = ["wav":"audio/wav", "mp3":"audio/mpeg"][String(path.split(separator: ".").last ?? "")] { return audio }
+        return try AuthoringV2Contract.mediaType(path: path)
+    }
     public static func encodePackage(_ package: CatalogPackage) throws -> Data {
-        guard package.schemaVersion == 1, package.screen.entry == "index.html", !package.files.isEmpty, package.files.count <= 20, package.screen.requiredAssets.count <= 20, package.screen.externalDependencies.count <= 20 else { throw ValidationError.invalid("package metadata") }
-        var previous = ""; var paths = Set<String>(); var files: [AuthoringScreenFile] = []
-        let media = ["html":"text/html","css":"text/css","js":"text/javascript","json":"application/json","svg":"image/svg+xml","txt":"text/plain"]
+        let extended = package.schemaVersion == 2
+        guard [1,2].contains(package.schemaVersion), !package.screen.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, package.screen.title.utf16.count <= 100, package.screen.entry == "index.html", !package.files.isEmpty, package.files.count <= 20, package.screen.requiredAssets.count <= 20, package.screen.externalDependencies.count <= 20 else { throw ValidationError.invalid("package metadata") }
+        var previous = ""; var paths = Set<String>(); var files: [AuthoringScreenFile] = []; var expanded = 0
         for file in package.files {
-            guard safePath(file.path), file.path > previous, paths.insert(file.path.lowercased()).inserted, file.byteLength >= 0, file.byteLength <= 204800, media[String(file.path.split(separator: ".").last ?? "")] == file.mediaType, let bytes = Data(base64Encoded: file.contentBase64), bytes.base64EncodedString() == file.contentBase64, bytes.count == file.byteLength, digest(bytes) == file.digest, let content = String(data: bytes, encoding: .utf8), !containsCredentials(path: file.path, content: content) else { throw ValidationError.invalid("package file") }
-            previous = file.path; files.append(AuthoringScreenFile(path: file.path, content: content))
+            guard safePath(file.path), file.path > previous, paths.insert(file.path.lowercased()).inserted, file.byteLength >= 0, file.byteLength <= (extended ? extendedFileBytes : 204800), file.contentBase64.utf8.count <= (extended ? 2796204 : 273068), try mediaType(path: file.path, extended: extended) == file.mediaType, let bytes = Data(base64Encoded: file.contentBase64), bytes.base64EncodedString() == file.contentBase64, bytes.count == file.byteLength, digest(bytes) == file.digest else { throw ValidationError.invalid("package file") }
+            expanded += bytes.count
+            guard expanded <= expandedPackageBytes else { throw ValidationError.invalid("expanded package bytes") }
+            previous = file.path
+            if extended && file.mediaType.hasPrefix("audio/") {
+                guard !containsCredentials(path: file.path, content: String(decoding: bytes, as: UTF8.self)) else { throw ValidationError.invalid("credential-bearing asset") }
+                let raw = Array(bytes.prefix(12))
+                let wav = raw.count >= 12 && String(bytes: raw[0..<4], encoding: .ascii) == "RIFF" && String(bytes: raw[8..<12], encoding: .ascii) == "WAVE"
+                let mp3 = raw.count >= 3 && (String(bytes: raw[0..<3], encoding: .ascii) == "ID3" || (raw[0] == 255 && raw[1] & 224 == 224))
+                guard (file.mediaType == "audio/wav" && wav) || (file.mediaType == "audio/mpeg" && mp3) else { throw ValidationError.invalid("bundled audio header") }
+                files.append(.init(path: file.path, content: ""))
+            } else {
+                guard let content = String(data: bytes, encoding: .utf8), !containsCredentials(path: file.path, content: content) else { throw ValidationError.invalid("package text") }
+                files.append(.init(path: file.path, content: content))
+            }
         }
-        guard Set(package.screen.requiredAssets).count == package.screen.requiredAssets.count, package.screen.requiredAssets.allSatisfy({ p in safePath(p) && package.files.contains { $0.path == p } }), package.screen.externalDependencies.allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && $0.count <= 160 }) else { throw ValidationError.invalid("package dependencies") }
-        try AuthoringPackageDependencies.validate(files: files)
-        try AuthoringPackageDependencies.validateManifest(files: files)
-        _ = try AuthoringContract.validateScreen(JSONEncoder().encode(AuthoringScreen(title: package.screen.title, entry: package.screen.entry, files: files)))
+        guard paths.contains("index.html"), Set(package.screen.requiredAssets).count == package.screen.requiredAssets.count, package.screen.requiredAssets.allSatisfy({ p in safePath(p) && package.files.contains { $0.path == p } }), package.screen.externalDependencies.allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && $0.count <= 160 }) else { throw ValidationError.invalid("package dependencies") }
+        let dependencies = try AuthoringPackageDependencies.catalogDependencies(files: files, extended: extended)
+        guard Set(dependencies.local).isSubset(of: Set(package.screen.requiredAssets)), Set(dependencies.external).isSubset(of: Set(package.screen.externalDependencies)) else { throw ValidationError.invalid("undeclared dependency") }
+        if extended {
+            guard let source = files.first(where: { $0.path == "manifest.json" }) else { throw ValidationError.invalid("manifest required") }
+            let manifest = try JSONDecoder().decode(DashboardManifest.self, from: Data(source.content.utf8))
+            guard manifest.entrypoint == "index.html", manifest.files.count <= 20, manifest.files.allSatisfy({ $0.bytes >= 0 && $0.bytes <= extendedFileBytes }) else { throw ValidationError.invalid("manifest bounds") }
+            try PackageValidator.validate(manifest)
+            let actual = Dictionary(uniqueKeysWithValues: package.files.filter { $0.path != "manifest.json" }.map { ($0.path, $0) })
+            guard Set(manifest.files.map(\.path)) == Set(actual.keys), manifest.files.count == actual.count else { throw ValidationError.invalid("manifest file set") }
+            for file in manifest.files {
+                guard let asset = actual[file.path], asset.byteLength == file.bytes, asset.digest == file.sha256 else { throw ValidationError.invalid("manifest integrity") }
+            }
+        } else {
+            try AuthoringPackageDependencies.validateManifest(files: files)
+            _ = try AuthoringContract.validateScreen(JSONEncoder().encode(AuthoringScreen(title: package.screen.title, entry: package.screen.entry, files: files)))
+        }
         let bytes = try canonical(package); guard bytes.count <= packageBytes else { throw ValidationError.invalid("package bytes") }; return bytes
     }
     public static func verifyPackage(_ bytes: Data, declaration: CatalogObjectDeclaration) throws -> CatalogPackage {
@@ -379,12 +458,12 @@ public enum CatalogContract {
 }
 
 extension CatalogContract {
-    public static func validateBegin(_ value: CatalogBeginBackup) throws {
+    public static func validateBegin(_ value: CatalogBeginBackup, assetManifest: Bool = false) throws {
         func id(_ value: String) -> Bool { value.range(of: "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$", options: .regularExpression) != nil }
         func reject() throws { throw ValidationError.invalid("begin metadata") }
         guard value.schemaVersion == 1, [value.operationID,value.libraryID,value.localScreenID,value.sourceRevisionID].allSatisfy(id), value.commitCounter > 0, value.commitCounter <= 9_007_199_254_740_991, ["applied","seed"].contains(value.origin), !value.screenName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, value.screenName.utf16.count <= 100, value.parentRevisionIDs.count <= 8, value.parentRevisionIDs.allSatisfy(id), Set(value.parentRevisionIDs).count == value.parentRevisionIDs.count, !value.parentRevisionIDs.contains(value.sourceRevisionID) else { return try reject() }
         let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.timeZone = TimeZone(secondsFromGMT: 0); f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"; f.isLenient = false
-        guard let date = f.date(from: value.sourceAppliedAt), timestamp(date) == value.sourceAppliedAt, value.package.byteLength > 0, value.package.byteLength <= packageBytes, value.package.digest.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil else { return try reject() }
+        guard let date = f.date(from: value.sourceAppliedAt), timestamp(date) == value.sourceAppliedAt, value.package.byteLength > 0, value.package.byteLength <= (assetManifest ? 9_007_199_254_740_991 : packageBytes), value.package.digest.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil else { return try reject() }
         if let previous = value.predecessorRevisionID, !id(previous) || !value.parentRevisionIDs.contains(previous) || previous == value.sourceRevisionID { return try reject() }
         if let label = value.versionName, label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || label.utf16.count > 100 { return try reject() }
         if let note = value.note, note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || note.utf16.count > 1000 { return try reject() }
@@ -413,7 +492,8 @@ public struct CatalogPreviewCandidate: Codable, Sendable, Equatable {
     public var sourceRevisionID: String
     public var packageDigest: String
     public var packageBytes: Int
-    public init(catalogScreenID: String, versionID: String, libraryID: String, localScreenID: String, sourceRevisionID: String, packageDigest: String, packageBytes: Int) {
+    public var packageStorage: String?
+    public init(catalogScreenID: String, versionID: String, libraryID: String, localScreenID: String, sourceRevisionID: String, packageDigest: String, packageBytes: Int, packageStorage: String? = nil) {
         self.catalogScreenID = catalogScreenID
         self.versionID = versionID
         self.libraryID = libraryID
@@ -421,6 +501,7 @@ public struct CatalogPreviewCandidate: Codable, Sendable, Equatable {
         self.sourceRevisionID = sourceRevisionID
         self.packageDigest = packageDigest
         self.packageBytes = packageBytes
+        self.packageStorage = packageStorage
     }
 }
 
@@ -513,5 +594,51 @@ extension CatalogContract {
         if let restart = value.error?.restartOperation {
             guard restart, value.state == "failed", value.error?.code == "retry_later" else { throw ValidationError.invalid("restart requires failed expired preview") }
         }
+    }
+}
+
+extension CatalogContract {
+    @discardableResult
+    public static func validateAssetManifest(_ manifest: CatalogAssetManifest) throws -> Int {
+        let screen = manifest.screen
+        guard [1, 2].contains(manifest.schemaVersion), screen.entry == "index.html",
+              !screen.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, screen.title.utf16.count <= 100,
+              (1...assetFileCount).contains(manifest.files.count),
+              screen.requiredAssets.count <= assetFileCount, Set(screen.requiredAssets).count == screen.requiredAssets.count,
+              screen.externalDependencies.count <= assetFileCount, Set(screen.externalDependencies).count == screen.externalDependencies.count,
+              screen.externalDependencies.allSatisfy({ dependency in
+                  guard dependency.utf16.count <= 160, let url = URLComponents(string: dependency),
+                        let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
+                        let host = url.host, !host.isEmpty else { return false }
+                  return (url.user ?? "").isEmpty && (url.password ?? "").isEmpty
+              }) else { throw ValidationError.invalid("asset manifest metadata") }
+
+        let emptyDigest = digest(Data())
+        var previous = ""
+        var total = 0
+        var paths = Set<String>()
+        var folded = Set<String>()
+        var lengthsByDigest: [String: Int] = [:]
+        for file in manifest.files {
+            guard safePath(file.path), file.path > previous, folded.insert(file.path.lowercased()).inserted,
+                  !containsCredentials(path: file.path, content: ""),
+                  file.digest.utf8.count == 64, file.digest.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil,
+                  (0...9_007_199_254_740_991).contains(file.byteLength),
+                  file.byteLength > 0 || file.digest == emptyDigest,
+                  file.mediaType.range(of: #"\A[a-z0-9][a-z0-9.+_-]{0,62}/[a-z0-9][a-z0-9.+_-]{0,62}\z"#, options: .regularExpression) != nil,
+                  file.path != "index.html" || file.mediaType == "text/html",
+                  (lengthsByDigest[file.digest] ?? file.byteLength) == file.byteLength
+            else { throw ValidationError.invalid("asset declaration") }
+            previous = file.path
+            paths.insert(file.path)
+            lengthsByDigest[file.digest] = file.byteLength
+            total += file.byteLength
+            guard total <= 9_007_199_254_740_991 else { throw ValidationError.invalid("asset manifest length") }
+        }
+        guard total > 0, paths.contains("index.html"), Set(screen.requiredAssets).isSubset(of: paths),
+              try canonical(manifest).count <= assetManifestBytes else {
+            throw ValidationError.invalid("asset manifest bounds")
+        }
+        return total
     }
 }

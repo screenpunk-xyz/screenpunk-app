@@ -24,6 +24,7 @@ public enum WebIsolation: Sendable {
 public final class PackageSchemeHandler: NSObject, WKURLSchemeHandler {
     public let store: PackageAssetStore
     public let rasterResources: PublicRasterResources?
+    private var transfers: [ObjectIdentifier: Task<Void, Never>] = [:]
 
     public init(store: PackageAssetStore, rasterResources: PublicRasterResources? = nil) {
         self.rasterResources = rasterResources
@@ -54,8 +55,29 @@ public final class PackageSchemeHandler: NSObject, WKURLSchemeHandler {
                 headerFields: headers
             )!
             urlSchemeTask.didReceive(response)
-            urlSchemeTask.didReceive(media.data)
-            urlSchemeTask.didFinish()
+            if media.data.count <= Self.transferChunkBytes {
+                urlSchemeTask.didReceive(media.data)
+                urlSchemeTask.didFinish()
+                return
+            }
+
+            let id = ObjectIdentifier(urlSchemeTask)
+            let body = media.data
+            transfers[id] = Task { @MainActor [weak self] in
+                var offset = body.startIndex
+                while offset < body.endIndex {
+                    guard !Task.isCancelled, self != nil else { return }
+                    let end = offset + min(Self.transferChunkBytes, body.endIndex - offset)
+                    autoreleasepool {
+                        urlSchemeTask.didReceive(body.subdata(in: offset..<end))
+                    }
+                    offset = end
+                    await Task.yield()
+                }
+                guard !Task.isCancelled, let self else { return }
+                self.transfers[id] = nil
+                urlSchemeTask.didFinish()
+            }
         } catch {
             let code: URLError.Code = (error as? PackageAssetError) == .missingFile
                 ? .fileDoesNotExist : .noPermissionsToReadFile
@@ -63,6 +85,10 @@ public final class PackageSchemeHandler: NSObject, WKURLSchemeHandler {
         }
     }
 
-    public func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {}
+    private static let transferChunkBytes = 256 * 1024
+
+    public func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {
+        transfers.removeValue(forKey: ObjectIdentifier(urlSchemeTask))?.cancel()
+    }
 }
 #endif

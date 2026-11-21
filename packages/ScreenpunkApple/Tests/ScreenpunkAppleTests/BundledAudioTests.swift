@@ -34,6 +34,28 @@ final class BundledAudioTests: XCTestCase {
         XCTAssertEqual(PackageMediaResponse(asset: empty, range: "bytes=0-").status, 416)
     }
 
+    @MainActor
+    func testLargePackageRangeStreamsInChunks() async throws {
+#if os(macOS)
+        _ = NSApplication.shared
+#endif
+        let body = Data(repeating: 42, count: 768 * 1024)
+        let asset = PackageAsset(path: "tone.wav", data: body, mime: "audio/wav")
+        let handler = PackageSchemeHandler(store: PackageAssetStore(assets: [asset.path: asset]))
+        let webView = WKWebView()
+        var request = URLRequest(url: URL(string: "screenpunk://package/tone.wav")!)
+        request.setValue("bytes=128-", forHTTPHeaderField: "Range")
+        let task = RecordingPackageTask(request: request)
+        handler.webView(webView, start: task)
+        await fulfillment(of: [task.finished], timeout: 5)
+
+        XCTAssertNil(task.error)
+        XCTAssertEqual(task.response?.statusCode, 206)
+        XCTAssertEqual(task.chunks.count, 3)
+        XCTAssertTrue(task.chunks.allSatisfy { $0.count <= 256 * 1024 })
+        XCTAssertEqual(task.chunks.reduce(into: Data()) { $0.append($1) }, Data(body.dropFirst(128)))
+    }
+
     /// Runs the real WKWebView scheme loader and decoder, not a browser mock.
     /// Timeline completion is not proof that a person heard the speakers.
     @MainActor
@@ -143,4 +165,21 @@ final class BundledAudioTests: XCTestCase {
 private final class NavigationWaiter: NSObject, WKNavigationDelegate {
     let loaded = XCTestExpectation(description: "Package navigation")
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { loaded.fulfill() }
+}
+
+private final class RecordingPackageTask: NSObject, WKURLSchemeTask {
+    let request: URLRequest
+    let finished = XCTestExpectation(description: "Package asset transferred")
+    var response: HTTPURLResponse?
+    var chunks: [Data] = []
+    var error: Error?
+
+    init(request: URLRequest) { self.request = request }
+    func didReceive(_ response: URLResponse) { self.response = response as? HTTPURLResponse }
+    func didReceive(_ data: Data) { chunks.append(data) }
+    func didFinish() { finished.fulfill() }
+    func didFailWithError(_ error: any Error) {
+        self.error = error
+        finished.fulfill()
+    }
 }

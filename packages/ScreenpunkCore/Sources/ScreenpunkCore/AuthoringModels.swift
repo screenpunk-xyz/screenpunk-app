@@ -340,6 +340,10 @@ public struct AuthoringBrowserProfileV1: Codable, Sendable, Equatable {
     public var runtime: AuthoringRuntimeV1
 }
 
+public struct AuthoringCustomHTTPDefinition: Codable, Sendable, Equatable {
+    public var rules: [String]
+}
+
 public struct AuthoringDefinitionV1: Codable, Sendable, Equatable {
     public var schemaVersion: Int
     public var designGuidance: AuthoringDesignGuidanceV1
@@ -347,6 +351,7 @@ public struct AuthoringDefinitionV1: Codable, Sendable, Equatable {
     public var serviceCatalog: [AuthoringServiceDefinitionV1]
     public var schemas: [String: AuthoringJSONValue]
     public var screenData: AuthoringScreenDataDefinition?
+    public var customHTTP: AuthoringCustomHTTPDefinition?
     public var browser: AuthoringBrowserProfileV1?
     public init(schemaVersion: Int, designGuidance: AuthoringDesignGuidanceV1, runtime: AuthoringRuntimeV1, serviceCatalog: [AuthoringServiceDefinitionV1], schemas: [String: AuthoringJSONValue], screenData: AuthoringScreenDataDefinition? = nil, browser: AuthoringBrowserProfileV1? = nil) {
         self.schemaVersion = schemaVersion

@@ -15,7 +15,13 @@ public struct AuthoringSourceScreenV2: Codable, Sendable, Equatable {
     public var title: String
     public var entry: String
     public var files: [AuthoringSourceFileV2]
-    public init(title: String, entry: String = "index.html", files: [AuthoringSourceFileV2]) { self.title = title; self.entry = entry; self.files = files }
+    public var packageSchema: Int?
+    public init(title: String, entry: String = "index.html", files: [AuthoringSourceFileV2], packageSchema: Int? = nil) {
+        self.title = title
+        self.entry = entry
+        self.files = files
+        self.packageSchema = packageSchema
+    }
 }
 public struct AuthoringContextV2: Codable, Sendable, Equatable {
     public var profileID: String
@@ -108,6 +114,7 @@ public struct AuthoringResultV2: Codable, Sendable, Equatable {
 public struct AuthoringCapabilitiesV2: Codable, Sendable, Equatable {
     public var contractVersions: [String]
     public var features: [String]
-    public init(contractVersions: [String] = ["1","2"], features: [String] = ["asset-references-v2"]) { self.contractVersions = contractVersions; self.features = features }
+    public init(contractVersions: [String] = ["1","2"], features: [String] = ["asset-references-v2", "package-assets-v2", AuthoringContract.customHTTPFeature]) { self.contractVersions = contractVersions; self.features = features }
     public var supportsV2: Bool { contractVersions.contains("2") && features.contains("asset-references-v2") }
+    public var supportsPackageAssets: Bool { supportsV2 && features.contains("package-assets-v2") }
 }

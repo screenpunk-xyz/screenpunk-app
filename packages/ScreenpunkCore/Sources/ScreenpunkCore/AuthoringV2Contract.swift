@@ -11,8 +11,25 @@ public enum AuthoringV2Contract {
     public static var resultSchema: AuthoringJSONValue { schemas["Result"]! }
     public static var requestSchema: AuthoringJSONValue { schemas["Request"]! }
     public static let capabilities = AuthoringCapabilitiesV2()
-    public static func mediaType(path: String) throws -> String {
-        guard let ext = path.split(separator: ".").last, let media = ["html":"text/html","css":"text/css","js":"text/javascript","json":"application/json","svg":"image/svg+xml","txt":"text/plain"][String(ext)] else { throw AuthoringContractError("unsupported file extension") }
+    public static let nativeFileCountLimit = 512
+    private static let legacyMediaTypes = ["html":"text/html", "css":"text/css", "js":"text/javascript", "json":"application/json", "svg":"image/svg+xml", "txt":"text/plain"]
+    private static let additionalTextMediaTypes = ["mjs":"text/javascript", "md":"text/markdown", "xml":"application/xml", "csv":"text/csv", "vtt":"text/vtt"]
+    private static let assetMediaTypes = ["wav":"audio/wav", "mp3":"audio/mpeg", "ogg":"audio/ogg", "mp4":"video/mp4", "webm":"video/webm", "png":"image/png", "jpg":"image/jpeg", "jpeg":"image/jpeg", "gif":"image/gif", "webp":"image/webp", "avif":"image/avif", "woff":"font/woff", "woff2":"font/woff2"]
+    private static func pathExtension(_ path: String) -> String { (path as NSString).pathExtension }
+    public static func isEditableText(path: String) -> Bool {
+        let ext = pathExtension(path).lowercased()
+        return legacyMediaTypes[ext] != nil || additionalTextMediaTypes[ext] != nil
+    }
+    private static func legacyPath(_ path: String) -> Bool {
+        path.utf8.count <= 160 && path.range(of: #"^[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)*\.(?:html|css|js|json|svg|txt)$"#, options: .regularExpression) == path.startIndex..<path.endIndex
+    }
+    public static func mediaType(path: String, extended: Bool = false) throws -> String {
+        let ext = pathExtension(path)
+        if extended {
+            let lowercased = ext.lowercased()
+            return legacyMediaTypes[lowercased] ?? additionalTextMediaTypes[lowercased] ?? assetMediaTypes[lowercased] ?? "application/octet-stream"
+        }
+        guard let media = legacyMediaTypes[ext] else { throw AuthoringContractError("unsupported file extension") }
         return media
     }
     public static func reference(request: AuthoringRequestV2, file: AuthoringSourceFileV2) throws -> String {
@@ -47,14 +64,21 @@ public enum AuthoringV2Contract {
         guard (request.context.currentScreen != nil) == (request.context.baseRevision != nil) else { throw AuthoringContractError("base revision and source manifest must appear together") }
         if let source = request.context.currentScreen {
             guard !source.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, source.title.utf16.count <= 100 else { throw AuthoringContractError("invalid source title") }
-            var paths = Set<String>(); var bytes = 0
+            let extended = source.packageSchema == 3
+            var paths = Set<String>()
+            var bytes = 0
+            guard extended || source.files.count <= 20 else { throw AuthoringContractError("source file count") }
             for file in source.files {
                 guard paths.insert(file.path.lowercased()).inserted else { throw AuthoringContractError("duplicate source path") }
-                guard file.mediaType == (try mediaType(path: file.path)), file.reference == (try reference(request: request, file: file)) else { throw AuthoringContractError("source scope/reference/media mismatch") }
-                bytes += file.byteLength
+                guard file.reference == (try reference(request: request, file: file)) else { throw AuthoringContractError("source reference mismatch") }
+                if !extended {
+                    guard legacyPath(file.path), file.byteLength <= 204800, file.mediaType == (try mediaType(path: file.path)) else { throw AuthoringContractError("legacy source path, size or media type") }
+                    bytes += file.byteLength
+                }
                 if let content = file.content {
+                    guard !extended || isEditableText(path: file.path) else { throw AuthoringContractError("opaque source must omit content") }
                     guard content.utf8.count == file.byteLength, AuthoringContract.contentDigest(Data(content.utf8)) == file.digest else { throw AuthoringContractError("source content hash/length mismatch") }
-                    if file.path == "manifest.json" { try ScreenDataContract.validateManifestDeclaration(content) }
+                    if file.path == "manifest.json" { try AuthoringContract.validateManifest(content) }
                 }
             }
             guard bytes <= 204800, source.files.contains(where: { $0.path == "index.html" }) else { throw AuthoringContractError("source package limit/entry") }
@@ -78,33 +102,47 @@ public enum AuthoringV2Contract {
         var metadata = result; metadata.screen = nil
         guard try AuthoringContract.encodedCanonical(result).count <= 393216, try AuthoringContract.encodedCanonical(metadata).count <= 131072 else { throw AuthoringContractError("result byte limit") }
         if let screen = result.screen {
+            let extended = request?.context.currentScreen?.packageSchema == 3
+            let legacy = request != nil && !extended
+            if legacy {
+                let paths = screen.files.map(\.path) + screen.files.compactMap(\.sourcePath) + screen.deletedPaths + (screen.requiredAssets ?? [])
+                guard screen.files.count <= 20, screen.deletedPaths.count <= 20, (screen.requiredAssets ?? []).count <= 20,
+                      paths.allSatisfy(legacyPath) else { throw AuthoringContractError("legacy result paths or count") }
+            }
             guard !screen.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, screen.title.utf16.count <= 100 else { throw AuthoringContractError("invalid screen title") }
             var destinations = Set<String>(); var deleted = Set<String>(); var bytes = 0
             let base = request?.context.currentScreen?.files ?? []
-            let supportsScreenData = request.map { $0.runtime == AuthoringContract.runtime(supportsScreenData: true) } ?? true
             let previousManifest = base.first(where: { $0.path == "manifest.json" })?.content
             for path in screen.deletedPaths { guard deleted.insert(path.lowercased()).inserted else { throw AuthoringContractError("duplicate delete path") } }
             for file in screen.files {
                 guard destinations.insert(file.path.lowercased()).inserted, !deleted.contains(file.path.lowercased()) else { throw AuthoringContractError("duplicate/overlapping destination") }
                 if file.kind == "write" {
+                    guard isEditableText(path: file.path) else { throw AuthoringContractError("writes require editable text") }
                     bytes += file.content!.utf8.count
                     if file.path == "manifest.json" {
-                        try ScreenDataContract.validateManifestDeclaration(file.content!, previous: previousManifest, supportsScreenData: supportsScreenData)
+                        try AuthoringContract.validateManifest(file.content!, previous: previousManifest, runtime: request?.runtime)
                     }
                 }
                 else if request != nil {
                     guard let source = base.first(where: { $0.path == file.sourcePath && $0.reference == file.reference && $0.digest == file.digest }) else { throw AuthoringContractError("unknown/out-of-scope source reference") }
-                    bytes += source.byteLength
+                    if extended {
+                        guard file.path == source.path || pathExtension(file.path).lowercased() == pathExtension(source.path).lowercased() else {
+                            throw AuthoringContractError("retain must preserve the file extension")
+                        }
+                    } else {
+                        bytes += source.byteLength
+                    }
                     if file.path == "manifest.json", source.path != file.path {
                         if let content = source.content {
-                            try ScreenDataContract.validateManifestDeclaration(content, previous: previousManifest, supportsScreenData: supportsScreenData)
-                        } else if !supportsScreenData {
+                            try AuthoringContract.validateManifest(content, previous: previousManifest, runtime: request?.runtime)
+                        } else if request?.runtime.features.contains(AuthoringContract.customHTTPFeature) != true
+                                    || AuthoringContract.definition.screenData?.features.allSatisfy({ request?.runtime.features.contains($0) == true }) != true {
                             throw AuthoringContractError("target runtime cannot admit a manifest from an opaque reference")
                         }
                     }
                 }
             }
-            guard bytes <= 204800, screen.files.contains(where: { $0.path == "index.html" }) else { throw AuthoringContractError("materialized entry/byte limit") }
+            guard (!legacy || bytes <= 204800), screen.files.contains(where: { $0.path == "index.html" }) else { throw AuthoringContractError("materialized entry/byte limit") }
             var required = Set<String>()
             for path in screen.requiredAssets ?? [] { guard required.insert(path.lowercased()).inserted, screen.files.contains(where: { $0.path == path }) else { throw AuthoringContractError("missing/duplicate declared asset") } }
             if request != nil {
@@ -116,23 +154,36 @@ public enum AuthoringV2Contract {
     }
     /// Resolver receives an already validated manifest member, never a caller-supplied destination.
     public static func materialize(_ result: AuthoringResultV2, request: AuthoringRequestV2, resolve: (AuthoringSourceFileV2) throws -> Data) throws -> AuthoringScreen {
-        _ = try validateResult(JSONEncoder().encode(result), request: request)
+        guard request.context.currentScreen?.packageSchema != 3 else { throw AuthoringContractError("asset packages require byte materialization") }
+        let bytes = try materializeBytes(result, request: request, resolve: resolve)
         guard let mutation = result.screen else { throw AuthoringContractError("result has no screen") }
-        var files: [AuthoringScreenFile] = []
-        for file in mutation.files {
-            if file.kind == "write" { files.append(.init(path: file.path, content: file.content!)); continue }
-            let source = request.context.currentScreen!.files.first(where: { $0.path == file.sourcePath })!
-            let bytes = try resolve(source)
-            guard bytes.count == source.byteLength, AuthoringContract.contentDigest(bytes) == source.digest, String(data: bytes, encoding: .utf8) != nil else { throw AuthoringContractError("pinned source missing/corrupt/not UTF8") }
-            let content = String(decoding: bytes, as: UTF8.self)
-            if file.path == "manifest.json", source.path != file.path {
-                try ScreenDataContract.validateManifestDeclaration(content,
-                    previous: request.context.currentScreen?.files.first(where: { $0.path == "manifest.json" })?.content,
-                    supportsScreenData: request.runtime == AuthoringContract.runtime(supportsScreenData: true))
-            }
-            files.append(.init(path: file.path, content: content))
+        let files = try mutation.files.map { file in
+            let data = bytes[file.path]!
+            guard String(data: data, encoding: .utf8) != nil else { throw AuthoringContractError("pinned source is not UTF8") }
+            return AuthoringScreenFile(path: file.path, content: String(decoding: data, as: UTF8.self))
         }
         return try AuthoringContract.validateScreen(JSONEncoder().encode(AuthoringScreen(title: mutation.title, entry: mutation.entry, files: files)))
+    }
+
+    /// Verifies retained assets as raw bytes, including files with no text representation.
+    public static func materializeBytes(_ result: AuthoringResultV2, request: AuthoringRequestV2, resolve: (AuthoringSourceFileV2) throws -> Data) throws -> [String: Data] {
+        _ = try validateResult(JSONEncoder().encode(result), request: request)
+        guard let mutation = result.screen else { throw AuthoringContractError("result has no screen") }
+        var files: [String: Data] = [:]
+        for file in mutation.files {
+            if file.kind == "write" { files[file.path] = Data(file.content!.utf8); continue }
+            let source = request.context.currentScreen!.files.first(where: { $0.path == file.sourcePath })!
+            let bytes = try resolve(source)
+            guard bytes.count == source.byteLength, AuthoringContract.contentDigest(bytes) == source.digest else { throw AuthoringContractError("pinned source missing/corrupt") }
+            if file.path == "manifest.json", source.path != file.path {
+                guard String(data: bytes, encoding: .utf8) != nil else { throw AuthoringContractError("manifest source is not UTF8") }
+                try AuthoringContract.validateManifest(String(decoding: bytes, as: UTF8.self),
+                    previous: request.context.currentScreen?.files.first(where: { $0.path == "manifest.json" })?.content,
+                    runtime: request.runtime)
+            }
+            files[file.path] = bytes
+        }
+        return files
     }
     private static func json(_ data: Data) throws -> Any { try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) }
     private static func validateSchema(_ name: String, data: Data) throws {

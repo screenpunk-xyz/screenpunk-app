@@ -25,4 +25,13 @@ public enum CatalogPreviewCapturePolicy {
               Set(actual.files.keys) == Set(package.files.map(\.path)) else { return false }
         return package.files.allSatisfy { file in actual.files[file.path] == CatalogObjectDeclaration(byteLength: file.byteLength, digest: file.digest) }
     }
+    public static func allows(_ actual: CatalogPreviewCaptureProof, scope: CatalogPreviewScope, revision: String, generation: UUID, manifest: CatalogAssetManifest, packageDigest: String) -> Bool {
+        guard actual.scope == scope, actual.revision == revision, actual.generation == generation,
+              [scope.origin, scope.accountID, scope.profileID, scope.libraryID, scope.deviceID].allSatisfy({ !$0.isEmpty }),
+              (try? CatalogContract.validateAssetManifest(manifest)) != nil,
+              let canonical = try? CatalogContract.canonical(manifest), CatalogContract.digest(canonical) == packageDigest,
+              Set(actual.files.keys) == Set(manifest.files.map(\.path)) else { return false }
+        return manifest.files.allSatisfy { file in actual.files[file.path] == CatalogObjectDeclaration(byteLength: file.byteLength, digest: file.digest) }
+    }
+
 }

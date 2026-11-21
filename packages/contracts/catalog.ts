@@ -6,14 +6,36 @@ import { authoringContentDigestV2, authoringMediaTypeV2 } from './authoring-v2';
 import { validateScreenDataDeclaration } from './screen-data';
 export const CATALOG_CAPABILITY = 'catalog-backup-v1';
 export const CATALOG_VERSION = '1';
+export const CATALOG_ASSET_BACKUP_VERSION = '1';
+export const CATALOG_LINKED_INSTALL_VERSION = '1';
+export const CATALOG_LINKED_INSTALL_HEADER = 'X-Screenpunk-Catalog-Links';
+export const CATALOG_ASSET_CHUNK_BYTES = 512 * 1024;
+export const CATALOG_ASSET_BEGIN_BYTES = 256 * 1024;
+export const CATALOG_ASSET_FILE_COUNT = 512;
 export const CATALOG_LIMITS = Object.freeze({ versionsPerScreen:3, screensPerAccount:20, packageBytes:10*1024*1024, previewBytes:512*1024, previewDimension:2048, accountBytes:1024*1024*1024, publicationOverlapBytes:20*1024*1024, queueRevisions:100, queueBytes:100*1024*1024, files:20, fileBytes:204800 });
-export const CATALOG_ROUTES = Object.freeze({ capabilities:'/api/catalog/capabilities', begin:'/api/catalog/backups/begin', uploads:'/api/catalog/backups/', operations:'/api/catalog/backups/operations/', list:'/api/catalog', screens:'/api/catalog/screens/', previewCandidates:'/api/catalog/preview-candidates', previewBegin:'/api/catalog/previews/begin', previewUploads:'/api/catalog/previews/', previewOperations:'/api/catalog/previews/operations/' });
+export const CATALOG_ROUTES = Object.freeze({ capabilities:'/api/catalog/capabilities', begin:'/api/catalog/backups/begin', uploads:'/api/catalog/backups/', operations:'/api/catalog/backups/operations/', list:'/api/catalog', screens:'/api/catalog/screens/', previewCandidates:'/api/catalog/preview-candidates', previewBegin:'/api/catalog/previews/begin', previewUploads:'/api/catalog/previews/', previewOperations:'/api/catalog/previews/operations/', linkedInstalls:'/api/catalog/linked-installs', linkedUpdates:'/api/catalog/linked-installs/updates' });
 export type CatalogErrorCode = 'not_entitled'|'offline'|'quota_exceeded'|'invalid_package'|'conflict'|'deleted'|'retry_later'|'unauthorized'|'not_found';
 export interface CatalogError { code:CatalogErrorCode; message:string; retryAfterSeconds?:number; restartOperation?:true }
 export interface CatalogEntitlement { backupEnabled:boolean; reason:string; versionsPerScreen:number; screensPerAccount:number; packageBytes:number; previewBytes:number; previewDimension:number; accountBytes:number; publicationOverlapBytes:number }
-export interface CatalogCapability { version:'1'; feature:'catalog-backup-v1'; previewMediaTypes:('image/png'|'image/jpeg')[]; previewBackfillVersion?:'1'; entitlement:CatalogEntitlement }
+export interface CatalogCapability { version:'1'; feature:'catalog-backup-v1'; previewMediaTypes:('image/png'|'image/jpeg')[]; previewBackfillVersion?:'1'; assetBackupVersion?:'1'; linkedInstallVersion?:'1'; entitlement:CatalogEntitlement }
 export interface CatalogPackageFile { path:string; mediaType:string; byteLength:number; digest:string; contentBase64:string }
-export interface CatalogPackage { schemaVersion:1; screen:{ title:string; entry:'index.html'; requiredAssets:string[]; externalDependencies:string[] }; files:CatalogPackageFile[] }
+export interface CatalogPackage { schemaVersion:1|2; screen:{ title:string; entry:'index.html'; requiredAssets:string[]; externalDependencies:string[] }; files:CatalogPackageFile[] }
+export type CatalogAssetFile = Omit<CatalogPackageFile,'contentBase64'>;
+export interface CatalogAssetManifest { schemaVersion:1|2; screen:CatalogPackage['screen']; files:CatalogAssetFile[] }
+export interface CatalogAssetBeginBackup { backup:CatalogBeginBackup; manifest:CatalogAssetManifest; link?:CatalogLinkedPublication }
+export interface CatalogLinkedPublication { catalogScreenID:string; baseVersionID:string }
+export interface CatalogLinkedInstall {
+ schemaVersion:1; catalogScreenID:string; versionID:string; sourceRevisionID:string; packageDigest:string;
+ libraryID:string; localScreenID:string; localRevisionID:string; commitCounter:number;
+}
+export interface CatalogLinkedSubscription {
+ schemaVersion:1; catalogScreenID:string; copyID:string; libraryID:string; localScreenID:string;
+ localRevisionID:string; commitCounter:number; installedVersionID:string; installedSourceRevisionID:string;
+ installedDisplayVersion:number; installedPackageDigest:string; linkedDeviceCount:number; current?:CatalogVersion;
+}
+export interface CatalogLinkedUpdates { schemaVersion:1; subscriptions:CatalogLinkedSubscription[]; nextCursor?:string }
+export interface CatalogLinkedDeleteResult { schemaVersion:1; catalogScreenID:string; deleted:true }
+export interface CatalogAssetBackupStatus extends CatalogBackupStatus { missingFiles:{digest:string;offset:number}[] }
 export interface CatalogObjectDeclaration { byteLength:number; digest:string }
 export interface CatalogPreviewDeclaration extends CatalogObjectDeclaration { mediaType:'image/png'|'image/jpeg'; width:number; height:number }
 export interface CatalogGapDeclaration { checkpointCounter:number; checkpointRevisionID:string; skippedFromCounter:number; skippedThroughCounter:number; reason:'user_acknowledged_backup_pause' }
@@ -26,7 +48,8 @@ export type CatalogBackupState = 'pending'|'uploaded'|'completed'|'duplicate'|'s
 export interface CatalogBackupStatus { schemaVersion:1; operationID:string; state:CatalogBackupState; catalogScreenID:string; uploadID?:string; versionID?:string; displayVersion?:number; expiresAt?:string; error?:CatalogError }
 export interface CatalogCompleteBackup { schemaVersion:1; operationID:string }
 export type CatalogPreview = { status:'available'; source?:'exact_package'; capturedAt?:string; mediaType:'image/png'|'image/jpeg'; byteLength:number; digest:string; width:number; height:number } | { status:'unavailable'; reason:'not_provided'|'invalid'|'capture_failed' };
-export interface CatalogVersion { versionID:string; catalogScreenID:string; displayVersion:number; sourceRevisionID:string; parentRevisionIDs:string[]; copyID:string; commitCounter:number; screenName:string; versionName?:string; note?:string; sourceAppliedAt:string; backedUpAt:string; packageSchema:1; packageDigest:string; sizeBytes:number; deviceDisplayName:string; deviceLinked:boolean; integrity?:'missing'; preview:CatalogPreview }
+interface CatalogVersionMetadata { versionID:string; catalogScreenID:string; displayVersion:number; sourceRevisionID:string; parentRevisionIDs:string[]; copyID:string; commitCounter:number; screenName:string; versionName?:string; note?:string; sourceAppliedAt:string; backedUpAt:string; packageDigest:string; sizeBytes:number; deviceDisplayName:string; deviceLinked:boolean; integrity?:'missing'; preview:CatalogPreview }
+export type CatalogVersion = CatalogVersionMetadata & ({ packageSchema:1|2; packageStorage?:never } | { packageSchema:3; packageStorage:'assets' });
 export interface CatalogScreen { catalogScreenID:string; latest:CatalogVersion; history:CatalogVersion[] }
 export interface CatalogList { schemaVersion:1; catalogRevision:number; entitlement:CatalogEntitlement; usage:{storedBytes:number;reservedBytes:number;cleanupBytes:number}; screens:CatalogScreen[]; nextCursor?:string }
 export interface CatalogDeleteResult { schemaVersion:1; catalogScreenID:string; versionID:string; deleted:true; catalogRevision:number }
@@ -47,7 +70,7 @@ export function validateCatalogWire(name:keyof typeof CATALOG_SCHEMAS,value:unkn
  const v=value as any;if(name==='Error'&&v.restartOperation&&v.code!=='retry_later'||(name==='BackupStatus'||name==='PreviewStatus')&&v.error?.restartOperation&&(v.state!=='failed'||v.error.code!=='retry_later'))throw Error('Catalog restart requires expired failed operation');
 }
 export interface CatalogPNGPreviewDeclaration extends Omit<CatalogPreviewDeclaration,'mediaType'> { mediaType:'image/png' }
-export interface CatalogPreviewCandidate { catalogScreenID:string; versionID:string; libraryID:string; localScreenID:string; sourceRevisionID:string; packageDigest:string; packageBytes:number }
+export interface CatalogPreviewCandidate { catalogScreenID:string; versionID:string; libraryID:string; localScreenID:string; sourceRevisionID:string; packageDigest:string; packageBytes:number; packageStorage?:'assets' }
 export interface CatalogPreviewCandidates { schemaVersion:1; candidates:CatalogPreviewCandidate[]; nextCursor?:string }
 export interface CatalogPreviewBegin { schemaVersion:1; operationID:string; catalogScreenID:string; versionID:string; libraryID:string; localScreenID:string; sourceRevisionID:string; packageDigest:string; capturedAt:string; source:'exact_package'; preview:CatalogPNGPreviewDeclaration }
 export interface CatalogPreviewStatus { schemaVersion:1; operationID:string; catalogScreenID:string; versionID:string; state:'pending'|'uploaded'|'completed'|'duplicate'|'deleted'|'failed'; uploadID?:string; expiresAt?:string; error?:CatalogError }
@@ -61,9 +84,9 @@ const id = (v:unknown) => typeof v==='string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,12
 const integer = (v:unknown,max:number,min=1) => typeof v==='number'&&Number.isSafeInteger(v)&&v>=min&&v<=max;
 const digest = (v:unknown) => typeof v==='string'&&/^[a-f0-9]{64}$/.test(v);
 const timestamp = (v:unknown) => typeof v==='string'&&/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(v)&&Number.isFinite(Date.parse(v))&&new Date(v).toISOString()===v;
-export function validateCatalogObject(value:unknown,max=CATALOG_LIMITS.packageBytes):CatalogObjectDeclaration { keys(value,['byteLength','digest']);const v=value as CatalogObjectDeclaration;if(!integer(v.byteLength,max)||!digest(v.digest))fail('invalid object declaration');return v; }
-export function validateCatalogBeginBackup(value:unknown):CatalogBeginBackup {
- validateCatalogWire('BeginBackup',value);
+export function validateCatalogObject(value:unknown,max:number=CATALOG_LIMITS.packageBytes):CatalogObjectDeclaration { keys(value,['byteLength','digest']);const v=value as CatalogObjectDeclaration;if(!integer(v.byteLength,max)||!digest(v.digest))fail('invalid object declaration');return v; }
+export function validateCatalogBeginBackup(value:unknown, options:{assetManifest?:boolean}={}):CatalogBeginBackup {
+ validateCatalogWire(options.assetManifest ? 'AssetBackupMetadata' : 'BeginBackup',value);
  keys(value,['schemaVersion','operationID','libraryID','localScreenID','sourceRevisionID','parentRevisionIDs','predecessorRevisionID','commitCounter','origin','sourceAppliedAt','screenName','package'],['versionName','note','preview','gap']);
  const v=value as CatalogBeginBackup;
  if(v.schemaVersion!==1||![v.operationID,v.libraryID,v.localScreenID,v.sourceRevisionID].every(id)||!integer(v.commitCounter,Number.MAX_SAFE_INTEGER)||!['applied','seed'].includes(v.origin)||!timestamp(v.sourceAppliedAt)||!bounded(v.screenName,100))fail('invalid begin metadata');
@@ -71,7 +94,7 @@ export function validateCatalogBeginBackup(value:unknown):CatalogBeginBackup {
  if(v.predecessorRevisionID!==null&&!v.parentRevisionIDs.includes(v.predecessorRevisionID))fail('predecessor must be a parent');
  if(v.versionName!==undefined&&!bounded(v.versionName,100)||v.note!==undefined&&!bounded(v.note,1000))fail('invalid label');
  if(v.gap!==undefined){const g=v.gap;keys(g,['checkpointCounter','checkpointRevisionID','skippedFromCounter','skippedThroughCounter','reason']);if(v.origin!=='seed'||!integer(g.checkpointCounter,Number.MAX_SAFE_INTEGER)||!id(g.checkpointRevisionID)||!integer(g.skippedFromCounter,Number.MAX_SAFE_INTEGER)||!integer(g.skippedThroughCounter,Number.MAX_SAFE_INTEGER)||g.skippedFromCounter!==g.checkpointCounter+1||g.skippedThroughCounter<g.skippedFromCounter||v.commitCounter!==g.skippedThroughCounter+1||v.predecessorRevisionID!==g.checkpointRevisionID||g.reason!=='user_acknowledged_backup_pause')fail('invalid gap checkpoint');}
- validateCatalogObject(v.package);
+ validateCatalogObject(v.package, options.assetManifest ? Number.MAX_SAFE_INTEGER : CATALOG_LIMITS.packageBytes);
  if(v.preview!==undefined){ keys(v.preview,['byteLength','digest','mediaType','width','height']);validateCatalogObject({byteLength:v.preview.byteLength,digest:v.preview.digest},CATALOG_LIMITS.previewBytes);if(!['image/png','image/jpeg'].includes(v.preview.mediaType)||!integer(v.preview.width,2048)||!integer(v.preview.height,2048))fail('invalid preview'); }
  return v;
 }
@@ -80,16 +103,17 @@ export async function validateCatalogPackage(value:unknown):Promise<CatalogPacka
  validateCatalogWire('Package',value);
  keys(value,['schemaVersion','screen','files']);const v=value as CatalogPackage;
  keys(v.screen,['title','entry','requiredAssets','externalDependencies']);
- if(v.schemaVersion!==1||v.screen.entry!=='index.html'||!bounded(v.screen.title,100)||!Array.isArray(v.files)||v.files.length<1||v.files.length>20)fail('invalid package');
+ if(![1,2].includes(v.schemaVersion)||v.screen.entry!=='index.html'||!bounded(v.screen.title,100)||!Array.isArray(v.files)||v.files.length<1||v.files.length>20)fail('invalid package');
  if(!Array.isArray(v.screen.requiredAssets)||v.screen.requiredAssets.length>20||!v.screen.requiredAssets.every(catalogSafePath)||new Set(v.screen.requiredAssets).size!==v.screen.requiredAssets.length)fail('invalid required assets');
  if(!Array.isArray(v.screen.externalDependencies)||v.screen.externalDependencies.length>20||!v.screen.externalDependencies.every(s=>bounded(s,160)))fail('invalid external dependencies');
+ const extended=v.schemaVersion===2; let expanded=0;
  let previous='';const folded=new Set<string>();const textFiles:{path:string;content:string}[]=[];
- for(const file of v.files){keys(file,['path','mediaType','byteLength','digest','contentBase64']);if(!catalogSafePath(file.path)||file.path<=previous||folded.has(file.path.toLowerCase())||!integer(file.byteLength,204800,0)||!digest(file.digest)||file.mediaType!==authoringMediaTypeV2(file.path)||typeof file.contentBase64!=='string'||file.contentBase64.length>273068)fail('invalid file');previous=file.path;folded.add(file.path.toLowerCase());let raw:string;try{raw=atob(file.contentBase64);}catch{return fail('invalid base64');}if(btoa(raw)!==file.contentBase64)fail('noncanonical base64');const bytes=Uint8Array.from(raw,c=>c.charCodeAt(0));if(bytes.length!==file.byteLength||await authoringContentDigestV2(bytes)!==file.digest)fail('file integrity mismatch');let content:string;try{content=new TextDecoder('utf-8',{fatal:true,ignoreBOM:false}).decode(bytes);}catch{return fail('invalid UTF-8');}if(catalogContainsCredentials(file.path,content))fail('credential-bearing package');textFiles.push({path:file.path,content});}
+ for(const file of v.files){keys(file,['path','mediaType','byteLength','digest','contentBase64']);if(!catalogSafePath(file.path)||file.path<=previous||folded.has(file.path.toLowerCase())||!integer(file.byteLength,extended ? 2*1024*1024 : 204800,0)||!digest(file.digest)||file.mediaType!==catalogMediaType(file.path,extended)||typeof file.contentBase64!=='string'||file.contentBase64.length>(extended ? 2796204 : 273068))fail('invalid file');previous=file.path;folded.add(file.path.toLowerCase());let raw:string;try{raw=atob(file.contentBase64);}catch{return fail('invalid base64');}if(btoa(raw)!==file.contentBase64)fail('noncanonical base64');const bytes=Uint8Array.from(raw,c=>c.charCodeAt(0));if(bytes.length!==file.byteLength||await authoringContentDigestV2(bytes)!==file.digest)fail('file integrity mismatch');expanded+=bytes.length;if(expanded>4*1024*1024)fail('expanded package exceeds limit');if(extended&&file.mediaType.startsWith('audio/')){if(catalogContainsCredentials(file.path,raw))fail('credential-bearing package');validateCatalogAudio(file.mediaType,bytes);textFiles.push({path:file.path,content:''});continue;}let content:string;try{content=new TextDecoder('utf-8',{fatal:true,ignoreBOM:false}).decode(bytes);}catch{return fail('invalid UTF-8');}if(catalogContainsCredentials(file.path,content))fail('credential-bearing package');textFiles.push({path:file.path,content});}
  if(!folded.has('index.html')||v.screen.requiredAssets.some(p=>!v.files.some(f=>f.path===p)))fail('missing package asset');
  // Existing screen rules remain stricter than the catalog transport budget.
- validateCatalogManifest(v.files,textFiles);
+ validateCatalogManifest(v.files,textFiles,extended);
  const dependencies=catalogDependencies(textFiles);if(dependencies.requiredAssets.some(p=>!v.screen.requiredAssets.includes(p))||dependencies.externalDependencies.some(p=>!v.screen.externalDependencies.includes(p)))fail('undeclared package dependency');
- validateAuthoringScreen({title:v.screen.title,entry:'index.html',files:textFiles});
+ if(!extended)validateAuthoringScreen({title:v.screen.title,entry:'index.html',files:textFiles});
  if(new TextEncoder().encode(canonicalJSON(v)).length>CATALOG_LIMITS.packageBytes)fail('package exceeds limit');return v;
 }
 export async function encodeCatalogPackage(value:unknown):Promise<Uint8Array> { return new TextEncoder().encode(canonicalJSON(await validateCatalogPackage(value))); }
@@ -114,10 +138,22 @@ export function catalogDependencies(files:{path:string;content:string}[]):{requi
  return {requiredAssets:[...local].sort(),externalDependencies:[...external].sort()};
 }
 /** Optional SDK manifest must enumerate the complete materialized package. */
-export function validateCatalogManifest(files:CatalogPackageFile[],textFiles:{path:string;content:string}[]):void {
- const source=textFiles.find(f=>f.path==='manifest.json');if(!source)return;let m:any;try{m=JSON.parse(source.content);}catch{return fail('invalid SDK manifest JSON');}
+export function validateCatalogManifest(files:CatalogPackageFile[],textFiles:{path:string;content:string}[],extended=false):void {
+ const source=textFiles.find(f=>f.path==='manifest.json');if(!source){if(extended)fail('SDK manifest required for package v2');return;}let m:any;try{m=JSON.parse(source.content);}catch{return fail('invalid SDK manifest JSON');}
  if(!plain(m)||m.schemaVersion!==1||m.sdkVersion!=='1'||m.entrypoint!=='index.html'||!['dashboardId','name','revision'].every(k=>bounded(m[k],160))||/password|secret|token|api[_-]?key|bearer/.test(m.dashboardId+m.name+m.entrypoint)||!plain(m.target)||!bounded(m.target.profileId,160)||!integer(m.target.width,Number.MAX_SAFE_INTEGER)||!integer(m.target.height,Number.MAX_SAFE_INTEGER)||typeof m.target.scale!=='number'||!Number.isFinite(m.target.scale)||!['portrait','landscape'].includes(m.target.orientation)||!Array.isArray(m.connections)||m.connections.length>20||!Array.isArray(m.files)||m.files.length>20)fail('invalid SDK manifest');
  if(Object.hasOwn(m,'screenData'))try{validateScreenDataDeclaration(m.screenData);}catch{return fail('invalid screenData declaration');}
  const aliases=new Set<string>();for(const c of m.connections){if(!plain(c)||!bounded(c.alias,160)||typeof c.required!=='boolean'||aliases.has(c.alias))fail('invalid manifest connection');aliases.add(c.alias);if(c.operations!==undefined&&(!Array.isArray(c.operations)||c.operations.some((o:any)=>!plain(o)||!bounded(o.name,160)||!bounded(o.kind,160))))fail('invalid manifest operations');}
- const actual=new Map(files.filter(f=>f.path!=='manifest.json').map(f=>[f.path,f]));if(m.files.length!==actual.size)fail('incomplete SDK manifest');const seen=new Set();let total=0;for(const d of m.files){if(!plain(d)||!catalogSafePath(d.path)||seen.has(d.path)||!integer(d.bytes,204800,0)||!digest(d.sha256))fail('invalid SDK manifest file');const file=actual.get(d.path);if(!file||d.bytes!==file.byteLength||d.sha256!==file.digest)fail('SDK manifest integrity mismatch');seen.add(d.path);total+=d.bytes;}if(!seen.has('index.html')||total>204800)fail('invalid SDK manifest entry');
+ const actual=new Map(files.filter(f=>f.path!=='manifest.json').map(f=>[f.path,f]));if(m.files.length!==actual.size)fail('incomplete SDK manifest');const seen=new Set();let total=0;for(const d of m.files){if(!plain(d)||!catalogSafePath(d.path)||seen.has(d.path)||!integer(d.bytes,extended ? 2*1024*1024 : 204800,0)||!digest(d.sha256))fail('invalid SDK manifest file');const file=actual.get(d.path);if(!file||d.bytes!==file.byteLength||d.sha256!==file.digest)fail('SDK manifest integrity mismatch');seen.add(d.path);total+=d.bytes;}if(!seen.has('index.html')||total>(extended ? 4*1024*1024 : 204800))fail('invalid SDK manifest entry');
+}
+
+/** Package v2 preserves bounded native assets; authoring wire limits are unchanged. */
+export function catalogMediaType(path:string,extended=false):string {
+ const audio:Record<string,string>={wav:'audio/wav',mp3:'audio/mpeg'};
+ return (extended ? audio[path.split('.').pop()!] : undefined) ?? authoringMediaTypeV2(path);
+}
+export function validateCatalogAudio(mediaType:string,bytes:Uint8Array):void {
+ const ascii=(at:number,count:number)=>String.fromCharCode(...bytes.subarray(at,at+count));
+ if(mediaType==='audio/wav'&&bytes.length>=12&&ascii(0,4)==='RIFF'&&ascii(8,4)==='WAVE')return;
+ if(mediaType==='audio/mpeg'&&bytes.length>=3&&(ascii(0,3)==='ID3'||bytes[0]===255&&(bytes[1]&224)===224))return;
+ fail('invalid bundled audio header');
 }

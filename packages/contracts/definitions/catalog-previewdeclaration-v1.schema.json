@@ -267,13 +267,15 @@
             "text/javascript",
             "application/json",
             "image/svg+xml",
-            "text/plain"
+            "text/plain",
+            "audio/wav",
+            "audio/mpeg"
           ]
         },
         "byteLength": {
           "type": "integer",
           "minimum": 0,
-          "maximum": 204800
+          "maximum": 2097152
         },
         "digest": {
           "type": "string",
@@ -284,7 +286,7 @@
         "contentBase64": {
           "type": "string",
           "minLength": 0,
-          "maxLength": 273068
+          "maxLength": 2796204
         }
       },
       "required": [
@@ -300,7 +302,10 @@
       "type": "object",
       "properties": {
         "schemaVersion": {
-          "const": 1
+          "enum": [
+            1,
+            2
+          ]
         },
         "screen": {
           "type": "object",
@@ -500,6 +505,12 @@
         },
         "previewBackfillVersion": {
           "const": "1"
+        },
+        "assetBackupVersion": {
+          "const": "1"
+        },
+        "linkedInstallVersion": {
+          "const": "1"
         }
       },
       "required": [
@@ -694,129 +705,265 @@
       ]
     },
     "Version": {
-      "type": "object",
-      "properties": {
-        "versionID": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 128,
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
-        },
-        "catalogScreenID": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 128,
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
-        },
-        "displayVersion": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 9007199254740991
-        },
-        "sourceRevisionID": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 128,
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
-        },
-        "parentRevisionIDs": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 128,
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "versionID": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+            },
+            "catalogScreenID": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+            },
+            "displayVersion": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "sourceRevisionID": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+            },
+            "parentRevisionIDs": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+              },
+              "minItems": 0,
+              "maxItems": 8,
+              "uniqueItems": true
+            },
+            "copyID": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+            },
+            "commitCounter": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "screenName": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100
+            },
+            "versionName": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100
+            },
+            "note": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1000
+            },
+            "sourceAppliedAt": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 24,
+              "pattern": "^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d\\.\\d{3}Z$"
+            },
+            "backedUpAt": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 24,
+              "pattern": "^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d\\.\\d{3}Z$"
+            },
+            "packageSchema": {
+              "enum": [
+                1,
+                2
+              ]
+            },
+            "packageDigest": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64,
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "sizeBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10485760
+            },
+            "deviceDisplayName": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100
+            },
+            "deviceLinked": {
+              "type": "boolean"
+            },
+            "preview": {
+              "$ref": "#/$defs/Preview"
+            },
+            "integrity": {
+              "const": "missing"
+            }
           },
-          "minItems": 0,
-          "maxItems": 8,
-          "uniqueItems": true
+          "required": [
+            "versionID",
+            "catalogScreenID",
+            "displayVersion",
+            "sourceRevisionID",
+            "parentRevisionIDs",
+            "copyID",
+            "commitCounter",
+            "screenName",
+            "sourceAppliedAt",
+            "backedUpAt",
+            "packageSchema",
+            "packageDigest",
+            "sizeBytes",
+            "deviceDisplayName",
+            "deviceLinked",
+            "preview"
+          ],
+          "additionalProperties": false
         },
-        "copyID": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 128,
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
-        },
-        "commitCounter": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 9007199254740991
-        },
-        "screenName": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 100
-        },
-        "versionName": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 100
-        },
-        "note": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 1000
-        },
-        "sourceAppliedAt": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 24,
-          "pattern": "^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d\\.\\d{3}Z$"
-        },
-        "backedUpAt": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 24,
-          "pattern": "^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d\\.\\d{3}Z$"
-        },
-        "packageSchema": {
-          "const": 1
-        },
-        "packageDigest": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 64,
-          "pattern": "^[a-f0-9]{64}$"
-        },
-        "sizeBytes": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 10485760
-        },
-        "deviceDisplayName": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 100
-        },
-        "deviceLinked": {
-          "type": "boolean"
-        },
-        "preview": {
-          "$ref": "#/$defs/Preview"
-        },
-        "integrity": {
-          "const": "missing"
+        {
+          "type": "object",
+          "properties": {
+            "versionID": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+            },
+            "catalogScreenID": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+            },
+            "displayVersion": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "sourceRevisionID": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+            },
+            "parentRevisionIDs": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+              },
+              "minItems": 0,
+              "maxItems": 8,
+              "uniqueItems": true
+            },
+            "copyID": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+            },
+            "commitCounter": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "screenName": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100
+            },
+            "versionName": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100
+            },
+            "note": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1000
+            },
+            "sourceAppliedAt": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 24,
+              "pattern": "^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d\\.\\d{3}Z$"
+            },
+            "backedUpAt": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 24,
+              "pattern": "^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d\\.\\d{3}Z$"
+            },
+            "packageSchema": {
+              "const": 3
+            },
+            "packageDigest": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64,
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "sizeBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "deviceDisplayName": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100
+            },
+            "deviceLinked": {
+              "type": "boolean"
+            },
+            "preview": {
+              "$ref": "#/$defs/Preview"
+            },
+            "integrity": {
+              "const": "missing"
+            },
+            "packageStorage": {
+              "const": "assets"
+            }
+          },
+          "required": [
+            "versionID",
+            "catalogScreenID",
+            "displayVersion",
+            "sourceRevisionID",
+            "parentRevisionIDs",
+            "copyID",
+            "commitCounter",
+            "screenName",
+            "sourceAppliedAt",
+            "backedUpAt",
+            "packageSchema",
+            "packageDigest",
+            "sizeBytes",
+            "deviceDisplayName",
+            "deviceLinked",
+            "preview",
+            "packageStorage"
+          ],
+          "additionalProperties": false
         }
-      },
-      "required": [
-        "versionID",
-        "catalogScreenID",
-        "displayVersion",
-        "sourceRevisionID",
-        "parentRevisionIDs",
-        "copyID",
-        "commitCounter",
-        "screenName",
-        "sourceAppliedAt",
-        "backedUpAt",
-        "packageSchema",
-        "packageDigest",
-        "sizeBytes",
-        "deviceDisplayName",
-        "deviceLinked",
-        "preview"
-      ],
-      "additionalProperties": false
+      ]
     },
     "Screen": {
       "type": "object",
@@ -948,60 +1095,124 @@
       "additionalProperties": false
     },
     "PreviewCandidate": {
-      "type": "object",
-      "properties": {
-        "catalogScreenID": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 128,
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "catalogScreenID": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+            },
+            "versionID": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+            },
+            "libraryID": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+            },
+            "localScreenID": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+            },
+            "sourceRevisionID": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+            },
+            "packageDigest": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64,
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "packageBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10485760
+            }
+          },
+          "required": [
+            "catalogScreenID",
+            "versionID",
+            "libraryID",
+            "localScreenID",
+            "sourceRevisionID",
+            "packageDigest",
+            "packageBytes"
+          ],
+          "additionalProperties": false
         },
-        "versionID": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 128,
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
-        },
-        "libraryID": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 128,
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
-        },
-        "localScreenID": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 128,
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
-        },
-        "sourceRevisionID": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 128,
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
-        },
-        "packageDigest": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 64,
-          "pattern": "^[a-f0-9]{64}$"
-        },
-        "packageBytes": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 10485760
+        {
+          "type": "object",
+          "properties": {
+            "catalogScreenID": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+            },
+            "versionID": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+            },
+            "libraryID": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+            },
+            "localScreenID": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+            },
+            "sourceRevisionID": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+            },
+            "packageDigest": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64,
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "packageBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "packageStorage": {
+              "const": "assets"
+            }
+          },
+          "required": [
+            "catalogScreenID",
+            "versionID",
+            "libraryID",
+            "localScreenID",
+            "sourceRevisionID",
+            "packageDigest",
+            "packageBytes",
+            "packageStorage"
+          ],
+          "additionalProperties": false
         }
-      },
-      "required": [
-        "catalogScreenID",
-        "versionID",
-        "libraryID",
-        "localScreenID",
-        "sourceRevisionID",
-        "packageDigest",
-        "packageBytes"
-      ],
-      "additionalProperties": false
+      ]
     },
     "PreviewCandidates": {
       "type": "object",
@@ -1224,6 +1435,368 @@
           }
         }
       ]
+    },
+    "AssetObject": {
+      "type": "object",
+      "properties": {
+        "byteLength": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "digest": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      },
+      "required": [
+        "byteLength",
+        "digest"
+      ],
+      "additionalProperties": false
+    },
+    "AssetBackupMetadata": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "operationID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "libraryID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "localScreenID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "sourceRevisionID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+        },
+        "parentRevisionIDs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+          },
+          "minItems": 0,
+          "maxItems": 8,
+          "uniqueItems": true
+        },
+        "predecessorRevisionID": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "commitCounter": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "origin": {
+          "enum": [
+            "applied",
+            "seed"
+          ]
+        },
+        "sourceAppliedAt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 24,
+          "pattern": "^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d\\.\\d{3}Z$"
+        },
+        "screenName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "versionName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "note": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "gap": {
+          "$ref": "#/$defs/Gap"
+        },
+        "package": {
+          "$ref": "#/$defs/AssetObject"
+        },
+        "preview": {
+          "$ref": "#/$defs/PreviewDeclaration"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "operationID",
+        "libraryID",
+        "localScreenID",
+        "sourceRevisionID",
+        "parentRevisionIDs",
+        "predecessorRevisionID",
+        "commitCounter",
+        "origin",
+        "sourceAppliedAt",
+        "screenName",
+        "package"
+      ],
+      "additionalProperties": false
+    },
+    "LinkedPublication": {
+      "type": "object",
+      "properties": {
+        "catalogScreenID": {
+          "type": "string",
+          "minLength": 36,
+          "maxLength": 36,
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "baseVersionID": {
+          "type": "string",
+          "minLength": 36,
+          "maxLength": 36,
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        }
+      },
+      "required": [
+        "catalogScreenID",
+        "baseVersionID"
+      ],
+      "additionalProperties": false
+    },
+    "LinkedInstall": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "catalogScreenID": {
+          "type": "string",
+          "minLength": 36,
+          "maxLength": 36,
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "versionID": {
+          "type": "string",
+          "minLength": 36,
+          "maxLength": 36,
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "sourceRevisionID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$(?![\\s\\S])"
+        },
+        "packageDigest": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64,
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "libraryID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$(?![\\s\\S])"
+        },
+        "localScreenID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$(?![\\s\\S])"
+        },
+        "localRevisionID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$(?![\\s\\S])"
+        },
+        "commitCounter": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "catalogScreenID",
+        "versionID",
+        "sourceRevisionID",
+        "packageDigest",
+        "libraryID",
+        "localScreenID",
+        "localRevisionID",
+        "commitCounter"
+      ],
+      "additionalProperties": false
+    },
+    "LinkedSubscription": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "catalogScreenID": {
+          "type": "string",
+          "minLength": 36,
+          "maxLength": 36,
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "copyID": {
+          "type": "string",
+          "minLength": 36,
+          "maxLength": 36,
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "libraryID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$(?![\\s\\S])"
+        },
+        "localScreenID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$(?![\\s\\S])"
+        },
+        "localRevisionID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$(?![\\s\\S])"
+        },
+        "commitCounter": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "installedVersionID": {
+          "type": "string",
+          "minLength": 36,
+          "maxLength": 36,
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "current": {
+          "$ref": "#/$defs/Version"
+        },
+        "linkedDeviceCount": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "installedSourceRevisionID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$(?![\\s\\S])"
+        },
+        "installedDisplayVersion": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "installedPackageDigest": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64,
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "catalogScreenID",
+        "copyID",
+        "libraryID",
+        "localScreenID",
+        "localRevisionID",
+        "commitCounter",
+        "installedVersionID",
+        "linkedDeviceCount",
+        "installedSourceRevisionID",
+        "installedDisplayVersion",
+        "installedPackageDigest"
+      ],
+      "additionalProperties": false
+    },
+    "LinkedUpdates": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "subscriptions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LinkedSubscription"
+          },
+          "maxItems": 20,
+          "minItems": 0
+        },
+        "nextCursor": {
+          "type": "string",
+          "minLength": 36,
+          "maxLength": 36,
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "subscriptions"
+      ],
+      "additionalProperties": false
+    },
+    "LinkedDeleteResult": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "catalogScreenID": {
+          "type": "string",
+          "minLength": 36,
+          "maxLength": 36,
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "deleted": {
+          "const": true
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "catalogScreenID",
+        "deleted"
+      ],
+      "additionalProperties": false
     }
   }
 }

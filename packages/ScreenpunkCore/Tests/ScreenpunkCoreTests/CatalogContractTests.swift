@@ -8,6 +8,72 @@ final class CatalogContractTests: XCTestCase {
         return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("contracts/fixtures/conformance-catalog-v1.json"))) as? [String: Any])
     }
     private func data(_ value: Any) throws -> Data { try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys,.withoutEscapingSlashes]) }
+    func testLinkedCatalogCapabilityIsOptionalAndPublicationBindsBase() throws {
+        let entitlement = CatalogEntitlement(backupEnabled: true, reason: "enabled", versionsPerScreen: 3,
+                                            screensPerAccount: 20, packageBytes: 10_485_760, previewBytes: 524_288,
+                                            previewDimension: 2048, accountBytes: 1_073_741_824, publicationOverlapBytes: 20_971_520)
+        var capability = CatalogCapability(entitlement: entitlement, previewMediaTypes: [])
+        let encoder = JSONEncoder()
+        let decoder = JSONDecoder()
+        XCTAssertNil(try decoder.decode(CatalogCapability.self, from: encoder.encode(capability)).linkedInstallVersion)
+        capability.linkedInstallVersion = "1"
+        XCTAssertEqual(try decoder.decode(CatalogCapability.self, from: encoder.encode(capability)), capability)
+
+        let publication = CatalogLinkedPublication(catalogScreenID: "catalog-screen", baseVersionID: "base-version")
+        let encoded = try encoder.encode(publication)
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: encoded) as? [String: String],
+                       ["catalogScreenID": "catalog-screen", "baseVersionID": "base-version"])
+        XCTAssertEqual(try decoder.decode(CatalogLinkedPublication.self, from: encoded), publication)
+    }
+
+    func testAssetManifestAcceptsOpaqueMediaAndRequiresHTMLEntry() throws {
+        let emptyDigest = CatalogContract.digest(Data())
+        let bytes = Data([1, 2, 3])
+        let fileDigest = CatalogContract.digest(bytes)
+        let screen = CatalogPackageScreen(title: "Video", entry: "index.html", requiredAssets: ["movie.mp4"], externalDependencies: [])
+        var manifest = CatalogAssetManifest(schemaVersion: 2, screen: screen, files: [
+            .init(path: "index.html", mediaType: "text/html", byteLength: bytes.count, digest: fileDigest),
+            .init(path: "movie.mp4", mediaType: "video/mp4", byteLength: bytes.count, digest: fileDigest),
+            .init(path: "opaque.extension", mediaType: "application/octet-stream", byteLength: 0, digest: emptyDigest)
+        ])
+        XCTAssertEqual(try CatalogContract.validateAssetManifest(manifest), 2 * bytes.count)
+
+        manifest.files[0].mediaType = "text/plain"
+        XCTAssertThrowsError(try CatalogContract.validateAssetManifest(manifest))
+        manifest.files[0].mediaType = "text/html"
+        manifest.files[1].mediaType = "Video/mp4"
+        XCTAssertThrowsError(try CatalogContract.validateAssetManifest(manifest))
+        manifest.files[1].mediaType = "video/mp4"
+        manifest.files[2].digest = fileDigest
+        XCTAssertThrowsError(try CatalogContract.validateAssetManifest(manifest))
+        manifest.files[2].digest = emptyDigest
+        manifest.files.removeFirst()
+        XCTAssertThrowsError(try CatalogContract.validateAssetManifest(manifest))
+    }
+    func testNativeMigrationPackagesWhenProvided() throws {
+        guard let path = ProcessInfo.processInfo.environment["SCREENPUNK_CATALOG_PACKAGE_FIXTURES"] else { throw XCTSkip("No local migration packages supplied") }
+        let root = URL(fileURLWithPath: path)
+        let urls = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil).filter { $0.pathExtension == "json" }
+        XCTAssertFalse(urls.isEmpty)
+        for url in urls {
+            let bytes = try Data(contentsOf: url)
+            let package = try CatalogContract.verifyPackage(bytes, declaration: .init(byteLength: bytes.count, digest: CatalogContract.digest(bytes)))
+            XCTAssertEqual(try CatalogContract.encodePackage(package), bytes, url.lastPathComponent)
+        }
+    }
+    func testNativeAudioPackageRoundTripAndDowngradeRejection() throws {
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<4 { root.deleteLastPathComponent() }
+        let value = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("contracts/fixtures/conformance-catalog-package-v2.json"))) as? [String: Any])
+        var package = try JSONDecoder().decode(CatalogPackage.self, from: data(value["package"]!))
+        let bytes = try CatalogContract.encodePackage(package)
+        XCTAssertEqual(try CatalogContract.verifyPackage(bytes, declaration: .init(byteLength: bytes.count, digest: CatalogContract.digest(bytes))), package)
+        package.schemaVersion = 1
+        XCTAssertThrowsError(try CatalogContract.encodePackage(package))
+        package.schemaVersion = 2
+        package.files[2].contentBase64 = "AAAA"
+        XCTAssertThrowsError(try CatalogContract.encodePackage(package))
+    }
     func testCanonicalFixtureAndSHA256Parity() throws {
         let f = try fixture()
         let package = try JSONDecoder().decode(CatalogPackage.self, from: data(f["package"]!))

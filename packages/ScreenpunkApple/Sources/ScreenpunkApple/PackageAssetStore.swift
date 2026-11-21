@@ -57,7 +57,9 @@ public struct PackageAssetStore: Sendable, Equatable {
             guard resolvedPath.hasPrefix(prefix) else { throw PackageAssetError.denied }
             let rel = String(resolvedPath.dropFirst(prefix.count))
             let path = try hostRelativePath(rel)
-            let data = try Data(contentsOf: file)
+            // Installed revisions are immutable. Map their contents so loading
+            // the store only reads assets requested by the runtime.
+            let data = try Data(contentsOf: file, options: .alwaysMapped)
             assets[path] = PackageAsset(path: path, data: data, mime: mime(for: path))
         }
         return PackageAssetStore(assets: assets)

@@ -17,6 +17,89 @@ describe('catalog v1 independent capability and complete package',()=>{
  it('rejects corrupted/traversing/incomplete packages',async()=>{for(const patch of fixture.invalidPackage)await expect(encodeCatalogPackage(change(fixture.package,patch))).rejects.toThrow();const duplicate=structuredClone(fixture.package);duplicate.files.push({...duplicate.files[0]});await expect(encodeCatalogPackage(duplicate)).rejects.toThrow();const bom=new Uint8Array([239,187,191,...new TextEncoder().encode(fixture.canonicalPackage)]);await expect(verifyCatalogPackageUpload(bom,{byteLength:bom.length,digest:await authoringContentDigestV2(bom)})).rejects.toThrow();const bytes=new TextEncoder().encode(fixture.canonicalPackage+'\n');await expect(verifyCatalogPackageUpload(bytes,{byteLength:bytes.length,digest:await authoringContentDigestV2(bytes)})).rejects.toThrow();await expect(verifyCatalogPackageUpload(new TextEncoder().encode(fixture.canonicalPackage),{...fixture.begin.package,digest:'0'.repeat(64)})).rejects.toThrow();});
  it('rejects a missing local dependency even when requiredAssets is empty',async()=>{const p=structuredClone(fixture.package),content='<script src="missing.js"></script>',bytes=new TextEncoder().encode(content);p.files[0].contentBase64=btoa(content);p.files[0].byteLength=bytes.length;p.files[0].digest=await authoringContentDigestV2(bytes);await expect(encodeCatalogPackage(p)).rejects.toThrow();});
  it('rejects high-confidence credentials and unsupported binary files',async()=>{expect(catalogContainsCredentials('secrets.json','{}')).toBe(true);for(const content of ['-----BEGIN PRIVATE KEY-----','ghp_'+'a'.repeat(32),'sk-'+'a'.repeat(32)]){const p=structuredClone(fixture.package),bytes=new TextEncoder().encode(content);p.files[0].contentBase64=btoa(content);p.files[0].byteLength=bytes.length;p.files[0].digest=await authoringContentDigestV2(bytes);await expect(encodeCatalogPackage(p)).rejects.toThrow();}const p=structuredClone(fixture.package);p.files[0].mediaType='image/png';await expect(encodeCatalogPackage(p)).rejects.toThrow();});
+ it('accepts asset-backed catalog metadata with the explicit storage marker',()=>{
+  const sizeBytes=CATALOG_LIMITS.packageBytes+1;
+  const version={...fixture.missingVersion,packageSchema:3,packageStorage:'assets',sizeBytes};
+  validateCatalogWire('Version',version);
+  const {packageStorage,...unmarked}=version;
+  expect(()=>validateCatalogWire('Version',unmarked)).toThrow();
+  expect(()=>validateCatalogWire('Version',{...version,packageSchema:2})).toThrow();
+  const candidate={...fixture.previewAttachment.candidates.candidates[0],packageStorage,packageBytes:sizeBytes};
+  validateCatalogWire('PreviewCandidate',candidate);
+  expect(()=>validateCatalogWire('PreviewCandidate',{...candidate,packageStorage:'unknown'})).toThrow();
+  const begin={...fixture.begin,package:{...fixture.begin.package,byteLength:sizeBytes}};
+  expect(()=>validateCatalogBeginBackup(begin)).toThrow();
+  expect(validateCatalogBeginBackup(begin,{assetManifest:true})).toEqual(begin);
+ });
  it('marks missing objects and permits operation rotation only for failed expired retry statuses',()=>{validateCatalogWire('Version',fixture.missingVersion);validateCatalogWire('BackupStatus',fixture.expiredStatus);for(const state of ['pending','uploaded','completed'])expect(()=>validateCatalogWire('BackupStatus',{...fixture.expiredStatus,state})).toThrow();expect(()=>validateCatalogWire('Error',{...fixture.expiredStatus.error,code:'quota_exceeded'})).toThrow();expect(()=>validateCatalogWire('Error',{...fixture.expiredStatus.error,restartOperation:false})).toThrow();expect(()=>validateCatalogWire('Version',{...fixture.missingVersion,integrity:'okay'})).toThrow();});
  it('requires explicit honest unavailable previews and configured entitlement',()=>{validateCatalogWire('Preview',{status:'unavailable',reason:'not_provided'});expect(()=>validateCatalogWire('Preview',{status:'available'})).toThrow();const entitlement={backupEnabled:false,reason:'not_enabled',versionsPerScreen:3,screensPerAccount:20,packageBytes:CATALOG_LIMITS.packageBytes,previewBytes:CATALOG_LIMITS.previewBytes,previewDimension:2048,accountBytes:CATALOG_LIMITS.accountBytes,publicationOverlapBytes:CATALOG_LIMITS.publicationOverlapBytes};validateCatalogWire('Capability',{version:'1',feature:CATALOG_CAPABILITY,previewMediaTypes:[],entitlement});expect(()=>validateCatalogWire('Capability',{version:'2',feature:CATALOG_CAPABILITY,previewMediaTypes:[],entitlement})).toThrow();});
+});
+
+describe('catalog native package v2',()=>{
+ const extended=JSON.parse(readFileSync(new URL('./fixtures/conformance-catalog-package-v2.json',import.meta.url),'utf8')).package;
+ it('preserves audio bytes with manifest integrity and rejects v1 downgrade',async()=>{
+  const bytes=await encodeCatalogPackage(extended);
+  expect(await verifyCatalogPackageUpload(bytes,{byteLength:bytes.length,digest:await authoringContentDigestV2(bytes)})).toEqual(extended);
+  await expect(encodeCatalogPackage({...extended,schemaVersion:1})).rejects.toThrow();
+  const corrupt=structuredClone(extended);corrupt.files.find((f:any)=>f.path==='sound.wav').contentBase64='AAAA';
+  await expect(encodeCatalogPackage(corrupt)).rejects.toThrow();
+ });
+ it('rejects missing manifest, forged audio media, mismatched declarations and oversize',async()=>{
+  for(const mutate of [(p:any)=>p.files=p.files.filter((f:any)=>f.path!=='manifest.json'),(p:any)=>p.files[2].mediaType='text/plain',(p:any)=>p.files[2].byteLength=2097153,(p:any)=>p.screen.requiredAssets=[]]){
+   const p=structuredClone(extended);mutate(p);await expect(encodeCatalogPackage(p)).rejects.toThrow();
+  }
+ });
+ it('preserves larger text only in explicitly versioned native packages',async()=>{
+  const p=structuredClone(extended),data=new TextEncoder().encode('const historicalData="'+'x'.repeat(220000)+'";');
+  p.files.push({path:'large.js',mediaType:'text/javascript',byteLength:data.length,digest:await authoringContentDigestV2(data),contentBase64:''});
+  p.files.at(-1).contentBase64=btoa(Array.from(data,b=>String.fromCharCode(b)).join(''));
+  const m=p.files.find((f:any)=>f.path==='manifest.json'),manifest=JSON.parse(atob(m.contentBase64));
+  manifest.files.push({path:'large.js',bytes:data.length,sha256:await authoringContentDigestV2(data)});
+  const mb=new TextEncoder().encode(JSON.stringify(manifest));Object.assign(m,{byteLength:mb.length,digest:await authoringContentDigestV2(mb),contentBase64:btoa(Array.from(mb,b=>String.fromCharCode(b)).join(''))});
+  p.files.sort((a:any,b:any)=>a.path.localeCompare(b.path));await expect(encodeCatalogPackage(p)).resolves.toBeInstanceOf(Uint8Array);
+  await expect(encodeCatalogPackage({...p,schemaVersion:1})).rejects.toThrow();
+ });
+});
+
+
+describe('negotiated linked catalog protocol', () => {
+ const local={libraryID:'library',localScreenID:'local-screen',localRevisionID:'local-revision',commitCounter:1};
+ const entry={catalogScreenID:'123e4567-e89b-12d3-a456-426614174001',versionID:'123e4567-e89b-12d3-a456-426614174002',sourceRevisionID:'source-revision',packageDigest:'a'.repeat(64)};
+ const subscription={schemaVersion:1,catalogScreenID:entry.catalogScreenID,copyID:'123e4567-e89b-12d3-a456-426614174003',installedVersionID:entry.versionID,installedSourceRevisionID:entry.sourceRevisionID,
+  installedDisplayVersion:1,installedPackageDigest:entry.packageDigest,linkedDeviceCount:2,...local};
+
+ it('keeps the capability optional and rejects unknown link versions', () => {
+  const legacy={version:'1',feature:CATALOG_CAPABILITY,previewMediaTypes:[],entitlement:{
+   backupEnabled:true,reason:'enabled',versionsPerScreen:3,screensPerAccount:20,packageBytes:CATALOG_LIMITS.packageBytes,
+   previewBytes:CATALOG_LIMITS.previewBytes,previewDimension:2048,accountBytes:CATALOG_LIMITS.accountBytes,
+   publicationOverlapBytes:CATALOG_LIMITS.publicationOverlapBytes
+  }};
+  validateCatalogWire('Capability',legacy);
+  validateCatalogWire('Capability',{...legacy,linkedInstallVersion:'1'});
+  expect(()=>validateCatalogWire('Capability',{...legacy,linkedInstallVersion:'2'})).toThrow();
+ });
+
+ it('binds acknowledgments and shared writes to exact identities and excludes caller authority', () => {
+  const body={schemaVersion:1,...local,...entry};
+  validateCatalogWire('LinkedInstall',body);
+  for(const bad of [
+   {...body,commitCounter:0}, {...body,packageDigest:'wrong'}, {...body,accountID:'forged'},
+   {...body,versionID:entry.versionID+'\n'}, {...body,localRevisionID:undefined}
+  ]) expect(()=>validateCatalogWire('LinkedInstall',bad)).toThrow();
+
+  const link={catalogScreenID:entry.catalogScreenID,baseVersionID:entry.versionID};
+  validateCatalogWire('LinkedPublication',link);
+  expect(()=>validateCatalogWire('LinkedPublication',{...link,baseVersionID:null})).toThrow();
+ });
+
+ it('validates subscription pages and exact unlink receipts', () => {
+  const current={...fixture.missingVersion,catalogScreenID:entry.catalogScreenID};
+  validateCatalogWire('LinkedUpdates',{schemaVersion:1,subscriptions:[subscription,{...subscription,current}],nextCursor:'123e4567-e89b-12d3-a456-426614174004'});
+  expect(()=>validateCatalogWire('LinkedUpdates',{schemaVersion:1,subscriptions:[{...subscription,current:{}}]})).toThrow();
+  expect(()=>validateCatalogWire('LinkedSubscription',{...subscription,installedPackageDigest:undefined})).toThrow();
+  expect(()=>validateCatalogWire('LinkedSubscription',{...subscription,installedDisplayVersion:0})).toThrow();
+  expect(()=>validateCatalogWire('LinkedUpdates',{schemaVersion:1,subscriptions:[],nextCursor:'x'.repeat(257)})).toThrow();
+  validateCatalogWire('LinkedDeleteResult',{schemaVersion:1,catalogScreenID:entry.catalogScreenID,deleted:true});
+  expect(()=>validateCatalogWire('LinkedDeleteResult',{schemaVersion:1,catalogScreenID:entry.catalogScreenID,deleted:false})).toThrow();
+ });
 });

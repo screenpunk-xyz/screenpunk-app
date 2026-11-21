@@ -439,6 +439,131 @@ struct AgentStatus: Decodable {
         let bytes = try await catalogBytes(path, method: "GET", bytes: nil, token: token, requestLimit: 0, responseLimit: CatalogContract.packageBytes, contentType: "application/json")
         return try CatalogContract.verifyPackage(bytes, declaration: declaration)
     }
+    struct CatalogAssetProgress: Decodable {
+        struct MissingFile: Decodable {
+            var digest: String
+            var offset: Int
+        }
+        let status: CatalogBackupStatus
+        let missingFiles: [MissingFile]
+
+        init(from decoder: Decoder) throws {
+            status = try CatalogBackupStatus(from: decoder)
+            missingFiles = try decoder.container(keyedBy: CodingKeys.self).decode([MissingFile].self, forKey: .missingFiles)
+        }
+        private enum CodingKeys: CodingKey { case missingFiles }
+    }
+
+    private static let linkedCatalogPath = "/api/catalog/linked-installs"
+    nonisolated static func validCatalogIdentifier(_ value: String) -> Bool {
+        CatalogLinkedInstall.validIdentifier(value)
+    }
+
+    func registerCatalogLink(_ link: CatalogLinkedInstallRequest, token: String) async throws -> CatalogLinkedInstall {
+        guard [link.catalogScreenID, link.versionID, link.sourceRevisionID, link.libraryID, link.localScreenID, link.localRevisionID]
+            .allSatisfy(Self.validCatalogIdentifier) else {
+            throw DeviceError.message("The linked screen reference is invalid.")
+        }
+        let reply: CatalogLinkedInstall = try await catalogRequest(Self.linkedCatalogPath, method: "POST",
+            bytes: CatalogContract.canonical(link), token: token)
+        try reply.validate()
+        guard reply.matches(link) else {
+            throw DeviceError.message("Cloud returned a different linked screen.")
+        }
+        return reply
+    }
+
+    func catalogLinkUpdates(cursor: String?, token: String) async throws -> CatalogLinkedUpdates {
+        var path = URLComponents()
+        path.path = Self.linkedCatalogPath + "/updates"
+        if let cursor { path.queryItems = [.init(name: "cursor", value: cursor)] }
+        let data = try await catalogBytes(path.string!, method: "GET", bytes: nil, token: token,
+                                          requestLimit: 0, responseLimit: 2 * 1024 * 1024, contentType: "application/json")
+        let page = try JSONDecoder().decode(CatalogLinkedUpdates.self, from: data)
+        guard page.schemaVersion == 1, page.subscriptions.count <= 100,
+              page.nextCursor.map({ (1...1024).contains($0.utf8.count) }) != false else {
+            throw DeviceError.message("Cloud returned an invalid linked screen page.")
+        }
+        for entry in page.subscriptions { try entry.validate() }
+        return page
+    }
+
+    func deleteCatalogLink(catalogScreenID: String, copyID: String, token: String) async throws {
+        struct Receipt: Decodable { var schemaVersion: Int; var catalogScreenID: String; var deleted: Bool }
+        guard [catalogScreenID, copyID].allSatisfy(Self.validCatalogIdentifier) else {
+            throw DeviceError.message("The linked screen reference is invalid.")
+        }
+        let path = Self.linkedCatalogPath + "/" + catalogScreenID + "?copyID=" + copyID
+        let reply: Receipt = try await catalogRequest(path, method: "DELETE", token: token)
+        guard reply.schemaVersion == 1, reply.catalogScreenID == catalogScreenID, reply.deleted else {
+            throw DeviceError.message("Cloud did not confirm removal of the linked screen.")
+        }
+    }
+
+    static let assetBackupsPath = "/api/catalog/asset-backups"
+    static let assetOperationsPath = assetBackupsPath + "/operations/"
+    static let assetUploadsPath = assetBackupsPath + "/uploads/"
+
+    func catalogAssetProgress(_ path: String, method: String = "GET", bytes: Data? = nil, token: String, chunk: Bool = false) async throws -> CatalogAssetProgress {
+        let data = try await catalogBytes(path, method: method, bytes: bytes, token: token,
+                                          requestLimit: chunk ? CatalogContract.assetChunkBytes : CatalogContract.assetManifestBytes + 16 * 1024,
+                                          responseLimit: CatalogContract.assetManifestBytes,
+                                          contentType: chunk ? "application/octet-stream" : "application/json")
+        return try JSONDecoder().decode(CatalogAssetProgress.self, from: data)
+    }
+
+    func catalogVersionManifest(_ path: URLComponents, token: String, declaration: CatalogObjectDeclaration) async throws -> CatalogAssetManifest {
+        var request = path
+        request.path += "/manifest"
+        let bytes = try await catalogBytes(request.string!, method: "GET", bytes: nil, token: token, requestLimit: 0,
+                                           responseLimit: CatalogContract.assetManifestBytes, contentType: "application/json")
+        let manifest = try JSONDecoder().decode(CatalogAssetManifest.self, from: bytes)
+        guard try CatalogContract.validateAssetManifest(manifest) == declaration.byteLength,
+              CatalogContract.digest(try CatalogContract.canonical(manifest)) == declaration.digest else {
+            throw DeviceError.message("The restored catalog manifest did not match the saved version.")
+        }
+        return manifest
+    }
+
+    func catalogRestoreAssets(_ path: URLComponents, manifest: CatalogAssetManifest, directory: URL, token: String, current: () throws -> Void) async throws {
+        var downloaded: [String: URL] = [:]
+        for file in manifest.files {
+            try current()
+            let destination = directory.appendingPathComponent(file.path)
+            try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if let identical = downloaded[file.digest], !FileManager.default.fileExists(atPath: destination.path) {
+                try FileManager.default.copyItem(at: identical, to: destination)
+            } else {
+                try await catalogRestoreAsset(path, file: file, destination: destination, token: token, current: current)
+                downloaded[file.digest] = destination
+            }
+        }
+    }
+
+    private func catalogRestoreAsset(_ path: URLComponents, file: CatalogAssetFile, destination: URL, token: String, current: () throws -> Void) async throws {
+        try await CatalogAssetDownload.restore(file: file, destination: destination, current: current) { offset, length in
+            var request = path
+            request.path += "/assets/" + file.digest
+            request.queryItems = (path.queryItems ?? []) + [.init(name: "offset", value: String(offset))]
+            return try await self.catalogRestoreChunk(request.string!, token: token, length: length, current: current)
+        }
+    }
+
+    private func catalogRestoreChunk(_ path: String, token: String, length: Int, current: () throws -> Void) async throws -> Data {
+        for attempt in 0..<3 {
+            try current()
+            do {
+                return try await catalogBytes(path, method: "GET", bytes: nil, token: token, requestLimit: 0,
+                                              responseLimit: length, contentType: "application/octet-stream")
+            } catch let error as CatalogHTTPError where attempt < 2 && [429, 500, 502, 503, 504].contains(error.status) {
+                try await Task.sleep(for: .seconds(max(attempt + 1, min(error.retryAfterSeconds ?? 0, 30))))
+            } catch is URLError where attempt < 2 && !Task.isCancelled {
+                try await Task.sleep(for: .seconds(attempt + 1))
+            }
+        }
+        throw DeviceError.message("The catalog asset could not be downloaded.")
+    }
+
     private func catalogBytes(_ path: String, method: String, bytes: Data?, token: String, requestLimit: Int, responseLimit: Int, contentType: String) async throws -> Data {
         try Task.checkCancellation()
         guard path.hasPrefix("/api/catalog"), let relative = URLComponents(string: path), relative.scheme == nil, relative.host == nil, relative.fragment == nil,
@@ -449,6 +574,8 @@ struct AgentStatus: Decodable {
         request.httpMethod = method; request.timeoutInterval = 60; request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue(CatalogContract.version, forHTTPHeaderField: "X-Screenpunk-Catalog-Version")
+        request.setValue(CatalogContract.assetBackupVersion, forHTTPHeaderField: "X-Screenpunk-Catalog-Assets")
+        request.setValue("1", forHTTPHeaderField: "X-Screenpunk-Catalog-Links")
         if let bytes { request.httpBody = bytes; request.setValue(contentType, forHTTPHeaderField: "Content-Type") }
         let transport = URLSession(configuration: .ephemeral, delegate: NoRedirects(), delegateQueue: nil)
         defer { transport.invalidateAndCancel() }

@@ -15,6 +15,8 @@ final class HomeAssistantWebBridge: NSObject, WKScriptMessageHandler {
     private let publicReads: PublicReadRuntime?
     private let resources: PublicRasterResources?
     private let screenData: (any ScreenDataProvider)?
+    private let customHTTP: CustomHTTPDeviceRuntime?
+    private var customHTTPTasks: [String: (generation: UUID, task: Task<Void, Never>)] = [:]
     private var screenDataTasks: [String: Task<Void, Never>] = [:]
     private var publicTasks: [String: Task<Void, Never>] = [:]
     private let onHealth: (Bool) -> Void
@@ -44,15 +46,16 @@ final class HomeAssistantWebBridge: NSObject, WKScriptMessageHandler {
     func setActive(_ value: Bool) {
         guard active != value else { return }
         active = value
-        if !value { voiceTapAt = nil; googleTV.close(); googleTVADB.close(); cancelScreenData() }
+        if !value { voiceTapAt = nil; googleTV.close(); googleTVADB.close(); cancelScreenData(); cancelCustomHTTP() }
         status(navigation?.status ?? [:])
     }
 
     init(runtime: HomeAssistantDeviceRuntime?, connections: ConnectionRuntime? = nil, navigation: DashboardEventRuntime? = nil,
-         revision: String, mapManifest: DashboardManifest? = nil, preferenceStore: ScreenPreferenceStore = .shared, stateReadOnly: Bool = false, publicReads: PublicReadRuntime? = nil, resources: PublicRasterResources? = nil, screenData: (any ScreenDataProvider)? = nil, onHealth: @escaping (Bool) -> Void) {
+         revision: String, mapManifest: DashboardManifest? = nil, preferenceStore: ScreenPreferenceStore = .shared, stateReadOnly: Bool = false, publicReads: PublicReadRuntime? = nil, resources: PublicRasterResources? = nil, screenData: (any ScreenDataProvider)? = nil, customHTTP: CustomHTTPDeviceRuntime? = nil, onHealth: @escaping (Bool) -> Void) {
         self.cameras = runtime.map { CameraPlaybackController(resolver: $0, revision: revision) }
         self.publicReads = publicReads; self.resources = resources
         self.screenData = stateReadOnly ? nil : screenData
+        self.customHTTP = stateReadOnly ? nil : customHTTP
         self.runtime = runtime; self.connections = connections; self.navigation = navigation
         self.mapManifest = mapManifest
         self.preferenceStore = preferenceStore; self.stateReadOnly = stateReadOnly
@@ -71,6 +74,7 @@ final class HomeAssistantWebBridge: NSObject, WKScriptMessageHandler {
         voiceTapAt = nil; googleTV.close(); googleTVADB.close(); maps.cancel(); interactiveMaps.close()
         documentGeneration = UUID()
         cancelScreenData()
+        cancelCustomHTTP()
         for task in publicTasks.values { task.cancel() }; publicTasks.removeAll(); resources?.clear()
         let reads = publicReads; Task { await reads?.cancel() }
         cameras?.stopAll()
@@ -79,7 +83,7 @@ final class HomeAssistantWebBridge: NSObject, WKScriptMessageHandler {
 
     func status(_ value: [String: Any]) {
         dispatch(["protocolVersion": 1, "id": "runtime-status", "kind": "event", "method": "runtime.onStatus",
-                  "value": ["active": active, "navigation": value, "homeAssistantTransport": "websocket-with-http", "homeAssistantServiceCalls": 1, "cameraPlayback": 1, "publicReadHTTP": 1, "googleCalendar": 1, "appleMaps": 1, "appleMapsInteractive": 1, "appleMapsTap": 1, "appleMapsLocation": 1, "persistentState": 1, "persistentStateWritable": stateReadOnly ? 0 : 1, "screenData": screenData == nil ? 0 : 1, "googleTVRemote": 1, "googleTVVoice": 1, "googleTVDirectChannels": 1, "googleTVDirectPower": 1, "macIsRuntimeProxy": false]])
+                  "value": ["active": active, "navigation": value, "homeAssistantTransport": "websocket-with-http", "homeAssistantServiceCalls": 1, "cameraPlayback": 1, "publicReadHTTP": 1, "customHTTP": customHTTP == nil ? 0 : 1, "googleCalendar": 1, "appleMaps": 1, "appleMapsInteractive": 1, "appleMapsTap": 1, "appleMapsLocation": 1, "persistentState": 1, "persistentStateWritable": stateReadOnly ? 0 : 1, "screenData": screenData == nil ? 0 : 1, "googleTVRemote": 1, "googleTVVoice": 1, "googleTVDirectChannels": 1, "googleTVDirectPower": 1, "macIsRuntimeProxy": false]])
     }
 
     deinit { let cameras = cameras; let interactiveMaps = interactiveMaps; Task { @MainActor in cameras?.cancel(); interactiveMaps.cancel() } }
@@ -102,7 +106,7 @@ final class HomeAssistantWebBridge: NSObject, WKScriptMessageHandler {
         switch method {
         case "runtime.ready": reply(id: id, value: NSNull())
         case "runtime.onStatus":
-            reply(id: id, value: ["publicReadHTTP": 1, "appleMaps": 1, "appleMapsInteractive": 1, "appleMapsTap": 1, "appleMapsLocation": 1, "persistentState": 1, "persistentStateWritable": stateReadOnly ? 0 : 1, "screenData": screenData == nil ? 0 : 1]); status(navigation?.status ?? [:])
+            reply(id: id, value: ["publicReadHTTP": 1, "customHTTP": customHTTP == nil ? 0 : 1, "appleMaps": 1, "appleMapsInteractive": 1, "appleMapsTap": 1, "appleMapsLocation": 1, "persistentState": 1, "persistentStateWritable": stateReadOnly ? 0 : 1, "screenData": screenData == nil ? 0 : 1]); status(navigation?.status ?? [:])
         case "navigation.get": reply(id: id, value: navigation?.status ?? ["pageId": "default"])
         case "navigation.open":
             guard let parameters = body["parameters"] as? [String: String], parameters.count == 1,
@@ -135,7 +139,7 @@ final class HomeAssistantWebBridge: NSObject, WKScriptMessageHandler {
             } catch { reply(id: id, error: (error as? ConnectionFailure)?.rawValue ?? "device_offline") }
         case "data.publish", "data.remove", "data.query": handleScreenData(id: id, body: body)
         case "connections.cancel":
-            if let target = (body["parameters"] as? [String: String])?["requestId"] { publicTasks.removeValue(forKey: target)?.cancel(); tasks.removeValue(forKey: target)?.cancel() }
+            if let target = (body["parameters"] as? [String: String])?["requestId"] { publicTasks.removeValue(forKey: target)?.cancel(); tasks.removeValue(forKey: target)?.cancel(); customHTTPTasks.removeValue(forKey: target)?.task.cancel() }
             reply(id: id, value: NSNull())
         case "connections.release":
             if let url = (body["parameters"] as? [String: String])?["resourceURL"] { resources?.release(url: url) }
@@ -152,6 +156,11 @@ final class HomeAssistantWebBridge: NSObject, WKScriptMessageHandler {
             }
             let subscribe = body["method"] as? String == "connections.subscribe"
             let generation = documentGeneration
+            if let customHTTP, customHTTP.declares(alias: alias) {
+                guard !subscribe, active else { reply(id: id, error: "permission_required"); return }
+                handleCustomHTTP(customHTTP, id: id, alias: alias, operation: operation, parameters: parameters)
+                return
+            }
             if alias == "appleMaps" {
                 guard !subscribe, active, let manifest = navigation?.manifest ?? mapManifest,
                       AppleMapPreview.isDeclared(in: manifest, operation: operation),
@@ -301,6 +310,36 @@ final class HomeAssistantWebBridge: NSObject, WKScriptMessageHandler {
     }
 
     private func current(_ generation: UUID) -> Bool { generation == documentGeneration && !Task.isCancelled }
+
+    private func cancelCustomHTTP() {
+        for pending in customHTTPTasks.values { pending.task.cancel() }
+        customHTTPTasks.removeAll()
+    }
+
+    private func handleCustomHTTP(_ runtime: CustomHTTPDeviceRuntime, id: String, alias: String,
+                                  operation: String, parameters: [String: String]) {
+        guard customHTTPTasks[id] == nil else { return }
+        guard customHTTPTasks.count < 4 else { reply(id: id, error: "size_limit"); return }
+        let request = UUID()
+        let document = documentGeneration
+        customHTTPTasks[id] = (request, Task { @MainActor [weak self] in
+            guard let self, self.active, self.current(document) else { return }
+            defer {
+                if self.customHTTPTasks[id]?.generation == request { self.customHTTPTasks.removeValue(forKey: id) }
+            }
+            do {
+                let data = try await runtime.request(alias: alias, operation: operation, parameters: parameters)
+                guard self.active, self.current(document) else { return }
+                let value = try JSONSerialization.jsonObject(with: data, options: .fragmentsAllowed)
+                self.onHealth(true)
+                self.reply(id: id, value: value)
+            } catch {
+                guard self.active, self.current(document) else { return }
+                self.onHealth(false)
+                self.reply(id: id, error: (error as? ConnectionFailure)?.rawValue ?? "device_offline")
+            }
+        })
+    }
 
     private func cancelScreenData() {
         for task in screenDataTasks.values { task.cancel() }

@@ -255,6 +255,7 @@ struct CloudAuthoringCapabilities: Codable, Equatable, Sendable {
     let contractVersions: [String]
     let features: [String]
     var supportsV2: Bool { contractVersions.contains("2") && features.contains("asset-references-v2") }
+    var supportsPackageAssets: Bool { supportsV2 && features.contains("package-assets-v2") }
     static let unavailable = CloudAuthoringCapabilities(contractVersions: [], features: [])
 }
 
@@ -435,6 +436,73 @@ final class CatalogWorkPump {
         pending = false
     }
 }
+
+struct CatalogLinkedInstallRequest: Encodable {
+    let schemaVersion = 1
+    var catalogScreenID: String
+    var versionID: String
+    var sourceRevisionID: String
+    var packageDigest: String
+    var libraryID: String
+    var localScreenID: String
+    var localRevisionID: String
+    var commitCounter: Int
+}
+
+struct CatalogLinkedInstall: Decodable {
+    var schemaVersion: Int
+    var catalogScreenID: String
+    var libraryID: String
+    var localScreenID: String
+    var localRevisionID: String
+    var commitCounter: Int
+    var copyID: String
+    var installedVersionID: String
+    var installedSourceRevisionID: String
+    var installedDisplayVersion: Int
+    var installedPackageDigest: String
+    var linkedDeviceCount: Int
+    var current: CatalogVersion?
+
+    func validate() throws {
+        guard schemaVersion == 1,
+              [catalogScreenID, libraryID, localScreenID, localRevisionID, copyID, installedVersionID, installedSourceRevisionID]
+                .allSatisfy(Self.validIdentifier),
+              (1...9_007_199_254_740_991).contains(commitCounter), (1...9_007_199_254_740_991).contains(linkedDeviceCount),
+              installedDisplayVersion > 0,
+              installedPackageDigest.range(of: #"^[a-f0-9]{64}\z"#, options: .regularExpression) != nil,
+              current.map({ $0.catalogScreenID == catalogScreenID }) != false else {
+            throw DeviceError.message("Cloud returned an invalid linked screen.")
+        }
+    }
+
+    static func validIdentifier(_ value: String) -> Bool {
+        value.range(of: #"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}\z"#, options: .regularExpression) != nil
+    }
+
+    func matches(_ request: CatalogLinkedInstallRequest) -> Bool {
+        catalogScreenID == request.catalogScreenID && libraryID == request.libraryID &&
+            localScreenID == request.localScreenID && localRevisionID == request.localRevisionID &&
+            installedVersionID == request.versionID && commitCounter == request.commitCounter &&
+            installedSourceRevisionID == request.sourceRevisionID && installedPackageDigest == request.packageDigest
+    }
+
+    func matches(_ link: ScreenLibrary.LinkedCatalogInstall) -> Bool {
+        catalogScreenID == link.catalogScreenID && libraryID == link.libraryID &&
+            localScreenID == link.localScreenID && localRevisionID == link.localRevision &&
+            installedVersionID == link.versionID && commitCounter == link.commitCounter &&
+            installedSourceRevisionID == link.sourceRevisionID && installedPackageDigest == link.packageDigest &&
+            installedDisplayVersion == link.displayVersion && copyID == link.copyID
+    }
+
+}
+
+struct CatalogLinkedUpdates: Decodable {
+    var schemaVersion: Int
+    var subscriptions: [CatalogLinkedInstall]
+    var nextCursor: String?
+}
+
 
 /// Request-local silence timer, reset before a new preflight becomes visible.
 struct RequestProgressTiming {

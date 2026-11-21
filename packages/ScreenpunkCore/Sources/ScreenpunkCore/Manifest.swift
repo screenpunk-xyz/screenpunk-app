@@ -58,12 +58,30 @@ public struct ManifestConnection: Codable, Sendable, Equatable {
     public var serviceCalls: [HomeAssistantServiceGrant]?
     public var cameraEntities: [String]?
     public var publicHTTP: PublicReadDeclaration?
+    public var customHTTP: CustomHTTPDeclaration?
 
-    public init(alias: String, required: Bool, operations: [ManifestOperation]? = nil, serviceCalls: [HomeAssistantServiceGrant]? = nil) {
+    public init(alias: String, required: Bool, operations: [ManifestOperation]? = nil, serviceCalls: [HomeAssistantServiceGrant]? = nil,
+                customHTTP: CustomHTTPDeclaration? = nil) {
         self.alias = alias
         self.required = required
         self.operations = operations
         self.serviceCalls = serviceCalls
+        self.customHTTP = customHTTP
+    }
+
+    private enum CodingKeys: String, CodingKey { case alias, required, operations, serviceCalls, cameraEntities, publicHTTP, customHTTP }
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        alias = try values.decode(String.self, forKey: .alias)
+        required = try values.decode(Bool.self, forKey: .required)
+        operations = try values.decodeIfPresent([ManifestOperation].self, forKey: .operations)
+        serviceCalls = try values.decodeIfPresent([HomeAssistantServiceGrant].self, forKey: .serviceCalls)
+        cameraEntities = try values.decodeIfPresent([String].self, forKey: .cameraEntities)
+        publicHTTP = try values.decodeIfPresent(PublicReadDeclaration.self, forKey: .publicHTTP)
+        if values.contains(.customHTTP) {
+            try CustomHTTPDeclaration.validateConnectionKeys(decoder)
+            customHTTP = try values.decode(CustomHTTPDeclaration.self, forKey: .customHTTP)
+        }
     }
 }
 

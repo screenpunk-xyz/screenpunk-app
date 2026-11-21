@@ -19,34 +19,61 @@ public enum AuthoringPackageDependencies {
 
     /// Uses the exact bounded, quote-aware installation parser to collect catalog
     /// declarations. Catalog admission is stricter; ordinary validation is unchanged.
-    public static func catalogDependencies(files: [AuthoringScreenFile]) throws -> (local: [String], external: [String]) {
-        var budget = Budget(remaining: workLimit, catalog: true)
-        try scan(files: files, byteLimit: packageByteLimit, budget: &budget)
+    public static func catalogDependencies(files: [AuthoringScreenFile], extended: Bool = false) throws -> (local: [String], external: [String]) {
+        let limit = extended ? CatalogContract.expandedPackageBytes : packageByteLimit
+        var budget = Budget(remaining: limit * 32, catalog: true)
+        try scan(files: files, byteLimit: limit, budget: &budget)
         guard budget.local.count <= 20, budget.external.count <= 20 else { throw invalid("Too many catalog dependencies.") }
+        return (budget.local.sorted(), budget.external.sorted())
+    }
+
+    public static func catalogAssetDependencies(files: [AuthoringScreenFile]) throws -> (local: [String], external: [String]) {
+        let limit = files.reduce(0) { $0 + $1.content.utf8.count }
+        var budget = Budget(remaining: limit * 32, catalog: true)
+        try scanAdmitted(files: files, budget: &budget)
+        guard budget.local.count <= CatalogContract.assetFileCount, budget.external.count <= CatalogContract.assetFileCount else { throw invalid("Too many catalog dependencies.") }
         return (budget.local.sorted(), budget.external.sorted())
     }
 
     private static func scan(files: [AuthoringScreenFile], byteLimit: Int, budget: inout Budget) throws {
         try admit(files: files, byteLimit: byteLimit)
+        try scanAdmitted(files: files, budget: &budget)
+    }
+
+    public static func validateAssetReferences(paths: [String], readText: (String) throws -> String) throws {
+        let available = Set(paths)
+        for path in paths where scansReferences(path) {
+            let content = try readText(path)
+            var budget = Budget(remaining: max(1, content.utf8.count) * 32)
+            try scanReferences(path: path, content: content, paths: available, budget: &budget)
+        }
+    }
+
+    private static func scansReferences(_ path: String) -> Bool {
+        ["html", "svg", "css"].contains((path as NSString).pathExtension.lowercased())
+    }
+
+    private static func scanAdmitted(files: [AuthoringScreenFile], budget: inout Budget) throws {
         try budget.spend(0)
         let paths = Set(files.map(\.path))
-        for file in files {
-            let ext = (file.path as NSString).pathExtension.lowercased()
-            if ext == "html" || ext == "svg" || ext == "css" {
-                // Admission bounds this buffer before it or the path set is allocated.
-                let bytes = Array(file.content.utf8)
-                let directory = file.path.split(separator: "/").dropLast().map(String.init)
-                let context = Context(paths: paths, directory: directory, directoryBytes: file.path.utf8.count)
-                if ext == "css" { try css(bytes, start: 0, end: bytes.count, context: context, budget: &budget) }
-                else { try markup(bytes, html: ext == "html", context: context, budget: &budget) }
-            }
+        for file in files where scansReferences(file.path) {
+            try scanReferences(path: file.path, content: file.content, paths: paths, budget: &budget)
         }
+    }
+
+    private static func scanReferences(path: String, content: String, paths: Set<String>, budget: inout Budget) throws {
+        let ext = (path as NSString).pathExtension.lowercased()
+        let bytes = Array(content.utf8)
+        let directory = path.split(separator: "/").dropLast().map(String.init)
+        let context = Context(paths: paths, directory: directory, directoryBytes: path.utf8.count)
+        if ext == "css" { try css(bytes, start: 0, end: bytes.count, context: context, budget: &budget) }
+        else { try markup(bytes, html: ext == "html", context: context, budget: &budget) }
     }
 
     /// Count the canonical JSON files array without first encoding/copying arbitrary input.
     /// Title/entry admission remains with AuthoringContract.validateScreen at its caller.
     private static func admit(files: [AuthoringScreenFile], byteLimit: Int) throws {
-        guard files.count <= 20, (0...packageByteLimit).contains(byteLimit) else { throw invalid("The screen package is too large.") }
+        guard files.count <= 20, (0...CatalogContract.expandedPackageBytes).contains(byteLimit) else { throw invalid("The screen package is too large.") }
         var remaining = byteLimit
         func spend(_ count: Int) throws {
             guard count <= remaining else { throw invalid("The screen package is too large.") }

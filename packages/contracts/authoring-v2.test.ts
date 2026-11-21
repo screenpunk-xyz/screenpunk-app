@@ -1,7 +1,7 @@
 import {describe,it,expect} from 'vitest';
 import fixture from './fixtures/conformance-v2.json';
 import {canonicalJSON} from './authoring';
-import {authoringContentDigestV2,authoringReferenceV2,authoringSnapshotDigestV2,makeAuthoringRequestV2,materializeAuthoringResultV2,sealAuthoringRequestV2,supportsAuthoringV2,validateAuthoringRequestV2,validateAuthoringResultV2,verifyAuthoringRequestDigestV2,type AuthoringRequestV2,type AuthoringResultV2} from './authoring-v2';
+import {authoringContentDigestV2,authoringReferenceV2,authoringSnapshotDigestV2,makeAuthoringRequestV2,materializeAuthoringResultBytesV2,materializeAuthoringResultV2,sealAuthoringRequestV2,supportsAuthoringV2,validateAuthoringRequestV2,validateAuthoringResultV2,verifyAuthoringRequestDigestV2,type AuthoringRequestV2,type AuthoringResultV2} from './authoring-v2';
 const request=()=>structuredClone(fixture.request) as AuthoringRequestV2;
 const result=()=>structuredClone(fixture.result) as AuthoringResultV2;
 const asset=fixture.assetRecipe.prefix+'A'.repeat(fixture.assetRecipe.repeatCount)+fixture.assetRecipe.suffix;
@@ -14,5 +14,27 @@ describe('authoring v2 immutable assets',()=>{
  it('rejects retention/deletion on new screens and oversized materialized copies',async()=>{const r=request();delete r.context.currentScreen;r.context.baseRevision=null;const sealed=await sealAuthoringRequestV2(r);const v=result();v.inputDigest=sealed.delivery.snapshotDigest;v.baseRevision=null;expect(()=>validateAuthoringResultV2(v,sealed)).toThrow();const huge=result();huge.screen!.files.push({...huge.screen!.files[2],path:'copy1.svg'},{...huge.screen!.files[2],path:'copy2.svg'});expect(()=>validateAuthoringResultV2(huge,request())).toThrow(/byte/);});
  it('rejects unknown branch fields and unsafe paths; supports explicit capabilities only',()=>{const v=result();(v.screen!.files[2] as any).content='wrong';expect(()=>validateAuthoringResultV2(v,request())).toThrow();expect(supportsAuthoringV2({contractVersions:['1','2'],features:['asset-references-v2']})).toBe(true);expect(supportsAuthoringV2({contractVersions:['2'],features:[]})).toBe(false);expect(supportsAuthoringV2(null)).toBe(false);});
  it('preserves UTF8 BOM bytes and rejects JSON escaping beyond materialized limit',async()=>{const r=request();const withBOM='\uFEFF'+asset;const bytes=new TextEncoder().encode(withBOM);r.context.currentScreen!.files[2].byteLength=bytes.length;r.context.currentScreen!.files[2].digest=await authoringContentDigestV2(bytes);const sealed=await sealAuthoringRequestV2(r);const v=result();v.inputDigest=sealed.delivery.snapshotDigest;(v.screen!.files[2] as any).reference=sealed.context.currentScreen!.files[2].reference;(v.screen!.files[2] as any).digest=sealed.context.currentScreen!.files[2].digest;const screen=await materializeAuthoringResultV2(v,sealed,()=>bytes);expect(new TextEncoder().encode(screen!.files[2].content)).toEqual(bytes);delete r.context.currentScreen;r.context.baseRevision=null;const fresh=await sealAuthoringRequestV2(r);const huge:AuthoringResultV2={schemaVersion:2,requestID:fresh.requestID,inputDigest:fresh.delivery.snapshotDigest,baseRevision:null,preferenceRevisions:{},operationID:'escaped',screen:{title:'Escaped',entry:'index.html',files:[{kind:'write',path:'index.html',content:'"'.repeat(110000)}],deletedPaths:[]}};expect(validateAuthoringResultV2(huge,fresh)).toBe(huge);await expect(materializeAuthoringResultV2(huge,fresh,()=>{throw new Error('must not resolve')})).rejects.toThrow(/size/);});
+
+ it('materializes arbitrary opaque raw assets while applying an editable-text change', async () => {
+   const input = request();
+   const inventory = input.context.currentScreen!;
+   inventory.packageSchema = 3;
+   const raw = new Uint8Array(224 * 1024).fill(0xff);
+   const digest = await authoringContentDigestV2(raw);
+   inventory.files.push({path:'media/video.payload', mediaType:'application/octet-stream', byteLength:raw.length, digest, reference:''});
+   const sealed = await sealAuthoringRequestV2(input);
+   const output = result();
+   output.inputDigest = sealed.delivery.snapshotDigest;
+   const source = sealed.context.currentScreen!.files.at(-1)!;
+   output.screen!.files.push({kind:'retain',path:source.path,sourcePath:source.path,reference:source.reference,digest:source.digest});
+   const resolve = (file: {path:string}) => file.path === source.path ? raw : new TextEncoder().encode(asset);
+   const files = await materializeAuthoringResultBytesV2(output,sealed,resolve);
+   expect(files?.get(source.path)).toEqual(raw);
+   await expect(materializeAuthoringResultBytesV2(output,sealed,() => new Uint8Array())).rejects.toThrow(/corrupt/);
+   output.screen!.files[output.screen!.files.length - 1] = {kind:'write',path:source.path,content:'text'};
+   expect(() => validateAuthoringResultV2(output,sealed)).toThrow(/editable text/);
+   delete inventory.packageSchema;
+   await expect(sealAuthoringRequestV2(input)).rejects.toThrow(/legacy source/);
+ });
 
 });

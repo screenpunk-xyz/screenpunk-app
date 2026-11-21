@@ -15,7 +15,8 @@ struct PackageMediaResponse {
         if let range {
             if let bounds = Self.byteRange(range, count: count) {
                 status = 206
-                data = asset.data.subdata(in: bounds)
+                let start = asset.data.startIndex
+                data = asset.data[(start + bounds.lowerBound)..<(start + bounds.upperBound)]
                 headers["Content-Range"] = "bytes \(bounds.lowerBound)-\(bounds.upperBound - 1)/\(count)"
             } else {
                 status = 416

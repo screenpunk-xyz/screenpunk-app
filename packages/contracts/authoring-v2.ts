@@ -1,15 +1,18 @@
 import definition from './generated/authoring-v2-definition';
-import { AUTHORING_DEFINITION, AuthoringContractError, authoringRuntime, canonicalJSON, checkAuthoringManifestScreenData, sealAuthoringRequest, validateAuthoringRequest, validateAuthoringResult, validateAuthoringScreen, type AuthoringRequestV1, type AuthoringResultV1, type AuthoringScreen, type JSONSchema } from './authoring';
+import { AUTHORING_DEFINITION, CUSTOM_HTTP_FEATURE, AuthoringContractError, canonicalJSON, checkAuthoringManifestScreenData, sealAuthoringRequest, validateAuthoringRequest, validateAuthoringResult, validateAuthoringScreen, type AuthoringRequestV1, type AuthoringResultV1, type AuthoringScreen, type JSONSchema } from './authoring';
 export interface AuthoringSourceFileV2 { path: string; mediaType: string; byteLength: number; digest: string; reference: string; content?: string }
-export interface AuthoringSourceScreenV2 { title: string; entry: 'index.html'; files: AuthoringSourceFileV2[] }
+export interface AuthoringSourceScreenV2 { title: string; entry: 'index.html'; files: AuthoringSourceFileV2[]; packageSchema?: 3 }
 export interface AuthoringContextV2 extends Omit<AuthoringRequestV1['context'],'currentScreen'> { libraryID: string; currentScreen?: AuthoringSourceScreenV2 }
 export interface AuthoringRequestV2 extends Omit<AuthoringRequestV1,'schemaVersion'|'context'|'delivery'> { schemaVersion: 2; context: AuthoringContextV2; delivery: { route: 'cloud'|'local'|'fixture'; contractVersion: '2'; snapshotDigest: string } }
 export type AuthoringFileMutationV2 = {kind:'write';path:string;content:string} | {kind:'retain';path:string;sourcePath:string;reference:string;digest:string};
 export interface AuthoringScreenMutationV2 { title:string;entry:'index.html';files:AuthoringFileMutationV2[];deletedPaths:string[];requiredAssets?:string[] }
 export interface AuthoringResultV2 extends Omit<AuthoringResultV1,'schemaVersion'|'screen'> { schemaVersion:2;screen?:AuthoringScreenMutationV2 }
 export interface AuthoringCapabilitiesV2 { contractVersions: string[]; features: string[] }
-export const AUTHORING_V2_CAPABILITIES: Readonly<AuthoringCapabilitiesV2> = Object.freeze({contractVersions:Object.freeze(['1','2']) as unknown as string[],features:Object.freeze(['asset-references-v2']) as unknown as string[]});
+export const AUTHORING_V2_CAPABILITIES: Readonly<AuthoringCapabilitiesV2> = Object.freeze({contractVersions:Object.freeze(['1','2']) as unknown as string[],features:Object.freeze(['asset-references-v2','package-assets-v2',CUSTOM_HTTP_FEATURE]) as unknown as string[]});
 export function supportsAuthoringV2(value: unknown): boolean { const v = value as AuthoringCapabilitiesV2 | null; return !!v && Array.isArray(v.contractVersions) && v.contractVersions.includes('2') && Array.isArray(v.features) && v.features.includes('asset-references-v2'); }
+export function supportsAuthoringPackageAssets(value: unknown): boolean {
+  return supportsAuthoringV2(value) && (value as AuthoringCapabilitiesV2).features.includes('package-assets-v2');
+}
 const fail = (message:string):never => {throw new AuthoringContractError(message)};
 const utf8 = (text:string) => new TextEncoder().encode(text);
 const plain = (v:unknown):v is Record<string,any> => typeof v === 'object' && v !== null && !Array.isArray(v) && (Object.getPrototypeOf(v) === Object.prototype || Object.getPrototypeOf(v) === null);
@@ -55,7 +58,26 @@ function check(schema: JSONSchema, value: any, defs: JSONSchema, path: string, d
   }
 }
 function validateSchema(name:'Request'|'Result',value:unknown):void { const schema = definition.schemas[name] as JSONSchema; canonicalJSON(value);check(schema,value,schema.$defs,'$'); }
-export function authoringMediaTypeV2(path:string):string { return ({html:'text/html',css:'text/css',js:'text/javascript',json:'application/json',svg:'image/svg+xml',txt:'text/plain'} as Record<string,string>)[path.split('.').pop()!] ?? fail('unsupported file extension'); }
+const legacyMediaTypes: Readonly<Record<string,string>> = Object.freeze({html:'text/html',css:'text/css',js:'text/javascript',json:'application/json',svg:'image/svg+xml',txt:'text/plain'});
+const additionalTextMediaTypes: Readonly<Record<string,string>> = Object.freeze({mjs:'text/javascript',md:'text/markdown',xml:'application/xml',csv:'text/csv',vtt:'text/vtt'});
+const assetMediaTypes: Readonly<Record<string,string>> = Object.freeze({wav:'audio/wav',mp3:'audio/mpeg',ogg:'audio/ogg',mp4:'video/mp4',webm:'video/webm',png:'image/png',jpg:'image/jpeg',jpeg:'image/jpeg',gif:'image/gif',webp:'image/webp',avif:'image/avif',woff:'font/woff',woff2:'font/woff2'});
+const extension = (path: string) => /\.([^.\/]+)$/u.exec(path)?.[1] ?? '';
+function legacyPath(path: string): boolean {
+  return path.length <= 160 && /^[a-zA-Z0-9_-]+(?:\/[a-zA-Z0-9_-]+)*\.(?:html|css|js|json|svg|txt)$/u.test(path);
+}
+export function isEditableAuthoringText(path: string): boolean {
+  const ext = extension(path).toLowerCase();
+  return Object.hasOwn(legacyMediaTypes, ext) || Object.hasOwn(additionalTextMediaTypes, ext);
+}
+export function authoringMediaTypeV2(path: string, extended = false): string {
+  const ext = extension(path);
+  if (!extended) return Object.hasOwn(legacyMediaTypes, ext) ? legacyMediaTypes[ext] : fail('unsupported file extension');
+  const lower = ext.toLowerCase();
+  for (const types of [legacyMediaTypes, additionalTextMediaTypes, assetMediaTypes]) {
+    if (Object.hasOwn(types, lower)) return types[lower];
+  }
+  return 'application/octet-stream';
+}
 export async function authoringContentDigestV2(data:Uint8Array|string):Promise<string> { const bytes=typeof data==='string'?utf8(data):new Uint8Array(data);const hash=await crypto.subtle.digest('SHA-256',bytes);return Array.from(new Uint8Array(hash),b=>b.toString(16).padStart(2,'0')).join(''); }
 export async function authoringReferenceV2(request:AuthoringRequestV2,file:AuthoringSourceFileV2):Promise<string> { return authoringContentDigestV2(canonicalJSON({version:2,requestID:request.requestID,profileID:request.context.profileID,libraryID:request.context.libraryID,screenID:request.context.screenID,baseRevision:request.context.baseRevision,path:file.path,mediaType:file.mediaType,byteLength:file.byteLength,digest:file.digest})); }
 export async function authoringSnapshotDigestV2(request:AuthoringRequestV2):Promise<string> {const copy=structuredClone(request) as any;delete copy.delivery.snapshotDigest;return authoringContentDigestV2(canonicalJSON(copy));}
@@ -66,9 +88,25 @@ export function validateAuthoringRequestV2(value:unknown):AuthoringRequestV2 {
  if(!!source !== (request.context.baseRevision !== null)) fail('base revision and source manifest must appear together');
  if(source) {
   if(!source.title.trim() || source.title.length>100) fail('invalid source title');
-  const paths=new Set<string>();let bytes=0;
-  for(const file of source.files) {if(paths.has(file.path.toLowerCase()))fail('duplicate source path');paths.add(file.path.toLowerCase());if(file.mediaType!==authoringMediaTypeV2(file.path))fail('source media type mismatch');bytes+=file.byteLength;if(file.content!==undefined&&utf8(file.content).length!==file.byteLength)fail('source byte length mismatch');if(file.path==='manifest.json'&&file.content!==undefined)checkAuthoringManifestScreenData(file.content);}
-  if(!source.files.some(f=>f.path==='index.html') || bytes>204800)fail('source package limit/entry');
+  const extended = source.packageSchema === 3;
+  if (!extended && source.files.length > 20) fail('source file count');
+  const paths = new Set<string>();
+  let bytes = 0;
+  for (const file of source.files) {
+    const key = file.path.toLowerCase();
+    if (paths.has(key)) fail('duplicate source path');
+    paths.add(key);
+    if (!extended) {
+      if (!legacyPath(file.path) || file.byteLength > 204800 || file.mediaType !== authoringMediaTypeV2(file.path)) fail('legacy source path, size or media type');
+      bytes += file.byteLength;
+    }
+    if (file.content !== undefined) {
+      if (extended && !isEditableAuthoringText(file.path)) fail('opaque source must omit content');
+      if (utf8(file.content).length !== file.byteLength) fail('source byte length mismatch');
+      if (file.path === 'manifest.json') checkAuthoringManifestScreenData(file.content);
+    }
+  }
+  if (!source.files.some(f => f.path === 'index.html') || bytes > 204800) fail('source package limit/entry');
  }
  if(utf8(canonicalJSON(request)).length>393216)fail('request byte limit');
  return request;
@@ -90,26 +128,68 @@ export function validateAuthoringResultV2(value:unknown,request?:AuthoringReques
  validateAuthoringResult(legacy,request?legacyRequest(request):undefined);
  if(utf8(canonicalJSON(result)).length>393216||utf8(canonicalJSON(metadata)).length>131072)fail('result byte limit');
  if(screen){
+  const extended = request?.context.currentScreen?.packageSchema === 3;
+  const legacy = !!request && !extended;
+  if (legacy) {
+    const paths = [...screen.files.flatMap(file => file.kind === 'retain' ? [file.path, file.sourcePath] : [file.path]), ...screen.deletedPaths, ...(screen.requiredAssets ?? [])];
+    if (screen.files.length > 20 || screen.deletedPaths.length > 20 || (screen.requiredAssets?.length ?? 0) > 20 || !paths.every(legacyPath)) fail('legacy result paths or count');
+  }
   if(!screen.title.trim()||screen.title.length>100)fail('invalid screen title');
   const targets=new Set<string>();const deleted=new Set<string>();const base=request?.context.currentScreen?.files??[];
-  const supportsScreenData = !request || canonicalJSON(request.runtime) === canonicalJSON(authoringRuntime(true));
+  const supportsScreenData = !request || AUTHORING_DEFINITION.screenData.features.every(feature => request.runtime.features.includes(feature));
+  const supportsCustomHTTP = !request || request.runtime.features.includes(CUSTOM_HTTP_FEATURE);
   const previousManifest = base.find(f => f.path === 'manifest.json')?.content;
   for(const path of screen.deletedPaths){if(deleted.has(path.toLowerCase()))fail('duplicate deleted path');deleted.add(path.toLowerCase());}
   let total=0;
   for(const file of screen.files){const path=file.path.toLowerCase();if(targets.has(path)||deleted.has(path))fail('duplicate/overlapping destination');targets.add(path);
-   if(file.kind==='write'){total+=utf8(file.content).length;if(file.path==='manifest.json')checkAuthoringManifestScreenData(file.content,previousManifest,supportsScreenData);}
-   else if(request){const source=base.find(f=>f.path===file.sourcePath&&f.reference===file.reference&&f.digest===file.digest)??fail('unknown/out-of-scope source reference');total+=source.byteLength;
-    if(file.path==='manifest.json'&&source.path!==file.path){if(source.content!==undefined)checkAuthoringManifestScreenData(source.content,previousManifest,supportsScreenData);else if(!supportsScreenData)fail('target runtime cannot admit a manifest from an opaque reference');}}
+   if(file.kind==='write'){if(!isEditableAuthoringText(file.path))fail('writes require editable text');total+=utf8(file.content).length;if(file.path==='manifest.json')checkAuthoringManifestScreenData(file.content,previousManifest,supportsScreenData,supportsCustomHTTP);}
+   else if(request){const source=base.find(f=>f.path===file.sourcePath&&f.reference===file.reference&&f.digest===file.digest)??fail('unknown/out-of-scope source reference');if (extended) {
+     if (file.path !== source.path && extension(file.path).toLowerCase() !== extension(source.path).toLowerCase()) fail('retain must preserve the file extension');
+    } else total += source.byteLength;
+    if(file.path==='manifest.json'&&source.path!==file.path){if(source.content!==undefined)checkAuthoringManifestScreenData(source.content,previousManifest,supportsScreenData,supportsCustomHTTP);else if(!supportsScreenData || !supportsCustomHTTP)fail('target runtime cannot admit a manifest from an opaque reference');}}
   }
-  if(!screen.files.some(f=>f.path==='index.html')||total>204800)fail('materialized entry/byte limit');
+  if(!screen.files.some(f=>f.path==='index.html')||(legacy && total>204800))fail('materialized entry/byte limit');
   const required=new Set<string>();for(const path of screen.requiredAssets??[]){if(required.has(path.toLowerCase())||!screen.files.some(f=>f.path===path))fail('missing/duplicate declared asset');required.add(path.toLowerCase());}
   if(request){for(const path of screen.deletedPaths)if(!base.some(f=>f.path===path))fail('delete outside base snapshot');for(const file of base)if(!screen.files.some(f=>f.path===file.path)&&!screen.deletedPaths.includes(file.path))fail('unaccounted base file');}
  }
  return result;
 }
-/** Materialize exact UTF8 bytes after request digest/reference verification, before native dependency checks and atomic installation. */
-export async function materializeAuthoringResultV2(result:AuthoringResultV2,request:AuthoringRequestV2,resolve:(file:AuthoringSourceFileV2)=>Promise<Uint8Array>|Uint8Array):Promise<AuthoringScreen|undefined> {
- if(!await verifyAuthoringRequestDigestV2(request))fail('snapshot/reference digest mismatch');validateAuthoringResultV2(result,request);if(!result.screen)return undefined;const files=[];
- for(const file of result.screen.files){if(file.kind==='write'){files.push({path:file.path,content:file.content});continue;}const source=request.context.currentScreen!.files.find(f=>f.path===file.sourcePath)!;const bytes=await resolve(source);if(bytes.length!==source.byteLength||await authoringContentDigestV2(bytes)!==source.digest)fail('pinned source corrupt/missing');let content:string;try{content=new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(bytes);}catch{fail('source is not UTF8');}if(file.path==='manifest.json'&&source.path!==file.path)checkAuthoringManifestScreenData(content!,request.context.currentScreen?.files.find(f=>f.path==='manifest.json')?.content,canonicalJSON(request.runtime)===canonicalJSON(authoringRuntime(true)));files.push({path:file.path,content:content!});}
- return validateAuthoringScreen({title:result.screen.title,entry:result.screen.entry,files});
+type AuthoringSourceResolverV2 = (file: AuthoringSourceFileV2) => Promise<Uint8Array> | Uint8Array;
+const decodeUTF8 = (bytes: Uint8Array): string => {
+  try { return new TextDecoder('utf-8', {fatal:true,ignoreBOM:true}).decode(bytes); }
+  catch { return fail('source is not UTF8'); }
+};
+
+/** Verify and materialize raw bytes before native dependency checks and atomic installation. */
+export async function materializeAuthoringResultBytesV2(result: AuthoringResultV2, request: AuthoringRequestV2, resolve: AuthoringSourceResolverV2): Promise<Map<string,Uint8Array> | undefined> {
+  if (!await verifyAuthoringRequestDigestV2(request)) fail('snapshot/reference digest mismatch');
+  validateAuthoringResultV2(result, request);
+  if (!result.screen) return undefined;
+  const files = new Map<string,Uint8Array>();
+  const base = new Map(request.context.currentScreen?.files.map(file => [file.path,file]));
+  for (const file of result.screen.files) {
+    if (file.kind === 'write') {
+      files.set(file.path, utf8(file.content));
+      continue;
+    }
+    const source = base.get(file.sourcePath)!;
+    const bytes = new Uint8Array(await resolve(source));
+    if (bytes.length !== source.byteLength || await authoringContentDigestV2(bytes) !== source.digest) fail('pinned source corrupt/missing');
+    if (file.path === 'manifest.json' && source.path !== file.path) {
+      checkAuthoringManifestScreenData(decodeUTF8(bytes), base.get('manifest.json')?.content,
+        AUTHORING_DEFINITION.screenData.features.every(feature => request.runtime.features.includes(feature)),
+        request.runtime.features.includes(CUSTOM_HTTP_FEATURE));
+    }
+    files.set(file.path, bytes);
+  }
+  return files;
+}
+
+/** Preserve the original text-only materialization API for legacy packages. */
+export async function materializeAuthoringResultV2(result: AuthoringResultV2, request: AuthoringRequestV2, resolve: AuthoringSourceResolverV2): Promise<AuthoringScreen | undefined> {
+  if (request.context.currentScreen?.packageSchema === 3) fail('asset packages require byte materialization');
+  const bytes = await materializeAuthoringResultBytesV2(result, request, resolve);
+  if (!bytes || !result.screen) return undefined;
+  const files = [...bytes].map(([path, content]) => ({path,content:decodeUTF8(content)}));
+  return validateAuthoringScreen({title:result.screen.title,entry:result.screen.entry,files});
 }

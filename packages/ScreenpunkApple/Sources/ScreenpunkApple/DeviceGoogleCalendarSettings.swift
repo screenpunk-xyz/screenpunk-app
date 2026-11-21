@@ -38,11 +38,14 @@ final class GoogleCalendarSignIn: NSObject, ASWebAuthenticationPresentationConte
 }
 
 @MainActor
-public struct DeviceGoogleCalendarSettings: View {
-    public init(manifests: [DashboardManifest] = [], onChange: @escaping () -> Void = {}) { self.manifests = manifests; self.onChange = onChange }
+public struct DeviceGoogleCalendarSettings<ScreenLinks: View>: View {
+    public init(onChange: @escaping () -> Void = {}, @ViewBuilder screenLinks: () -> ScreenLinks) {
+        self.onChange = onChange
+        self.screenLinks = screenLinks()
+    }
 
-    let manifests: [DashboardManifest]
-    let onChange: () -> Void
+    private let screenLinks: ScreenLinks
+    private let onChange: () -> Void
     @State private var state = GoogleCalendarState()
     @State private var message: String?
     @State private var configurationNoticeDismissed = false
@@ -55,9 +58,6 @@ public struct DeviceGoogleCalendarSettings: View {
         guard let oauth = try? GoogleCalendarOAuth(clientID: clientID),
               let types = Bundle.main.object(forInfoDictionaryKey: "CFBundleURLTypes") as? [[String: Any]] else { return false }
         return types.contains { ($0["CFBundleURLSchemes"] as? [String])?.contains(oauth.callbackScheme) == true }
-    }
-    private var calendarScreens: [DashboardManifest] {
-        manifests.filter { $0.connections.contains { ["googleCalendar", "google-calendar"].contains($0.alias) } }
     }
     public var body: some View {
         Form {
@@ -86,22 +86,7 @@ public struct DeviceGoogleCalendarSettings: View {
                 }.disabled(!configured)
                 if !configured && !configurationNoticeDismissed { ConnectionFeedback("Google Calendar sign-in is not configured in this build.") { configurationNoticeDismissed = true } }
             }
-            ForEach(calendarScreens, id: \.dashboardId) { screen in
-                Section(screen.name) {
-                    if state.accounts.isEmpty { Text("Connect an account to choose calendars.").foregroundStyle(.secondary) }
-                    ForEach(state.accounts) { account in
-                        ForEach(account.calendars) { calendar in
-                            let selection = GoogleCalendarSelection(accountID: account.id, calendarID: calendar.id)
-                            Toggle(isOn: Binding(get: { (state.selections[screen.dashboardId] ?? []).contains(selection) }, set: { enabled in
-                                do { try service.select(dashboard: screen.dashboardId, selection: selection, enabled: enabled); reload(); onChange() }
-                                catch { message = error.localizedDescription }
-                            })) {
-                                VStack(alignment: .leading) { Text(calendar.summary); Text(account.email).font(.caption).foregroundStyle(.secondary) }
-                            }
-                        }
-                    }
-                }
-            }
+            Section("Screens using Google Calendar") { screenLinks }
             Section {
                 Text("Removing an account here clears its data and calendar selections from this device. To revoke Screenpunk’s Google access across devices, manage your Google account connections.").font(.footnote).foregroundStyle(.secondary)
                 Link("Manage access in Google", destination: URL(string: "https://myaccount.google.com/connections")!)
@@ -127,6 +112,61 @@ public struct DeviceGoogleCalendarSettings: View {
             catch let error as ASWebAuthenticationSessionError where error.code == .canceledLogin { }
             catch { message = (error as? GoogleCalendarError)?.localizedDescription ?? "Could not connect to Google Calendar. Try again." }
         }
+    }
+}
+
+@MainActor
+public struct DeviceGoogleCalendarScreenSettings: View {
+    private let manifest: DashboardManifest
+    private let onChange: () -> Void
+    private let service = GoogleCalendarDeviceService.shared
+    @State private var state = GoogleCalendarState()
+    @State private var message: String?
+
+    public init(manifest: DashboardManifest, onChange: @escaping () -> Void = {}) {
+        self.manifest = manifest
+        self.onChange = onChange
+    }
+
+    public var body: some View {
+        Section("Google Calendar") {
+            if state.accounts.isEmpty {
+                Text("Connect a Google account in Connections to choose calendars for this screen.")
+                    .foregroundStyle(.secondary)
+            } else if state.accounts.allSatisfy({ $0.calendars.isEmpty }) {
+                Text("No calendars are available. Refresh your account in Connections.")
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(state.accounts) { account in
+                ForEach(account.calendars) { calendar in
+                    let selection = GoogleCalendarSelection(accountID: account.id, calendarID: calendar.id)
+                    Toggle(isOn: binding(for: selection)) {
+                        VStack(alignment: .leading) {
+                            Text(calendar.summary)
+                            Text(account.email).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+            if let message { ConnectionFeedback(message) { self.message = nil } }
+        }
+        .task { reload() }
+    }
+
+    private func binding(for selection: GoogleCalendarSelection) -> Binding<Bool> {
+        Binding(get: { (state.selections[manifest.dashboardId] ?? []).contains(selection) }, set: { enabled in
+            do {
+                try service.select(dashboard: manifest.dashboardId, selection: selection, enabled: enabled)
+                message = nil
+                reload()
+                onChange()
+            } catch { message = error.localizedDescription }
+        })
+    }
+
+    private func reload() {
+        do { state = try service.snapshot() }
+        catch { message = "Calendar accounts could not be loaded from this device’s secure storage." }
     }
 }
 #endif

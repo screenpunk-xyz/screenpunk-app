@@ -96,6 +96,9 @@ import ScreenpunkLocalTransport
     }
     @Published private(set) var catalogCanResume = false
     private let catalogPump = CatalogWorkPump()
+    private let linkedCatalogPump = CatalogWorkPump()
+    @Published private(set) var catalogPickerFollowsUpdates = false
+    @Published private var linkedCatalogDeviceCounts: [String: Int] = [:]
     private var catalogCatchUpNeeded = false
     private var catalogCapabilityRetry: Date?
     @Published private(set) var catalogPreviewStatus: String? {
@@ -263,6 +266,7 @@ import ScreenpunkLocalTransport
 
     @Published private(set) var resolvedAgentName: String?
     private var cloudSupportsV2 = false
+    private var cloudSupportsCustomHTTP = false
     @Published private(set) var localAgent: LocalAgentConfiguration?
     @Published private(set) var localSettings: LocalAgentSettingsModel?
     private var profileRepository: LocalProfileRepository?
@@ -283,7 +287,7 @@ import ScreenpunkLocalTransport
     var hasProfile: Bool { activeProfile != nil }
     var canUseCloudRoute: Bool { cloudBindingMatches }
     var canSelectCloudRoute: Bool { cloudAccountMatches }
-    var routeChangeBlocked: Bool { accountDeletionIntent != nil || busy || pendingID != nil || library?.state.submissionKey != nil }
+    var routeChangeBlocked: Bool { accountDeletionIntent != nil || busy || pendingID != nil || library?.state.submissionKey != nil || linkedEditPrompt != nil }
     private var currentRequestRoute: AuthoringRoute {
         if let id = pendingID ?? library?.state.submissionKey {
             if let route = library?.authoringRequestV2(id: id)?.delivery.route { return AuthoringRoute(rawValue: route) ?? selectedRoute }
@@ -331,8 +335,91 @@ import ScreenpunkLocalTransport
         do { try library?.saveKeyboardDraft(text, screenID: screenID) }
         catch { message = "Your draft is kept for this session, but could not be saved: " + error.localizedDescription }
     }
+    struct LinkedEditOptions {
+        let screenID: String
+        let revision: String
+        let owner: String
+        let screenName: String
+        let forkName: String
+        let deviceCount: Int?
+        let version: Int
+        let pendingPublication: Bool
+        let hasConflict: Bool
+
+        var blocksEditing: Bool { pendingPublication || hasConflict }
+
+        var updateAllTitle: String {
+            if let deviceCount { return "Update all linked iPads (\(deviceCount))" }
+            return "Update all linked iPads"
+        }
+    }
+
+    struct LinkedEditPrompt: Identifiable {
+        let id = UUID()
+        let text: String
+        let options: LinkedEditOptions
+    }
+
+    @Published private(set) var linkedEditPrompt: LinkedEditPrompt?
+    private var retryLinkedEdit: (options: LinkedEditOptions, scope: ScreenLibrary.LinkedCatalogEditScope, text: String)?
+
+    func linkedEditOptions(for screenID: String?) -> LinkedEditOptions? {
+        guard let screenID, let saved = installedScreens.first(where: { $0.id == screenID }),
+              let link = library?.linkedCatalogScreen(id: screenID) else { return nil }
+        func bounded(_ value: String, limit: Int) -> String {
+            var remaining = limit
+            return String(value.prefix(while: { character in
+                remaining -= String(character).utf16.count
+                return remaining >= 0
+            }))
+        }
+        let deviceName = bounded(displayName.trimmingCharacters(in: .whitespacesAndNewlines), limit: 50)
+        let suffix = " — " + (deviceName.isEmpty ? "This iPad" : deviceName)
+        let title = bounded(saved.displayName, limit: 100 - suffix.utf16.count) + suffix
+        return .init(screenID: screenID, revision: saved.revision, owner: keyboardRequestScope,
+                     screenName: saved.displayName, forkName: title, deviceCount: linkedCatalogDeviceCount(for: screenID),
+                     version: link.displayVersion, pendingPublication: link.pendingRevision != nil, hasConflict: link.conflict)
+    }
+
+    func cancelLinkedEditPrompt() { linkedEditPrompt = nil }
+
+    func confirmLinkedEdit(_ prompt: LinkedEditPrompt, scope: ScreenLibrary.LinkedCatalogEditScope) {
+        if let current = linkedEditPrompt, current.id != prompt.id { return }
+        linkedEditPrompt = nil
+        guard linkedEditIsCurrent(prompt.options) else {
+            message = "This screen changed. Reopen it before sending your instructions."
+            return
+        }
+        Task { await send(prompt.text, linkedEdit: scope, expectedLinkedEdit: prompt.options) }
+    }
+
+    func resolveLinkedEditConflict(_ options: LinkedEditOptions, keepOnThisIPad: Bool) throws {
+        guard let library, !routeChangeBlocked, !accountOperationInProgress,
+              options.owner == keyboardRequestScope,
+              library.linkedCatalogScreen(id: options.screenID)?.conflict == true,
+              installedScreens.first(where: { $0.id == options.screenID })?.revision == options.revision else {
+            throw DeviceError.message("This shared edit changed. Reopen the screen’s settings.")
+        }
+        if keepOnThisIPad {
+            try library.resolveLinkedCatalogConflictAsFork(id: options.screenID, name: options.forkName)
+        } else {
+            try library.discardLinkedCatalogConflict(id: options.screenID)
+        }
+        guard library.linkedCatalogScreen(id: options.screenID)?.conflict != true else {
+            throw DeviceError.message("This shared edit could not be resolved.")
+        }
+        refreshScreen()
+        requestLinkedCatalogSync()
+    }
+
+    private func linkedEditIsCurrent(_ options: LinkedEditOptions) -> Bool {
+        guard let link = library?.linkedCatalogScreen(id: options.screenID), link.pendingRevision == nil, !link.conflict else { return false }
+        return options.owner == keyboardRequestScope && screen?.id == options.screenID && screen?.revision == options.revision
+    }
+
     @discardableResult
-    func submitKeyboardRequest(_ text: String, owner: String, screenID: String?, revision: String?, creatingNew: Bool) -> Bool {
+    func submitKeyboardRequest(_ text: String, owner: String, screenID: String?, revision: String?, creatingNew: Bool,
+                               linkedEdit: ScreenLibrary.LinkedCatalogEditScope? = nil) -> Bool {
         guard let normalized = KeyboardRequestText.normalized(text) else {
             message = "Enter instructions that fit the request limit. Your draft is kept."; return false
         }
@@ -342,6 +429,15 @@ import ScreenpunkLocalTransport
         }
         guard creatingNew || (screen?.id == screenID && screen?.revision == revision) else {
             message = "The selected screen changed. Your draft is kept; reopen the intended screen before sending."; return false
+        }
+        let options = creatingNew ? nil : linkedEditOptions(for: screenID)
+        guard options?.blocksEditing != true else {
+            message = "Finish reviewing this screen’s shared update first. Your draft is kept."
+            return false
+        }
+        guard (options == nil) == (linkedEdit == nil) else {
+            message = "Choose which iPads this edit should update. Your draft is kept."
+            return false
         }
         saveKeyboardDraft(text, owner: owner, screenID: creatingNew ? nil : screenID)
         do {
@@ -356,7 +452,7 @@ import ScreenpunkLocalTransport
             Task {
                 guard self.keyboardRequestScope == owner,
                       (creatingNew ? self.screen == nil : (self.screen?.id == screenID && self.screen?.revision == revision)) else { return }
-                await self.send(normalized)
+                await self.send(normalized, linkedEdit: linkedEdit, expectedLinkedEdit: options)
             }
             return true
         } catch { message = error.localizedDescription; return false }
@@ -634,6 +730,7 @@ import ScreenpunkLocalTransport
             try localLedger.removeProfile(profileID: profile.id)
             try HomeAssistantDeviceVault().removeOwner(profile.permissionOwner)
             try GenericConnectionDeviceVault().removeOwner(profile.permissionOwner)
+            try customHTTPVault.removeOwner(profile.permissionOwner)
             try ScreenLibrary.deleteAccountScreens(accountID: intent.accountID, profile: profile)
         }
         if intent.profiles.isEmpty { try ScreenLibrary.deleteAccountScreens(accountID: intent.accountID, profile: nil) }
@@ -797,8 +894,9 @@ import ScreenpunkLocalTransport
     }
     /// Resolve a new request before sealing source or preparing delivery. A prepared
     /// request never enters this resolver again, including after a send failure.
-    func send(_ text: String) async {
-        guard accountDeletionIntent == nil else { return }
+    func send(_ text: String, linkedEdit: ScreenLibrary.LinkedCatalogEditScope? = nil,
+              expectedLinkedEdit: LinkedEditOptions? = nil) async {
+        guard accountDeletionIntent == nil, !accountOperationInProgress, linkedEditPrompt == nil else { return }
         // First Cloud linking can change the wire profile while keeping the same
         // native descriptor. Rebind idle adapters before capturing any new request.
         if !busy, pendingID == nil, library?.state.submissionKey == nil, localAgent != nil,
@@ -815,6 +913,26 @@ import ScreenpunkLocalTransport
             }
             message = "The saved delivery needs attention. Cancel it before sending new instructions."; return
         }
+        guard pendingID == nil else { return }
+        if let expectedLinkedEdit, !linkedEditIsCurrent(expectedLinkedEdit) {
+            message = "This screen changed. Reopen it before sending your instructions."
+            return
+        }
+        let options = expectedLinkedEdit ?? linkedEditOptions(for: screen?.id)
+        guard options?.blocksEditing != true else {
+            message = "Finish reviewing this screen’s shared update in Settings first."
+            return
+        }
+        guard linkedEdit == nil || options != nil else {
+            message = "This screen is no longer linked. Reopen it before sending your instructions."
+            return
+        }
+        if let options, linkedEdit == nil {
+            linkedEditPrompt = .init(text: text, options: options)
+            return
+        }
+        if let options, let linkedEdit { retryLinkedEdit = (options, linkedEdit, text) }
+        else { retryLinkedEdit = nil }
         let generation = connectionGeneration
         let endpoint = try? configurationRepository?.load()
         let token = cloud.session?.accessToken
@@ -827,12 +945,13 @@ import ScreenpunkLocalTransport
         busy = true; requestPending = true; canCancelRequest = false; message = nil; progressCaption = "Checking available agents…"
         do {
             try library.saveInstruction(text)
-            let resolved = try await resolveNewRequest(requiresV2: screen != nil)
+            let resolved = try await resolveNewRequest(requiresV2: screen != nil, requiresPackageAssets: screen?.hasNativeAssets == true)
             guard self.library === library, activeProfile?.id == profile.id,
                   activeProfile?.authoringProfileID == profile.authoringProfileID,
                   activeProfile?.authoringDeviceID == profile.authoringDeviceID,
                   connectionGeneration == generation, cloud.session?.accessToken == token,
-                  screen?.revision == selectedScreen, !Task.isCancelled else { throw CancellationError() }
+                  screen?.revision == selectedScreen,
+                  options.map(linkedEditIsCurrent) ?? true, !Task.isCancelled else { throw CancellationError() }
             if resolved.route == .local {
                 guard try localLedger?.unresolvedRecord() == nil else { throw DeviceError.message("An earlier local delivery is unresolved. Finish or cancel it before sending another request.") }
                 guard let current = try configurationRepository?.load(), current.id == endpoint?.id,
@@ -844,10 +963,12 @@ import ScreenpunkLocalTransport
             if resolved.version == 1 {
                 busy = false; await sendV1(text); return
             }
-            let base = try makeAuthoringRequest(text: text, library: library, route: resolved.route)
+            let base = try makeAuthoringRequest(text: text, library: library, route: resolved.route, preparingV2: true)
             let snapshot = try library.makeAuthoringRequestV2(from: base)
             // Pin + snapshot durability precede delivery state and any network turn.
-            try library.prepareAuthoringRequest(snapshot, text: text, screen: screen?.artifact)
+            try library.prepareAuthoringRequest(snapshot, text: text, screen: nil,
+                                                linkedEdit: linkedEdit, forkName: linkedEdit == .thisDevice ? options?.forkName : nil)
+            retryLinkedEdit = nil
             pendingID = snapshot.requestID; pendingScreenID = snapshot.context.screenID
             busy = false
             await submitPreparedV2(snapshot, library: library)
@@ -866,7 +987,7 @@ import ScreenpunkLocalTransport
         var errorDescription: String? { "Ask your Cloud agent to listen for requests." }
     }
     private struct ResolvedRoute { let route: AuthoringRoute; let version: Int }
-    private func resolveNewRequest(requiresV2: Bool) async throws -> ResolvedRoute {
+    private func resolveNewRequest(requiresV2: Bool, requiresPackageAssets: Bool) async throws -> ResolvedRoute {
         RequestTimeline.record(.preflightStart)
         defer { RequestTimeline.record(.preflightEnd) }
         if routePreference != .cloud {
@@ -902,8 +1023,10 @@ import ScreenpunkLocalTransport
         let status: AgentStatus = try await cloud.call("api/device/status", authoringVersion: 2)
         guard status.profileID == activeProfile?.cloudBinding?.profileID else { throw DeviceError.message("The Cloud connection changed. Review your account connection.") }
         cloudAgentReady = status.agentReady; cloudSupportsV2 = status.authoringCapabilities?.supportsV2 == true
+        cloudSupportsCustomHTTP = status.authoringCapabilities?.features.contains("custom-http-v1") == true
         if cloudAgentReady { agentReady = true }
-        return try resolved(NewRequestRoutePolicy.resolve(preference: routePreference, local: local, cloud: status.agentReady ? .ready(supportsV2: cloudSupportsV2) : .notReady, requiresV2: requiresV2))
+        let supportsSelectedPackage = cloudSupportsV2 && (!requiresPackageAssets || status.authoringCapabilities?.supportsPackageAssets == true)
+        return try resolved(NewRequestRoutePolicy.resolve(preference: routePreference, local: local, cloud: status.agentReady ? .ready(supportsV2: supportsSelectedPackage) : .notReady, requiresV2: requiresV2))
     }
     private func localRepairMessage(_ reason: LocalAgentRepairReason) -> String {
         switch reason {
@@ -1031,7 +1154,12 @@ import ScreenpunkLocalTransport
                     requestPreferenceSync() // A stalled acknowledgement must not delay a committed preference.
                 }
                 refreshScreen(); refreshPreferences()
-                message = receipt.status == "applied" ? (result.preferenceMutations?.isEmpty == false ? "Preference saved" : result.answer) : (receipt.message ?? "Your screen is unchanged.")
+                if receipt.status == "applied", result.screen != nil,
+                   library.linkedCatalogScreen(id: snapshot.context.screenID)?.pendingRevision != nil {
+                    message = "Saved on this iPad. Waiting to update the linked iPads."
+                } else {
+                    message = receipt.status == "applied" ? (result.preferenceMutations?.isEmpty == false ? "Preference saved" : result.answer) : (receipt.message ?? "Your screen is unchanged.")
+                }
                 // Keep pending identity until acknowledgement; restart can finish the exact receipt.
                 agentWorkingRequestID = nil
                 canCancelRequest = false
@@ -1116,7 +1244,7 @@ import ScreenpunkLocalTransport
             busy = false; requestPending = false; canRetry = true; canCancelRequest = library.state.submissionKey != nil; message = error.localizedDescription; requestRefresh()
         }
     }
-    private func makeAuthoringRequest(text: String, session: DeviceSession? = nil, library: ScreenLibrary, route: AuthoringRoute? = nil) throws -> AuthoringRequestV1 {
+    private func makeAuthoringRequest(text: String, session: DeviceSession? = nil, library: ScreenLibrary, route: AuthoringRoute? = nil, preparingV2: Bool = false) throws -> AuthoringRequestV1 {
         guard let profile = activeProfile else { throw DeviceError.message("Your profile is unavailable.") }
         let route = route ?? selectedRoute
         if route == .cloud, !cloudBindingMatches { throw DeviceError.message("Cloud is still confirming your profile. Try again shortly.") }
@@ -1152,9 +1280,12 @@ import ScreenpunkLocalTransport
             }
             return service
         }
-        let source = screen.map { AuthoringScreen(title: $0.artifact.title, entry: $0.artifact.entry, files: $0.artifact.files.map { .init(path: $0.path, content: $0.content) }) }
+        guard preparingV2 || screen?.hasNativeAssets != true else { throw DeviceError.message("This screen requires an agent that supports package assets.") }
+        let source = preparingV2 ? nil : screen.map { AuthoringScreen(title: $0.artifact.title, entry: $0.artifact.entry, files: $0.artifact.files.map { .init(path: $0.path, content: $0.content) }) }
         let supportsScreenData = route == .local || screenDataSocketID != nil
-        return try AuthoringContract.seal(AuthoringRequestV1(requestID: UUID().uuidString, createdAt: now, deadlineAt: now + 10 * 60 * 1000, designGuidance: AuthoringContract.designGuidance(supportsScreenData: supportsScreenData), runtime: AuthoringContract.runtime(supportsScreenData: supportsScreenData), services: services, preferences: library.preferences(profileID: profileID, deviceID: deviceID, screenID: screenID), context: .init(profileID: profileID, deviceID: deviceID, screenID: screenID, baseRevision: screen?.revision, userRequest: text, currentScreen: source, viewport: .init(width: size.width, height: size.height, scale: scale, orientation: size.width > size.height ? "landscape" : "portrait")), delivery: .init(route: route.rawValue)))
+        let supportsCustomHTTP = preparingV2 && (route == .local || cloudSupportsCustomHTTP)
+        let request = AuthoringRequestV1(requestID: UUID().uuidString, createdAt: now, deadlineAt: now + 10 * 60 * 1000, designGuidance: AuthoringContract.designGuidance(supportsScreenData: supportsScreenData, supportsCustomHTTP: supportsCustomHTTP), runtime: AuthoringContract.runtime(supportsScreenData: supportsScreenData, supportsCustomHTTP: supportsCustomHTTP), services: services, preferences: library.preferences(profileID: profileID, deviceID: deviceID, screenID: screenID), context: .init(profileID: profileID, deviceID: deviceID, screenID: screenID, baseRevision: screen?.revision, userRequest: text, currentScreen: source, viewport: .init(width: size.width, height: size.height, scale: scale, orientation: size.width > size.height ? "landscape" : "portrait")), delivery: .init(route: route.rawValue))
+        return preparingV2 ? request : try AuthoringContract.seal(request)
     }
     private func measureRequestApply(_ requestID: String, _ apply: () throws -> ApplicationReceiptV1) rethrows -> ApplicationReceiptV1 {
         RequestTimeline.record(.applyStart, requestID: requestID)
@@ -1181,6 +1312,16 @@ import ScreenpunkLocalTransport
         if let id = pendingID ?? library.state.submissionKey, let saved = library.authoringRequestV2(id: id) {
             guard !cancelledLocally.contains(id) else { message = "This request was cancelled. Wait for confirmation before sending again."; requestRefresh(); return }
             Task { await submitPreparedV2(saved, library: library) }
+            return
+        }
+        if let retry = retryLinkedEdit {
+            guard linkedEditIsCurrent(retry.options) else {
+                retryLinkedEdit = nil
+                canRetry = false
+                message = "This screen changed. Reopen it before retrying your instructions."
+                return
+            }
+            Task { await send(retry.text, linkedEdit: retry.scope, expectedLinkedEdit: retry.options) }
             return
         }
         guard let text = library.state.lastInstruction else { return }
@@ -1397,6 +1538,16 @@ import ScreenpunkLocalTransport
         } catch { message = error.localizedDescription }
     }
 
+    func renameScreen(_ id: String, to name: String, owner: String) throws {
+        guard !needsAgentSetup, !accountOperationInProgress, let library,
+              !owner.isEmpty, owner == permissionOwner else {
+            throw DeviceError.message("This screen’s library is unavailable.")
+        }
+        try library.renameScreen(id, to: name)
+        installedScreens = library.state.screens
+        if screen?.id == id { screen = installedScreens.first(where: { $0.id == id }) }
+    }
+
     func selectScreen(_ id: String) {
         guard !needsAgentSetup, !accountOperationInProgress, let library, library.isScreenShown(id),
               library.containsRotationScreen(id) else { return }
@@ -1408,33 +1559,125 @@ import ScreenpunkLocalTransport
         do { try library?.remove(id); refreshScreen() }
         catch { message = error.localizedDescription }
     }
+    struct CustomConnectionUse: Identifiable {
+        let screen: ScreenLibrary.Saved
+        let manifest: DashboardManifest
+        var id: String { screen.id + "/" + alias }
+        let alias: String
+        let declaration: CustomHTTPDeclaration
+    }
+    private let customHTTPVault = CustomHTTPDeviceVault()
+    private(set) var customHTTP: CustomHTTPDeviceRuntime?
+    @Published private(set) var customHTTPRendererKey = ""
+
+    func customConnectionUses(serviceID: String? = nil) -> [CustomConnectionUse] {
+        installedScreens.flatMap { screen -> [CustomConnectionUse] in
+            guard let manifest = installedManifests.first(where: { $0.revision == screen.revision }) else { return [] }
+            return manifest.connections.compactMap { connection in
+                guard let declaration = connection.customHTTP,
+                      serviceID == nil || declaration.id == serviceID else { return nil }
+                return .init(screen: screen, manifest: manifest, alias: connection.alias, declaration: declaration)
+            }
+        }
+    }
+
+    var savedCustomConnections: [CustomHTTPDeviceVault.SavedService] {
+        guard !permissionOwner.isEmpty else { return [] }
+        return customHTTPVault.savedServices(owner: permissionOwner)
+    }
+
+    func customConnectionStatus(_ declaration: CustomHTTPDeclaration) -> CustomHTTPDeviceVault.Status? {
+        guard !permissionOwner.isEmpty else { return nil }
+        return customHTTPVault.status(owner: permissionOwner, declaration: declaration)
+    }
+
+    func customConnectionApproved(_ use: CustomConnectionUse) -> Bool {
+        guard !permissionOwner.isEmpty else { return false }
+        return customHTTPVault.isApproved(owner: permissionOwner, screenID: use.screen.id, manifest: use.manifest, alias: use.alias)
+    }
+
+    func saveCustomConnection(_ use: CustomConnectionUse, owner: String, fields: [String: String],
+                              secret: String?, allowInsecureHTTP: Bool) throws {
+        try requireCurrentCustomConnection(use, owner: owner)
+        try customHTTPVault.save(owner: owner, declaration: use.declaration, fields: fields, secret: secret,
+                                 allowInsecureHTTP: allowInsecureHTTP)
+        refreshCustomConnections()
+    }
+
+    func setCustomConnectionApproved(_ approved: Bool, use: CustomConnectionUse, owner: String) throws {
+        try requireCurrentCustomConnection(use, owner: owner)
+        if approved {
+            try customHTTPVault.approve(owner: owner, screenID: use.screen.id, manifest: use.manifest, alias: use.alias)
+        } else {
+            try customHTTPVault.revoke(owner: owner, screenID: use.screen.id, alias: use.alias)
+        }
+        refreshCustomConnections()
+    }
+
+    func testCustomConnection(_ use: CustomConnectionUse, owner: String) async throws {
+        try requireCurrentCustomConnection(use, owner: owner)
+        guard let operation = use.declaration.operations.first(where: { $0.parameters.isEmpty }) else {
+            throw DeviceError.message("This connection does not have a simple read to test.")
+        }
+        let runtime = CustomHTTPDeviceRuntime(owner: owner, screenID: use.screen.id, manifest: use.manifest, vault: customHTTPVault)
+        _ = try await runtime.request(alias: use.alias, operation: operation.name, parameters: [:])
+        try requireCurrentCustomConnection(use, owner: owner)
+    }
+
+    func removeCustomConnection(_ serviceID: String, owner: String) throws {
+        guard !accountOperationInProgress, !owner.isEmpty, owner == permissionOwner else {
+            throw DeviceError.message("This connection belongs to another library.")
+        }
+        try customHTTPVault.remove(owner: owner, serviceID: serviceID)
+        refreshCustomConnections()
+    }
+
+    private func requireCurrentCustomConnection(_ use: CustomConnectionUse, owner: String) throws {
+        guard !accountOperationInProgress, !owner.isEmpty, owner == permissionOwner,
+              customConnectionUses(serviceID: use.declaration.id).contains(where: {
+                  $0.screen.id == use.screen.id && $0.screen.revision == use.screen.revision && $0.alias == use.alias
+              }) else { throw DeviceError.message("This screen changed. Reopen its connection settings.") }
+    }
+
+    private func refreshCustomConnections() {
+        refreshScreen()
+        customHTTPRendererKey = UUID().uuidString
+    }
+
     struct SetupRequirement {
         let name: String
-        let page: DeviceSettingsPage
+        enum Kind { case screens, publicData, home, television, calendar, custom }
+        let kind: Kind
+        var unsupportedAlias: String? = nil
+        var customAlias: String? = nil
     }
     var missingConnections: [SetupRequirement] {
         guard let screen else { return [] }
-        if manifestIssues[screen.id] != nil { return [.init(name: "Screen connection configuration", page: .screens)] }
+        if manifestIssues[screen.id] != nil { return [.init(name: "Screen connection configuration", kind: .screens)] }
         guard let manifest else { return [] }
         return manifest.connections.filter(\.required).compactMap { connection in
             if connection.publicHTTP != nil {
-                return publicDataAllowed(manifest) ? nil : .init(name: connection.alias, page: .publicData)
+                return publicDataAllowed(manifest) ? nil : .init(name: connection.alias, kind: .publicData)
+            }
+            if let declaration = connection.customHTTP {
+                return customHTTPVault.isApproved(owner: permissionOwner, screenID: screen.id, manifest: manifest, alias: connection.alias)
+                    ? nil : .init(name: declaration.label, kind: .custom, customAlias: connection.alias)
             }
             switch connection.alias {
             case "home":
                 let configured = HomeAssistantDeviceVault().isConfigured(owner: permissionOwner, dashboardID: manifest.dashboardId, revision: manifest.revision)
-                return configured ? nil : .init(name: "Home Assistant", page: .home)
+                return configured ? nil : .init(name: "Home Assistant", kind: .home)
             case "googleTV":
-                return DeviceConnectionReadiness.television(dashboardID: manifest.dashboardId) ? nil : .init(name: "Google TV", page: .television)
+                return DeviceConnectionReadiness.television(dashboardID: manifest.dashboardId) ? nil : .init(name: "Google TV", kind: .television)
             case "googleCalendar", "google-calendar":
-                return DeviceConnectionReadiness.calendar(dashboardID: manifest.dashboardId) ? nil : .init(name: "Google Calendar", page: .calendar)
+                return DeviceConnectionReadiness.calendar(dashboardID: manifest.dashboardId) ? nil : .init(name: "Google Calendar", kind: .calendar)
             case "appleMaps": return nil // Native built-in provider, no account setup.
-            default: return .init(name: "Unsupported connection: " + connection.alias, page: .screens)
+            default: return .init(name: connection.alias, kind: .screens, unsupportedAlias: connection.alias)
             }
         }
     }
     var canAllowCurrentPublicData: Bool {
-        !missingConnections.isEmpty && missingConnections.allSatisfy { $0.page == .publicData }
+        !missingConnections.isEmpty && missingConnections.allSatisfy { $0.kind == .publicData }
     }
     var currentPublicDataOrigins: [String] {
         Array(Set(manifest?.connections.compactMap { $0.publicHTTP?.origin } ?? [])).sorted()
@@ -1443,12 +1686,21 @@ import ScreenpunkLocalTransport
         guard canAllowCurrentPublicData, let manifest else { return }
         setPublicDataAllowed(true, for: manifest)
     }
+    var settingsScreenID: String?
+    var settingsCustomConnectionAlias: String?
     func openSettings() {
+        settingsScreenID = nil
+        settingsCustomConnectionAlias = nil
         settingsPage = .account
         settingsOpen = true
     }
     func openConnectionSettings() {
-        settingsPage = missingConnections.first?.page ?? .screens
+        openConnectionSettings(customAlias: nil)
+    }
+    func openConnectionSettings(customAlias: String?) {
+        settingsPage = .screens
+        settingsScreenID = screen?.id
+        settingsCustomConnectionAlias = customAlias
         settingsOpen = true
     }
     private func weatherOfferKey(_ screenID: String) -> String {
@@ -1512,6 +1764,7 @@ import ScreenpunkLocalTransport
     }
     func swipe(_ offset: Int) { guard !needsAgentSetup else { return }; do { try library?.select(offset: offset); refreshScreen() } catch { message = error.localizedDescription } }
     func newScreen() { guard !needsAgentSetup else { return }; do { try library?.newScreen(); refreshScreen(); settingsOpen = false } catch { message = error.localizedDescription } }
+    var rollbackScreenID: String? { library?.state.previous?.id }
     func rollback() { guard !needsAgentSetup else { return }; do { try library?.rollback(); refreshScreen(); settingsOpen = false } catch { message = error.localizedDescription } }
     private func syncInventory() async throws {
         guard cloudBindingMatches, let library, let token = cloud.session?.accessToken else { return }
@@ -1556,6 +1809,7 @@ import ScreenpunkLocalTransport
         guard foreground, !connectionActive, !accountOperationInProgress else { return }
         connectionActive = true
         refreshCatalogScope()
+        requestLinkedCatalogSync()
         if let token = cloud.session?.accessToken {
             Task { [weak self] in
                 guard let self, self.foreground, self.cloud.session?.accessToken == token else { return }
@@ -1601,7 +1855,10 @@ import ScreenpunkLocalTransport
             case .preferenceUpdated(let profileID):
                 if self.preferenceSyncBinding?.cloud.profileID == profileID, !initial { self.requestPreferenceSync() }
             case .catalogUpdated:
-                if !initial { self.requestCatalogPreviewSync(discoverCandidates: true) }
+                if !initial {
+                    self.requestCatalogPreviewSync(discoverCandidates: true)
+                    self.requestLinkedCatalogSync()
+                }
             case .screenDataConnected(let socketID):
                 guard initial else { return }
                 self.screenDataSocketID = socketID
@@ -1797,6 +2054,10 @@ import ScreenpunkLocalTransport
         opened.onCatalogRevisionCommitted = { [weak self, weak opened] in
             guard let self, let opened, self.library === opened else { return }
             self.requestCatalogSync()
+        }
+        opened.onCatalogLinksChanged = { [weak self, weak opened] in
+            guard let self, let opened, self.library === opened else { return }
+            self.requestLinkedCatalogSync()
         }
         refreshCatalogScope()
         CatalogPreviewCaptureRegistry.shared.onReady = { [weak self] revision in self?.captureExactCatalogPreview(revision: revision) }
@@ -2032,11 +2293,14 @@ import ScreenpunkLocalTransport
     /// A failed open after authentication must leave no previous account's inventory
     /// attached to the new session. Durable account directories remain untouched.
     private func detachAccountLibrary() {
+        linkedEditPrompt = nil
+        retryLinkedEdit = nil
         resetScreenDataWork(disconnectSocket: true)
         screenDataPermissions = []
         publicReads?.cancel(); publicReads = nil; publicReadSessionKey = ""
         if let previous = homeAssistant { Task { await previous.cancelPending() } }
-        homeAssistant = nil; manifest = nil; assets = nil; screen = nil; activeProfile = nil
+        homeAssistant = nil; customHTTP = nil; customHTTPRendererKey = ""; manifest = nil; assets = nil; screen = nil; activeProfile = nil
+        cloudSupportsCustomHTTP = false
         library = nil; cloudAuthoring = nil; localAuthoring = nil; localTransport = nil; cloudAuthoringV2 = nil; localAuthoringV2 = nil; localTransportV2 = nil; localTransportAuthoringProfileID = nil; cloudAgentReady = false; cloudSupportsV2 = false; pendingID = nil; pendingScreenID = nil; consumedID = nil
         cancelledLocally = []; inventorySignature = nil
         installedManifests = []; installedScreens = []; hiddenScreenIDs = []; manifestIssues = [:]; onboarding = nil
@@ -2055,7 +2319,7 @@ import ScreenpunkLocalTransport
             requestRefresh()
         }
         if let previous = homeAssistant { Task { await previous.cancelPending() } }
-        homeAssistant = nil; manifest = nil
+        homeAssistant = nil; customHTTP = nil; manifest = nil
         onboarding = library?.state.onboarding
         installedScreens = library?.state.screens ?? []
         hiddenScreenIDs = library?.state.hiddenScreenIDs ?? []
@@ -2064,8 +2328,13 @@ import ScreenpunkLocalTransport
             guard let file = saved.artifact.files.first(where: { $0.path == "manifest.json" }) else { return nil }
             do {
                 var parsed = try JSONDecoder().decode(DashboardManifest.self, from: Data(file.content.utf8))
-                try PackageValidator.validate(parsed)
+                try PackageValidator.validate(parsed, maximumExpandedBytes: saved.catalogAssetPaths == nil ? PackageLimits.expandedBytes : nil)
                 parsed.revision = saved.revision
+                let declaredDigest = parsed.files.first(where: { $0.path == "app.js" })?.sha256
+                let enriched = LegacyGeneratorConnection.enrich(parsed, appDigest: declaredDigest)
+                if enriched != parsed, let source = try? library?.store(for: saved).assets["app.js"] {
+                    return LegacyGeneratorConnection.enrich(parsed, appDigest: CatalogContract.digest(source.data))
+                }
                 return parsed
             } catch {
                 manifestIssues[saved.id] = "Connection settings could not load. Ask your agent to repair this screen’s manifest."
@@ -2081,11 +2350,21 @@ import ScreenpunkLocalTransport
             assets = try screen.flatMap { try library?.store(for: $0) }
             if let data = assets?.assets["manifest.json"]?.data,
                var parsed = try? JSONDecoder().decode(DashboardManifest.self, from: data),
-               (try? PackageValidator.validate(parsed)) != nil, let screen, let owner = activeProfile?.permissionOwner {
+               let screen, let owner = activeProfile?.permissionOwner,
+               (try? PackageValidator.validate(parsed, maximumExpandedBytes: screen.catalogAssetPaths == nil ? PackageLimits.expandedBytes : nil)) != nil {
                 // Local immutable revision is the authority for device-approved credentials.
-                parsed.revision = screen.revision; manifest = parsed
+                parsed.revision = screen.revision
+                let declaredDigest = parsed.files.first(where: { $0.path == "app.js" })?.sha256
+                if LegacyGeneratorConnection.enrich(parsed, appDigest: declaredDigest) != parsed,
+                   let source = assets?.assets["app.js"] {
+                    parsed = LegacyGeneratorConnection.enrich(parsed, appDigest: CatalogContract.digest(source.data))
+                }
+                manifest = parsed
                 let scope = HomeAssistantDeviceRuntime.Scope(owner: owner, revision: screen.revision, dashboardId: parsed.dashboardId)
                 homeAssistant = HomeAssistantDeviceRuntime(vault: HomeAssistantDeviceVault(), scope: { scope })
+                if parsed.connections.contains(where: { $0.customHTTP != nil }) {
+                    customHTTP = CustomHTTPDeviceRuntime(owner: owner, screenID: screen.id, manifest: parsed, vault: customHTTPVault)
+                }
             }
         } catch { assets = nil; message = "Could not load this screen. Use Settings to restore its previous version." }
     }
@@ -2412,20 +2691,347 @@ extension DeviceModel {
             throw DeviceError.message("Connect this device to your Screenpunk Pro account to add a screen.")
         }
         let generation = connectionGeneration
+        func current() throws {
+            try Task.checkCancellation()
+            guard canAddCatalogScreen, catalogBinding == binding, self.library === library,
+                  cloud.session?.accessToken == token, connectionGeneration == generation else {
+                throw DeviceError.message("The account or device connection changed. Reopen your catalog.")
+            }
+        }
+        let capability = try await cloud.catalogCapability(token: token)
+        try current()
+        let linked = capability?.linkedInstallVersion == "1"
+        _ = try await restoreCatalogScreen(item, library: library, binding: binding, token: token,
+                                           linkedInstall: linked, current: current)
+        refreshScreen()
+        if linked { requestLinkedCatalogSync() }
+    }
+
+    private func restoreCatalogScreen(_ item: CatalogScreen, library: ScreenLibrary, binding: ScreenLibrary.CatalogBinding,
+                                      token: String, linkedInstall: Bool = false,
+                                      expecting link: ScreenLibrary.LinkedCatalogInstall? = nil,
+                                      current: () throws -> Void) async throws -> Bool {
         let version = item.latest
-        guard [item.catalogScreenID, version.versionID].allSatisfy({ $0.range(of: "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$", options: .regularExpression) != nil }) else {
+        guard version.catalogScreenID == item.catalogScreenID,
+              [item.catalogScreenID, version.versionID, version.sourceRevisionID].allSatisfy(CloudClient.validCatalogIdentifier),
+              version.packageDigest.range(of: #"^[a-f0-9]{64}\z"#, options: .regularExpression) != nil,
+              version.sizeBytes > 0 else {
             throw DeviceError.message("The catalog returned an invalid screen.")
         }
         var path = URLComponents()
-        path.path = "/api/catalog/screens/\(item.catalogScreenID)/versions/\(version.versionID)/import-package"
+        path.path = "/api/catalog/screens/\(item.catalogScreenID)/versions/\(version.versionID)"
         path.queryItems = [.init(name: "sourceRevisionID", value: version.sourceRevisionID), .init(name: "packageDigest", value: version.packageDigest)]
-        let package = try await cloud.catalogPackage(path.string!, token: token, declaration: .init(byteLength: version.sizeBytes, digest: version.packageDigest))
-        try Task.checkCancellation()
-        guard canAddCatalogScreen, catalogBinding == binding, self.library === library, connectionGeneration == generation else {
-            throw DeviceError.message("The account or device connection changed. Reopen your catalog.")
+        let declaration = CatalogObjectDeclaration(byteLength: version.sizeBytes, digest: version.packageDigest)
+        if version.packageStorage == "assets" {
+            let manifest = try await cloud.catalogVersionManifest(path, token: token, declaration: declaration)
+            try current()
+            let directory = try library.openCatalogRestoreDirectory(binding: binding, version: version)
+            defer { library.closeCatalogRestoreDirectory(directory) }
+            try await cloud.catalogRestoreAssets(path, manifest: manifest, directory: directory, token: token, current: current)
+            try current()
+            if let link { return try library.updateLinkedCatalogAssets(item, manifest: manifest, staged: directory, expecting: link) }
+            try library.installCatalogAssets(item, manifest: manifest, staged: directory, linkedBinding: linkedInstall ? binding : nil)
+        } else if version.packageStorage == nil {
+            path.path += "/import-package"
+            let package = try await cloud.catalogPackage(path.string!, token: token, declaration: declaration)
+            try current()
+            if let link { return try library.updateLinkedCatalogScreen(item, package: package, expecting: link) }
+            try library.installCatalogScreen(item, package: package, linkedBinding: linkedInstall ? binding : nil)
+        } else {
+            throw DeviceError.message("Update the app to restore this catalog format.")
         }
-        try library.installCatalogScreen(item, package: package)
-        refreshScreen()
+        return true
+    }
+
+    private struct LinkedCatalogFlight: Equatable {
+        let generation: UUID
+        let library: ObjectIdentifier
+        let binding: ScreenLibrary.CatalogBinding
+        let token: String
+    }
+
+    private var linkedCatalogFlight: LinkedCatalogFlight? {
+        guard foreground, connectionActive, !accountOperationInProgress, !cloudAuthorizationRejected,
+              catalogBackupAccess.allowsBackups, let library, let binding = catalogBinding,
+              let token = cloud.session?.accessToken else { return nil }
+        return .init(generation: connectionGeneration, library: ObjectIdentifier(library), binding: binding, token: token)
+    }
+
+    func linkedCatalogDeviceCount(for screenID: String) -> Int? {
+        guard linkedCatalogFlight != nil else { return nil }
+        return linkedCatalogDeviceCounts[screenID]
+    }
+
+    func requestLinkedCatalogSync() {
+        guard linkedCatalogFlight != nil else { return }
+        linkedCatalogPump.request { [weak self] in
+            guard let self, let flight = self.linkedCatalogFlight else { return .idle }
+            return await self.syncLinkedCatalog(flight)
+        }
+    }
+
+    private func syncLinkedCatalog(_ flight: LinkedCatalogFlight) async -> CatalogWorkPump.Next {
+        guard let library, linkedCatalogFlight == flight else { return .idle }
+        func current() throws {
+            try Task.checkCancellation()
+            guard linkedCatalogFlight == flight, self.library === library else { throw CancellationError() }
+        }
+        let links = library.linkedCatalogScreens.filter { $0.binding == flight.binding }
+        let unlinks = library.pendingCatalogUnlinks.filter { $0.binding == flight.binding }
+        guard !links.isEmpty || !unlinks.isEmpty || library.hasDiscoverableCatalogProducerCopies(binding: flight.binding)
+                || library.pendingCatalogForks.contains(where: { $0.binding == flight.binding }) else {
+            linkedCatalogDeviceCounts = [:]
+            return .idle
+        }
+        do {
+            let capability = try await cloud.catalogCapability(token: flight.token)
+            try current()
+            guard capability?.linkedInstallVersion == "1", capability?.entitlement.backupEnabled == true else { return .idle }
+
+            for link in unlinks {
+                guard let copyID = link.copyID else { continue }
+                do { try await unlinkCatalogScreen(link, copyID: copyID, token: flight.token, current: current) }
+                catch {
+                    try current()
+                    if let failure = error as? CloudClient.CatalogHTTPError, failure.status == 401 { throw failure }
+                }
+            }
+            for link in links where !link.registered {
+                guard library.linkedCatalogScreen(id: link.screenID) == link else { continue }
+                do {
+                    let registration = try await cloud.registerCatalogLink(.init(catalogScreenID: link.catalogScreenID,
+                        versionID: link.versionID, sourceRevisionID: link.sourceRevisionID, packageDigest: link.packageDigest,
+                        libraryID: link.libraryID, localScreenID: link.localScreenID,
+                        localRevisionID: link.localRevision, commitCounter: link.commitCounter), token: flight.token)
+                    try current()
+                    try library.markLinkedCatalogRegistered(expecting: link, copyID: registration.copyID)
+                } catch {
+                    try current()
+                    if let failure = error as? CloudClient.CatalogHTTPError, failure.status == 401 { throw failure }
+                }
+            }
+
+            for link in library.linkedCatalogScreens where link.binding == flight.binding &&
+                link.registered && link.pendingRevision != nil && !link.conflict {
+                do { try await syncLinkedCatalogPublication(link, library: library, token: flight.token, current: current) }
+                catch {
+                    try current()
+                    if let failure = error as? CloudClient.CatalogHTTPError, failure.status == 401 { throw failure }
+                }
+            }
+
+            for fork in library.pendingCatalogForks where fork.binding == flight.binding && fork.blockedReason == nil {
+                do { try await syncCatalogFork(fork, library: library, token: flight.token, current: current) }
+                catch {
+                    try current()
+                    if let failure = error as? CloudClient.CatalogHTTPError, failure.status == 401 { throw failure }
+                }
+            }
+
+            var cursor: String?
+            var seen = Set<String>()
+            var counts: [String: Int] = [:]
+            var unconfirmedUnlinks = unlinks.filter { $0.copyID == nil }
+            var didUpdate = false
+            repeat {
+                let page = try await cloud.catalogLinkUpdates(cursor: cursor, token: flight.token)
+                try current()
+                for entry in page.subscriptions {
+                    if let tombstone = unconfirmedUnlinks.first(where: {
+                        $0.libraryID == entry.libraryID && $0.localScreenID == entry.localScreenID && $0.catalogScreenID == entry.catalogScreenID
+                    }) {
+                        do { try await unlinkCatalogScreen(tombstone, copyID: entry.copyID, token: flight.token, current: current) }
+                        catch {
+                            try current()
+                            if let failure = error as? CloudClient.CatalogHTTPError, failure.status == 401 { throw failure }
+                        }
+                        unconfirmedUnlinks.removeAll { $0.screenID == tombstone.screenID }
+                        continue
+                    }
+                    let existing = library.linkedCatalogScreens.first { $0.localScreenID == entry.localScreenID && $0.libraryID == entry.libraryID }
+                    let link = existing ?? (try? library.adoptCatalogProducerLink(catalogScreenID: entry.catalogScreenID,
+                        libraryID: entry.libraryID, localScreenID: entry.localScreenID, localRevisionID: entry.localRevisionID,
+                        commitCounter: entry.commitCounter, copyID: entry.copyID, versionID: entry.installedVersionID,
+                        sourceRevisionID: entry.installedSourceRevisionID, displayVersion: entry.installedDisplayVersion,
+                        packageDigest: entry.installedPackageDigest, binding: flight.binding))
+                    guard let link, link.binding == flight.binding, link.libraryID == entry.libraryID,
+                          link.catalogScreenID == entry.catalogScreenID, link.copyID == entry.copyID else { continue }
+                    counts[link.screenID] = entry.linkedDeviceCount
+                    let discarding = link.discardAfterRefresh == true
+                    guard entry.matches(link), (link.pendingRevision == nil && !link.conflict) || discarding,
+                          let version = entry.current, version.versionID != link.versionID || discarding,
+                          !requestPending, pendingID == nil, !busy, !routeChangeBlocked else { continue }
+                    let item = CatalogScreen(catalogScreenID: link.catalogScreenID, latest: version, history: [])
+                    do {
+                        let installed = try await restoreCatalogScreen(item, library: library, binding: flight.binding,
+                            token: flight.token, expecting: link, current: {
+                                try current()
+                                guard library.linkedCatalogScreen(id: link.screenID) == link,
+                                      !self.requestPending, self.pendingID == nil, !self.busy, !self.routeChangeBlocked else {
+                                    throw CancellationError()
+                                }
+                            })
+                        if installed {
+                            refreshScreen()
+                            didUpdate = true
+                        }
+                    } catch {
+                        try current()
+                        // This screen keeps its installed version if another operation changes it or its download fails.
+                        if let failure = error as? CloudClient.CatalogHTTPError, failure.status == 401 { throw failure }
+                    }
+                }
+                cursor = page.nextCursor
+                if let cursor, (!seen.insert(cursor).inserted || seen.count >= 32) {
+                    throw DeviceError.message("Cloud returned an invalid linked screen cursor.")
+                }
+            } while cursor != nil
+            for link in unconfirmedUnlinks {
+                try library.acknowledgeCatalogUnlink(link)
+            }
+            if linkedCatalogDeviceCounts != counts { linkedCatalogDeviceCounts = counts }
+            if didUpdate { return .ready }
+            return .retry(Date().addingTimeInterval(60))
+        } catch let error as CloudClient.CatalogHTTPError where error.status == 401 {
+            if linkedCatalogFlight == flight, !Task.isCancelled { rejectCloudAuthorization() }
+            return .idle
+        } catch {
+            guard linkedCatalogFlight == flight, !Task.isCancelled else { return .idle }
+            return .retry(Date().addingTimeInterval(60))
+        }
+    }
+
+    private func syncLinkedCatalogPublication(_ link: ScreenLibrary.LinkedCatalogInstall, library: ScreenLibrary, token: String,
+                                               current: () throws -> Void) async throws {
+        func checkPublication() throws {
+            try current()
+            guard library.linkedCatalogScreen(id: link.screenID) == link else { throw CancellationError() }
+        }
+        try checkPublication()
+        let exported = try await library.exportLinkedCatalogEdit(link)
+        try checkPublication()
+        let begin = try library.linkedCatalogBegin(link, declaration: exported.declaration)
+        let beginBytes = try CatalogContract.canonical(CatalogAssetBeginRequest(backup: begin, manifest: exported.manifest,
+            link: .init(catalogScreenID: link.catalogScreenID, baseVersionID: link.versionID)))
+
+        func applied(_ status: CatalogBackupStatus) throws -> Bool {
+            guard status.schemaVersion == 1, status.operationID == begin.operationID, status.catalogScreenID == link.catalogScreenID else {
+                throw DeviceError.message("Cloud returned a different shared publication.")
+            }
+            try CatalogContract.validateStatus(status)
+            switch status.state {
+            case "completed", "duplicate":
+                guard let versionID = status.versionID, CloudClient.validCatalogIdentifier(versionID),
+                      let displayVersion = status.displayVersion, displayVersion > link.displayVersion else {
+                    throw DeviceError.message("Cloud did not confirm the new shared version.")
+                }
+                try library.acknowledgeLinkedCatalogPublication(link, versionID: versionID, displayVersion: displayVersion,
+                                                               packageDigest: exported.declaration.digest)
+                refreshScreen()
+                return true
+            case "superseded", "deleted":
+                try library.recordLinkedCatalogConflict(link)
+                refreshScreen()
+                return true
+            case "failed":
+                if status.error?.code == "conflict" {
+                    try library.recordLinkedCatalogConflict(link)
+                    refreshScreen()
+                    return true
+                }
+                if status.error?.code == "retry_later", status.error?.restartOperation == true {
+                    try library.restartLinkedCatalogPublication(link)
+                    return true
+                }
+                throw CloudClient.CatalogHTTPError(status: status.error?.code == "unauthorized" ? 401 : 400,
+                                                  code: status.error?.code ?? "retry_later",
+                                                  retryAfterSeconds: status.error?.retryAfterSeconds)
+            default:
+                return false
+            }
+        }
+
+        do {
+            let initial = try await openCatalogAssetOperation(begin.operationID, bytes: beginBytes, token: token, current: checkPublication)
+            try checkPublication()
+            _ = try await uploadCatalogAssets(initial, exported: exported, operationID: begin.operationID, token: token,
+                                              current: checkPublication, applied: applied)
+        } catch let error as CloudClient.CatalogHTTPError where error.code == "conflict" {
+            try checkPublication()
+            try library.recordLinkedCatalogConflict(link)
+            refreshScreen()
+        }
+    }
+
+    private func syncCatalogFork(_ fork: ScreenLibrary.CatalogForkPublication, library: ScreenLibrary, token: String,
+                                 current: () throws -> Void) async throws {
+        func checkFork() throws {
+            try current()
+            guard library.pendingCatalogForks.contains(fork) else { throw CancellationError() }
+        }
+        let exported: CatalogPackageExporter.AssetExport
+        do {
+            exported = try await library.exportCatalogFork(fork)
+        } catch {
+            try checkFork()
+            try library.failCatalogFork(fork, reason: "Could not back up this copy. A saved file is missing, unsafe, or contains credential markers.")
+            objectWillChange.send()
+            return
+        }
+        try checkFork()
+        let begin = try library.catalogForkBegin(fork, declaration: exported.declaration)
+        let bytes = try CatalogContract.canonical(CatalogAssetBeginRequest(backup: begin, manifest: exported.manifest))
+        let initial = try await openCatalogAssetOperation(begin.operationID, bytes: bytes, token: token, current: checkFork)
+        try checkFork()
+        _ = try await uploadCatalogAssets(initial, exported: exported, operationID: begin.operationID, token: token, current: checkFork) { status in
+            guard status.schemaVersion == 1, status.operationID == begin.operationID,
+                  CloudClient.validCatalogIdentifier(status.catalogScreenID) else {
+                throw DeviceError.message("Cloud returned a different backup operation.")
+            }
+            try CatalogContract.validateStatus(status)
+            switch status.state {
+            case "completed", "duplicate":
+                guard let versionID = status.versionID, CloudClient.validCatalogIdentifier(versionID) else {
+                    throw DeviceError.message("Cloud did not confirm the backup of this copy.")
+                }
+                try library.acknowledgeCatalogFork(fork, catalogScreenID: status.catalogScreenID)
+                objectWillChange.send()
+                return true
+            case "superseded", "deleted":
+                try library.failCatalogFork(fork, reason: "Cloud could not finish this backup. Your copy remains installed.")
+                objectWillChange.send()
+                return true
+            case "failed":
+                if status.error?.code == "retry_later", status.error?.restartOperation == true {
+                    try library.restartCatalogFork(fork)
+                    return true
+                }
+                throw CloudClient.CatalogHTTPError(status: status.error?.code == "unauthorized" ? 401 : 400,
+                                                   code: status.error?.code ?? "retry_later",
+                                                   retryAfterSeconds: status.error?.retryAfterSeconds)
+            default:
+                return false
+            }
+        }
+    }
+
+    private func openCatalogAssetOperation(_ operationID: String, bytes: Data, token: String,
+                                           current: () throws -> Void) async throws -> CloudClient.CatalogAssetProgress {
+        do {
+            return try await cloud.catalogAssetProgress(CloudClient.assetOperationsPath + operationID, token: token)
+        } catch let error as CloudClient.CatalogHTTPError where error.status == 404 {
+            try current()
+            return try await cloud.catalogAssetProgress(CloudClient.assetBackupsPath, method: "POST", bytes: bytes, token: token)
+        }
+    }
+
+    private func unlinkCatalogScreen(_ link: ScreenLibrary.LinkedCatalogInstall, copyID: String, token: String,
+                                     current: () throws -> Void) async throws {
+        do {
+            try await cloud.deleteCatalogLink(catalogScreenID: link.catalogScreenID, copyID: copyID, token: token)
+        } catch let error as CloudClient.CatalogHTTPError where error.status == 404 {}
+        try current()
+        try library?.acknowledgeCatalogUnlink(link)
     }
 
     var catalogBackupsEnabled: Bool {
@@ -2479,6 +3085,9 @@ extension DeviceModel {
     }
     private func cancelCatalogWork() {
         catalogPump.cancel()
+        linkedCatalogPump.cancel()
+        linkedCatalogDeviceCounts = [:]
+        catalogPickerFollowsUpdates = false
         previewPump.cancel()
         catalogCatchUpNeeded = false
         catalogCapabilityRetry = nil
@@ -2503,6 +3112,7 @@ extension DeviceModel {
         // grant must perform capability catch-up even when no revision is queued.
         catalogCatchUpNeeded = true
         requestCatalogSync()
+        requestLinkedCatalogSync()
     }
     private func requestCatalogSync() {
         guard catalogFlight != nil else { return }
@@ -2567,7 +3177,7 @@ extension DeviceModel {
                 return .idle
             }
             if capability.entitlement.backupEnabled {
-                try library.activateCatalog(binding: flight.binding)
+                try library.activateCatalog(binding: flight.binding, assetBackups: capability.assetBackupVersion == CatalogContract.assetBackupVersion)
                 if capability.previewBackfillVersion == "1", capability.previewMediaTypes.contains("image/png") {
                     previewCaptureFlight = flight
                     previewByteLimit = min(CatalogContract.previewBytes, capability.entitlement.previewBytes)
@@ -2588,6 +3198,13 @@ extension DeviceModel {
             }
             activeIntent = intent
             if intent.retryAt > Date().timeIntervalSince1970 { return .retry(Date(timeIntervalSince1970: intent.retryAt)) }
+            if intent.packageStorage == "assets" {
+                if try await syncCatalogAssetBackup(intent: &intent, flight: flight, library: library, capability: capability, current: current, update: { activeIntent = $0 }) {
+                    refreshStatus()
+                    return .ready
+                }
+                return .idle
+            }
             // Recover a terminal acknowledgement even after entitlement is disabled.
             if intent.packageDigest != nil {
                 do {
@@ -2659,7 +3276,11 @@ extension DeviceModel {
                 }
                 do { try library.updateCatalogIntent(intent, binding: flight.binding) }
                 catch { catalogCapabilityRetry = Date(timeIntervalSince1970: intent.retryAt) }
-                catalogBackupStatus = intent.blockedReason ?? (detail?.status == 401 || detail?.status == 403 ? "Backups paused. Sign in to the original account to continue." : "Screen backups will retry when Cloud is available. Queued revisions stay on this device.")
+                if detail?.code == "quota_exceeded" {
+                    catalogBackupStatus = "Cloud backup storage is full. Free account storage to continue. Queued screens stay on this device."
+                } else {
+                    catalogBackupStatus = intent.blockedReason ?? "Screen backups will retry when Cloud is available. Queued revisions stay on this device."
+                }
                 return intent.blockedReason == nil ? .retry(Date(timeIntervalSince1970: intent.retryAt)) : .idle
             }
             catalogBackupStatus = "Cloud backups will retry. Your installed screens are saved on this device."
@@ -2670,6 +3291,112 @@ extension DeviceModel {
             return .retry(retry)
         }
     }
+    private func syncCatalogAssetBackup(
+        intent: inout ScreenLibrary.CatalogIntent,
+        flight: CatalogFlight,
+        library: ScreenLibrary,
+        capability: CatalogCapability,
+        current: () throws -> Void,
+        update: (ScreenLibrary.CatalogIntent) -> Void
+    ) async throws -> Bool {
+        guard capability.assetBackupVersion == CatalogContract.assetBackupVersion else {
+            catalogBackupStatus = "This server does not support the queued catalog backup format."
+            return false
+        }
+        var progress: CloudClient.CatalogAssetProgress?
+        if intent.beginDigest != nil {
+            do {
+                let known = try await cloud.catalogAssetProgress(CloudClient.assetOperationsPath + intent.operationID, token: flight.token)
+                try current()
+                if try handleCatalogStatus(known.status, intent: intent, binding: flight.binding, library: library) { return true }
+                progress = known
+            } catch let error as CloudClient.CatalogHTTPError where error.status == 404 { try current() }
+        }
+        guard capability.entitlement.backupEnabled else {
+            catalogBackupStatus = "Cloud backups are paused for this account. Queued screens stay saved on this device."
+            return false
+        }
+        if let reason = intent.blockedReason { catalogBackupStatus = reason; return false }
+        let exported: CatalogPackageExporter.AssetExport
+        do {
+            exported = try await library.exportCatalogAssetIntent(intent, binding: flight.binding)
+        } catch is CancellationError { throw CancellationError() }
+        catch {
+            try current()
+            intent.blockedReason = "Backups paused: a saved file is missing, unsafe, or contains credential markers. Review the screen before continuing."
+            try library.updateCatalogIntent(intent, binding: flight.binding)
+            update(intent)
+            catalogBackupStatus = intent.blockedReason
+            return false
+        }
+        try current()
+        let begin = try library.catalogBegin(intent, declaration: exported.declaration, binding: flight.binding)
+        let beginBytes = try CatalogContract.canonical(CatalogAssetBeginRequest(backup: begin, manifest: exported.manifest))
+        let beginDigest = CatalogContract.digest(beginBytes)
+        guard intent.beginDigest == nil || intent.beginDigest == beginDigest else {
+            throw DeviceError.message("The saved backup request changed.")
+        }
+        intent.packageDigest = exported.declaration.digest
+        intent.packageBytes = exported.declaration.byteLength
+        intent.beginDigest = beginDigest
+        try library.updateCatalogIntent(intent, binding: flight.binding)
+        update(intent)
+        if progress == nil {
+            progress = try await cloud.catalogAssetProgress(CloudClient.assetBackupsPath, method: "POST", bytes: beginBytes, token: flight.token)
+            try current()
+        }
+        guard let progress else { throw DeviceError.message("Cloud did not confirm this backup operation.") }
+        return try await uploadCatalogAssets(progress, exported: exported, operationID: intent.operationID, token: flight.token,
+            current: current, applied: { status in
+                try handleCatalogStatus(status, intent: intent, binding: flight.binding, library: library)
+            }, rememberUpload: { upload in
+                intent.uploadID = upload
+                try library.updateCatalogIntent(intent, binding: flight.binding)
+                update(intent)
+            })
+    }
+
+    private func uploadCatalogAssets(_ initial: CloudClient.CatalogAssetProgress, exported: CatalogPackageExporter.AssetExport,
+                                    operationID: String, token: String, current: () throws -> Void,
+                                    applied: (CatalogBackupStatus) throws -> Bool,
+                                    rememberUpload: (String) throws -> Void = { _ in }) async throws -> Bool {
+        var started = initial
+        if try applied(started.status) { return true }
+        guard let upload = started.status.uploadID, CloudClient.validCatalogIdentifier(upload) else {
+            throw DeviceError.message("Cloud did not confirm this upload.")
+        }
+        try rememberUpload(upload)
+        let uploadPath = CloudClient.assetUploadsPath + upload
+        let files = Dictionary(exported.manifest.files.map { ($0.digest, $0) }, uniquingKeysWith: { first, _ in first })
+        while let missing = started.missingFiles.first {
+            guard started.missingFiles.count <= files.count, let file = files[missing.digest] else {
+                throw DeviceError.message("Cloud requested an unknown backup asset.")
+            }
+            let chunk = try exported.chunk(file: file, offset: missing.offset)
+            let path = uploadPath + "/assets/" + missing.digest + "?offset=" + String(missing.offset)
+            started = try await cloud.catalogAssetProgress(path, method: "PUT", bytes: chunk, token: token, chunk: true)
+            try current()
+            if try applied(started.status) { return true }
+            guard started.status.uploadID == upload,
+                  started.missingFiles.allSatisfy({ $0.digest != missing.digest || $0.offset >= missing.offset + chunk.count }) else {
+                throw DeviceError.message("Cloud did not advance this backup asset.")
+            }
+        }
+        let complete = try CatalogContract.canonical(CatalogCompleteBackup(operationID: operationID))
+        let completed = try await cloud.catalogAssetProgress(uploadPath + "/complete", method: "POST", bytes: complete, token: token)
+        try current()
+        guard try applied(completed.status) else {
+            throw DeviceError.message("The backup has not completed yet.")
+        }
+        return true
+    }
+
+    private struct CatalogAssetBeginRequest: Encodable {
+        var backup: CatalogBeginBackup
+        var manifest: CatalogAssetManifest
+        var link: CatalogLinkedPublication? = nil
+    }
+
     private func handleCatalogStatus(_ status: CatalogBackupStatus, intent: ScreenLibrary.CatalogIntent, binding: ScreenLibrary.CatalogBinding, library: ScreenLibrary) throws -> Bool {
         guard status.schemaVersion == 1, status.operationID == intent.operationID else { throw DeviceError.message("Cloud returned a different backup operation.") }
         try CatalogContract.validateStatus(status)
@@ -2682,7 +3409,7 @@ extension DeviceModel {
         }
         guard ["completed", "duplicate", "superseded", "deleted"].contains(status.state) else { return false }
         if ["completed", "duplicate"].contains(status.state), let version = status.versionID, let queue = library.catalogQueue, let copy = queue.copies[intent.screenID], let digest = intent.packageDigest {
-            let candidate = CatalogPreviewCandidate(catalogScreenID: status.catalogScreenID, versionID: version, libraryID: queue.libraryID, localScreenID: copy.localScreenID, sourceRevisionID: intent.revision, packageDigest: digest, packageBytes: intent.packageBytes)
+            let candidate = CatalogPreviewCandidate(catalogScreenID: status.catalogScreenID, versionID: version, libraryID: queue.libraryID, localScreenID: copy.localScreenID, sourceRevisionID: intent.revision, packageDigest: digest, packageBytes: intent.packageBytes, packageStorage: intent.packageStorage)
             try? library.bindCatalogPreview(candidate, binding: binding)
             if previewCaptureFlight == catalogFlight {
                 rememberPreviewCandidate(candidate)
@@ -2696,6 +3423,7 @@ extension DeviceModel {
             try library.recordCatalogIdentity(status.catalogScreenID, screenID: intent.screenID)
         }
         try library.acknowledgeCatalogIntent(id: intent.id, binding: binding)
+        if ["completed", "duplicate"].contains(status.state) { requestLinkedCatalogSync() }
         return true
     }
 }
@@ -2774,19 +3502,28 @@ extension DeviceModel {
             }
             guard captureAllowed() else { return }
             do {
-                let package: CatalogPackage
-                if let recovered = try? library.catalogPackage(revision: revision, digest: digest, binding: flight.binding) { package = recovered.package }
-                else if let candidate {
-                    var path = URLComponents(); path.path = "/api/catalog/screens/\(candidate.catalogScreenID)/versions/\(candidate.versionID)/package"
-                    path.queryItems = [.init(name: "sourceRevisionID", value: revision), .init(name: "packageDigest", value: digest)]
-                    package = try await self.cloud.catalogPackage(path.string!, token: flight.token, declaration: .init(byteLength: candidate.packageBytes, digest: digest))
-                } else { return }
-                guard captureAllowed() else { return }
                 let snapshot: CatalogPreviewRenderer.Snapshot
-                do { snapshot = try await CatalogPreviewCaptureRegistry.shared.capture(context: context, revision: revision, package: package, packageDigest: digest, byteLimit: self.previewByteLimit, dimensionLimit: self.previewDimensionLimit) }
-                catch {
+                if let candidate, candidate.packageStorage == "assets" {
+                    var path = URLComponents()
+                    path.path = "/api/catalog/screens/\(candidate.catalogScreenID)/versions/\(candidate.versionID)"
+                    path.queryItems = [.init(name: "sourceRevisionID", value: revision), .init(name: "packageDigest", value: digest)]
+                    let manifest = try await self.cloud.catalogVersionManifest(path, token: flight.token, declaration: .init(byteLength: candidate.packageBytes, digest: digest))
                     guard captureAllowed() else { return }
-                    snapshot = try await CatalogPreviewRenderer().capture(package: package, packageDigest: digest, byteLimit: self.previewByteLimit, dimensionLimit: self.previewDimensionLimit)
+                    snapshot = try await CatalogPreviewCaptureRegistry.shared.capture(context: context, revision: revision, manifest: manifest, packageDigest: digest, byteLimit: self.previewByteLimit, dimensionLimit: self.previewDimensionLimit)
+                } else {
+                    let package: CatalogPackage
+                    if let recovered = try? library.catalogPackage(revision: revision, digest: digest, binding: flight.binding) { package = recovered.package }
+                    else if let candidate {
+                        var path = URLComponents(); path.path = "/api/catalog/screens/\(candidate.catalogScreenID)/versions/\(candidate.versionID)/package"
+                        path.queryItems = [.init(name: "sourceRevisionID", value: revision), .init(name: "packageDigest", value: digest)]
+                        package = try await self.cloud.catalogPackage(path.string!, token: flight.token, declaration: .init(byteLength: candidate.packageBytes, digest: digest))
+                    } else { return }
+                    guard captureAllowed() else { return }
+                    do { snapshot = try await CatalogPreviewCaptureRegistry.shared.capture(context: context, revision: revision, package: package, packageDigest: digest, byteLimit: self.previewByteLimit, dimensionLimit: self.previewDimensionLimit) }
+                    catch {
+                        guard captureAllowed() else { return }
+                        snapshot = try await CatalogPreviewRenderer().capture(package: package, packageDigest: digest, byteLimit: self.previewByteLimit, dimensionLimit: self.previewDimensionLimit)
+                    }
                 }
                 guard captureAllowed(), snapshot.packageDigest == digest else { return }
                 let d = snapshot.declaration

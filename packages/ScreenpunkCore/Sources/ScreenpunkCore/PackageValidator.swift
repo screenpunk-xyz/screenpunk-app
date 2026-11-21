@@ -50,9 +50,12 @@ public enum PackagePath {
 }
 
 public enum PackageValidator {
-    public static func validate(_ manifest: DashboardManifest) throws {
+    public static func validate(
+        _ manifest: DashboardManifest, maximumExpandedBytes: Int? = PackageLimits.expandedBytes
+    ) throws {
         var issues: [PackageIssue] = []
         do { _ = try PublicReadProvisioning(manifest: manifest) } catch { issues.append(.validationFailed) }
+        do { try CustomHTTPDeclaration.validateConnections(manifest.connections) } catch { issues.append(.validationFailed) }
         if manifest.schemaVersion != PackageLimits.schemaMajor {
             issues.append(.unsupportedVersion)
         }
@@ -88,9 +91,20 @@ public enum PackageValidator {
             } catch {
                 issues.append(.pathTraversal)
             }
-            expanded += file.bytes
+            guard file.bytes >= 0 else {
+                issues.append(.sizeLimit)
+                continue
+            }
+            if let maximumExpandedBytes {
+                let (total, overflow) = expanded.addingReportingOverflow(file.bytes)
+                if overflow || total > maximumExpandedBytes {
+                    issues.append(.sizeLimit)
+                } else {
+                    expanded = total
+                }
+            }
         }
-        if manifest.files.count > PackageLimits.maxFiles || expanded > PackageLimits.expandedBytes {
+        if manifest.files.count > PackageLimits.maxFiles {
             issues.append(.sizeLimit)
         }
         if let entry = try? PackagePath.normalize(manifest.entrypoint), !seen.contains(entry) {

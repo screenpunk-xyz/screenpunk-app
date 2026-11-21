@@ -196,8 +196,21 @@ import UniformTypeIdentifiers
         }
     }
     public func capture(context: CatalogPreviewContext, revision: String, package: CatalogPackage, packageDigest: String, byteLimit: Int, dimensionLimit: Int) async throws -> CatalogPreviewRenderer.Snapshot {
+        try await captureVerified(context: context, revision: revision, packageDigest: packageDigest, byteLimit: byteLimit, dimensionLimit: dimensionLimit) {
+            CatalogPreviewCapturePolicy.allows($0, scope: context, revision: revision, generation: $1, package: package, packageDigest: packageDigest)
+        }
+    }
+
+    public func capture(context: CatalogPreviewContext, revision: String, manifest: CatalogAssetManifest, packageDigest: String, byteLimit: Int, dimensionLimit: Int) async throws -> CatalogPreviewRenderer.Snapshot {
+        try await captureVerified(context: context, revision: revision, packageDigest: packageDigest, byteLimit: byteLimit, dimensionLimit: dimensionLimit) {
+            CatalogPreviewCapturePolicy.allows($0, scope: context, revision: revision, generation: $1, manifest: manifest, packageDigest: packageDigest)
+        }
+    }
+
+    private func captureVerified(context: CatalogPreviewContext, revision: String, packageDigest: String, byteLimit: Int, dimensionLimit: Int,
+                                 matches: (CatalogPreviewCaptureProof, UUID) -> Bool) async throws -> CatalogPreviewRenderer.Snapshot {
         guard let current = entry, current.active, current.context == context, current.revision == revision, let view = current.view, view.window != nil,
-              CatalogPreviewCapturePolicy.allows(proof(current), scope: context, revision: revision, generation: current.generation, package: package, packageDigest: packageDigest),
+              matches(proof(current), current.generation),
               try await Self.isReady(view) else { throw CaptureError.notReady }
         let generation = current.generation
         guard entry?.generation == generation, entry?.context == context, entry?.revision == revision, entry?.active == true, !Task.isCancelled else { throw CaptureError.changed }
@@ -208,7 +221,7 @@ import UniformTypeIdentifiers
         guard entry?.generation == generation, entry?.context == context, entry?.revision == revision, entry?.active == true, entry?.view === view, !Task.isCancelled,
               try await Self.isReady(view) else { throw CaptureError.changed }
         guard let final = entry, final.active, !Task.isCancelled,
-              CatalogPreviewCapturePolicy.allows(proof(final), scope: context, revision: revision, generation: generation, package: package, packageDigest: packageDigest) else { throw CaptureError.changed }
+              matches(proof(final), generation) else { throw CaptureError.changed }
         let encoded = try CatalogPreviewRenderer.encode(image: image, byteLimit: byteLimit, dimensionLimit: dimensionLimit)
         return .init(bytes: encoded.bytes, declaration: .init(byteLength: encoded.bytes.count, digest: CatalogContract.digest(encoded.bytes), mediaType: "image/png", width: encoded.width, height: encoded.height), packageDigest: packageDigest)
     }
