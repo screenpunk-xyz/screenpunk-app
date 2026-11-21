@@ -3,6 +3,7 @@ import Foundation
 /// Device-level, state-driven navigation. No service calls or credentials.
 public struct TemporaryActivationNavigation: Codable, Equatable, Sendable {
     public var alertId: String?
+    public var activationSource: String?
     public var expiresAt: Date?
     public var startedAt: Date?
     public var previousScreen: String?
@@ -11,23 +12,23 @@ public struct TemporaryActivationNavigation: Codable, Equatable, Sendable {
     public init() {}
 
     /// Returning a selection is a proposal: callers persist this value before selecting.
-    public mutating func receive(state: [String: Any], configuration: TemporaryActivationConfiguration, target: String, selected: String, now: Date) -> String? {
+    public mutating func receive(state: [String: Any], configuration: TemporaryActivationConfiguration, target: String, selected: String, now: Date, source: String? = nil) -> String? {
         guard (try? configuration.validate()) != nil,
               state["entity_id"] as? String == configuration.entityId,
               let attributes = state["attributes"] as? [String: Any],
               let id = attributes[configuration.idAttribute] as? String, !id.isEmpty, id.utf8.count <= 128 else { return nil }
         if state["state"] as? String == configuration.inactiveState {
-            guard id == alertId else { return nil }
+            guard id == alertId, source == activationSource else { return nil }
             return finish(selected: selected)
         }
         guard state["state"] as? String == configuration.activeState,
               let start = Self.date(attributes[configuration.startedAtAttribute]), let end = Self.date(attributes[configuration.expiresAtAttribute]),
               start <= now.addingTimeInterval(5), end > start, end.timeIntervalSince(start) <= Double(configuration.maxDurationSeconds),
               end > now else { return expire(selected: selected, now: now) }
-        if id == alertId { return nil } // Repeated starts never extend the deadline or undo a manual dismissal.
+        if id == alertId && source == activationSource { return nil } // Repeated starts never extend the deadline or undo a manual dismissal.
         if let startedAt, start <= startedAt { return nil }
         let prior = previousScreen ?? selected
-        alertId = id; startedAt = start; expiresAt = end; previousScreen = prior; targetScreen = target; dismissed = false
+        alertId = id; activationSource = source; startedAt = start; expiresAt = end; previousScreen = prior; targetScreen = target; dismissed = false
         return selected == target ? nil : target
     }
 
@@ -37,16 +38,16 @@ public struct TemporaryActivationNavigation: Codable, Equatable, Sendable {
                                   expiresAt end: Date, now: Date, maximumDuration: TimeInterval = 86400) -> String? {
         guard !id.isEmpty, id.utf8.count <= 128, !target.isEmpty, target.utf8.count <= 128,
               start <= now.addingTimeInterval(5), end > now, end > start,
-              end.timeIntervalSince(start) <= maximumDuration, id != alertId else { return nil }
+              end.timeIntervalSince(start) <= maximumDuration, id != alertId || activationSource != nil else { return nil }
         if let startedAt, start <= startedAt { return nil }
         let prior = previousScreen ?? selected
-        alertId = id; startedAt = start; expiresAt = end
+        alertId = id; activationSource = nil; startedAt = start; expiresAt = end
         previousScreen = prior; targetScreen = target; dismissed = false
         return selected == target ? nil : target
     }
 
     public mutating func end(id: String, selected: String) -> String? {
-        guard id == alertId else { return nil }
+        guard id == alertId, activationSource == nil else { return nil }
         return finish(selected: selected)
     }
 

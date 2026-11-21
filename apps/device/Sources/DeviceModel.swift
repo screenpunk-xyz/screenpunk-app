@@ -492,6 +492,13 @@ import ScreenpunkLocalTransport
     private let listenerStatusPump = PreferenceSyncPump()
     private var cloudSetupStatusTask: Task<Void, Never>?
     private var foreground = false
+    private struct TemporaryHomeAssistantTarget: Equatable {
+        var library: ObjectIdentifier
+        var screenID: String
+        var scope: HomeAssistantDeviceRuntime.Scope
+    }
+    private var temporaryHomeAssistantTargets: [String: TemporaryHomeAssistantTarget] = [:]
+    private var temporaryHomeAssistantTasks: [String: Task<Void, Never>] = [:]
     private var connectionActive = false
     @Published private var connectionGeneration = UUID()
     @Published private var screenDataRendererEpoch = UUID()
@@ -752,6 +759,79 @@ import ScreenpunkLocalTransport
         do { try library?.reconcileTemporary(); if screen?.id != library?.selected?.id { refreshScreen() } }
         catch { message = error.localizedDescription }
     }
+    /// Observe installed trigger declarations independently of the selected renderer.
+    private func updateTemporaryHomeAssistant() {
+        let next = currentTemporaryHomeAssistantTargets()
+        for (id, previous) in temporaryHomeAssistantTargets where next[id] != previous {
+            temporaryHomeAssistantTasks.removeValue(forKey: id)?.cancel()
+        }
+        temporaryHomeAssistantTargets = next
+        for (id, target) in next where temporaryHomeAssistantTasks[id] == nil {
+            startTemporaryHomeAssistant(target)
+        }
+    }
+
+    private func startTemporaryHomeAssistant(_ target: TemporaryHomeAssistantTarget) {
+        guard let configuration = target.scope.temporaryActivation else { return }
+        let scope = target.scope
+        let runtime = HomeAssistantDeviceRuntime(vault: HomeAssistantDeviceVault(), scope: { scope })
+        temporaryHomeAssistantTasks[target.screenID] = Task { [weak self] in
+            var retry = 2
+            while !Task.isCancelled {
+                guard self?.isCurrentTemporaryHomeAssistantTarget(target) == true else { break }
+                do {
+                    let bytes = try await runtime.readTemporaryActivationState(revision: scope.revision)
+                    try Task.checkCancellation()
+                    guard let self, self.isCurrentTemporaryHomeAssistantTarget(target), let library = self.library else { break }
+                    let priorSelection = library.state.selectedID
+                    let priorActivation = library.temporaryActivationID
+                    try library.receiveTemporaryHomeAssistantState(bytes, screenID: target.screenID, revision: scope.revision,
+                                                                   configuration: configuration)
+                    if priorSelection != library.state.selectedID || priorActivation != library.temporaryActivationID {
+                        self.refreshScreen()
+                    }
+                    retry = 2
+                } catch is CancellationError { break }
+                catch { retry = min(retry * 2, 30) }
+                do { try await Task.sleep(for: .seconds(retry)) } catch { break }
+            }
+            guard !Task.isCancelled, let self, self.temporaryHomeAssistantTargets[target.screenID] == target else { return }
+            self.temporaryHomeAssistantTasks.removeValue(forKey: target.screenID)
+        }
+    }
+
+    private func isCurrentTemporaryHomeAssistantTarget(_ target: TemporaryHomeAssistantTarget) -> Bool {
+        guard foreground, connectionActive, !accountOperationInProgress,
+              activeProfile?.permissionOwner == target.scope.owner, let library, ObjectIdentifier(library) == target.library,
+              temporaryHomeAssistantTargets[target.screenID] == target else { return false }
+        return true
+    }
+
+    private func currentTemporaryHomeAssistantTargets() -> [String: TemporaryHomeAssistantTarget] {
+        guard foreground, connectionActive, !accountOperationInProgress, let library,
+              let owner = activeProfile?.permissionOwner else { return [:] }
+        let byDashboard = Dictionary(grouping: installedManifests, by: \.dashboardId)
+        let vault = HomeAssistantDeviceVault()
+        var targets: [String: TemporaryHomeAssistantTarget] = [:]
+        for manifest in installedManifests {
+            guard byDashboard[manifest.dashboardId]?.count == 1, let configuration = manifest.deviceBehavior?.temporaryActivation,
+                  let target = library.state.screens.first(where: { $0.revision == manifest.revision }),
+                  manifest.connections.contains(where: { connection in
+                      connection.alias == "home" && (connection.operations?.contains(where: { $0.name == "getStates" && $0.kind == "http" }) ?? true)
+                  }),
+                  vault.isConfigured(owner: owner, dashboardID: manifest.dashboardId, revision: target.revision) else { continue }
+            targets[target.id] = .init(library: ObjectIdentifier(library), screenID: target.id,
+                scope: .init(owner: owner, revision: target.revision, dashboardId: manifest.dashboardId, temporaryActivation: configuration))
+        }
+        return targets
+    }
+
+    private func stopTemporaryHomeAssistant() {
+        for task in temporaryHomeAssistantTasks.values { task.cancel() }
+        temporaryHomeAssistantTasks.removeAll()
+        temporaryHomeAssistantTargets.removeAll()
+    }
+
     private var pollsLocalAuthoring: Bool {
         currentRequestRoute == .local && (pendingID != nil || routePreference == .local || !cloudAccountMatches)
     }
@@ -1774,7 +1854,10 @@ import ScreenpunkLocalTransport
             return
         }
         let generation = connectionGeneration
-        var body: [String: Any] = ["screens": library.state.screens.map { ["id": $0.id, "title": $0.artifact.title] }]
+        let includeCatalogIDs = await cloud.catalogInventorySupported(token: token)
+        guard cloudBindingMatches, self.library === library, connectionGeneration == generation,
+              cloud.session?.accessToken == token, screenDataSocketID == nil, !Task.isCancelled else { return }
+        var body: [String: Any] = ["screens": library.state.screens.map { library.catalogInventoryRow(for: $0, includeCatalogIDs: includeCatalogIDs) }]
         if let id = library.selected?.id { body["selectedID"] = id }
         let signature = String(data: try JSONSerialization.data(withJSONObject: body, options: .sortedKeys), encoding: .utf8)!
         guard signature != inventorySignature else { return }
@@ -1808,6 +1891,7 @@ import ScreenpunkLocalTransport
         guard accountDeletionIntent == nil else { return }
         guard foreground, !connectionActive, !accountOperationInProgress else { return }
         connectionActive = true
+        updateTemporaryHomeAssistant()
         refreshCatalogScope()
         requestLinkedCatalogSync()
         if let token = cloud.session?.accessToken {
@@ -1953,6 +2037,7 @@ import ScreenpunkLocalTransport
     private func stopConnection(releaseCloudSocket: Bool = true) {
         agentWorkingRequestID = nil
         connectionActive = false
+        stopTemporaryHomeAssistant()
         connectionGeneration = UUID()
         resetScreenDataWork(disconnectSocket: false)
         if releaseCloudSocket {
@@ -2312,6 +2397,7 @@ import ScreenpunkLocalTransport
     func refreshConnections() { refreshScreen() }
     private func refreshScreen() {
         defer {
+            updateTemporaryHomeAssistant()
             refreshPublicReads()
             refreshScreenDataPermissions()
             refreshScreenDataPrompts()
@@ -2484,11 +2570,13 @@ extension DeviceModel {
 
     private func sendScreenDataInventory(scope: ScreenDataCloudScope) async throws {
         guard screenDataCloudScope == scope, let library else { return }
+        let includeCatalogIDs = await cloud.catalogInventorySupported(token: scope.token)
+        guard screenDataCloudScope == scope, self.library === library, !Task.isCancelled else { return }
         let encoder = JSONEncoder()
         var screens: [[String: Any]] = []
         var generations: [String: String] = [:]
         for screen in library.state.screens {
-            var record: [String: Any] = ["id": screen.id, "title": screen.artifact.title]
+            var record = library.catalogInventoryRow(for: screen, includeCatalogIDs: includeCatalogIDs)
             if let installed = library.screenDataInstallation(screen.id) {
                 record["revision"] = screen.revision
                 record["screenDataGeneration"] = installed.generation
@@ -2995,6 +3083,7 @@ extension DeviceModel {
                     throw DeviceError.message("Cloud did not confirm the backup of this copy.")
                 }
                 try library.acknowledgeCatalogFork(fork, catalogScreenID: status.catalogScreenID)
+                requestScreenDataInventory()
                 objectWillChange.send()
                 return true
             case "superseded", "deleted":
@@ -3421,6 +3510,7 @@ extension DeviceModel {
         }
         if ["completed", "duplicate"].contains(status.state) {
             try library.recordCatalogIdentity(status.catalogScreenID, screenID: intent.screenID)
+            requestScreenDataInventory()
         }
         try library.acknowledgeCatalogIntent(id: intent.id, binding: binding)
         if ["completed", "duplicate"].contains(status.state) { requestLinkedCatalogSync() }

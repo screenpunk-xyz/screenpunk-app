@@ -1,6 +1,7 @@
 import Foundation
 import ScreenpunkApple
 import XCTest
+import ScreenpunkCore
 @testable import DeviceAuthoring
 
 final class ScreenLibraryVisibilityTests: XCTestCase {
@@ -160,6 +161,89 @@ final class ScreenLibraryVisibilityTests: XCTestCase {
         XCTAssertEqual(library.selected?.id, "nested")
         try library.reconcileTemporary(now: expiry)
         XCTAssertEqual(library.selected?.id, "fallback")
+    }
+
+    @MainActor func testRedAlertHomeAssistantLeaseRespectsRevisionAndRestoresVisibleScreen() throws {
+        let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
+        let library = try ScreenLibrary(accountID: "one", rootDirectory: root)
+        try install(["dashboard", "red-alert"], in: library)
+        try library.selectVisible("dashboard")
+        try library.setScreenShown(false, id: "red-alert")
+        let revision = try XCTUnwrap(library.state.screens.first { $0.id == "red-alert" }?.revision)
+        let configuration = TemporaryActivationConfiguration(entityId: "sensor.screenpunk_red_alert", activeState: "on",
+            inactiveState: "off", idAttribute: "alert_id", startedAtAttribute: "started_at", expiresAtAttribute: "expires_at",
+            maxDurationSeconds: 300)
+        let now = Date()
+        let timestamp = ISO8601DateFormatter()
+        func state(_ state: String, id: String, start: Date, entity: String = "sensor.screenpunk_red_alert") throws -> Data {
+            try JSONSerialization.data(withJSONObject: ["entity_id": entity, "state": state, "attributes": [
+                "alert_id": id, "started_at": timestamp.string(from: start),
+                "expires_at": timestamp.string(from: start.addingTimeInterval(60))
+            ]])
+        }
+        func receive(_ bytes: Data, revision: String = revision, at time: Date = now) throws {
+            try library.receiveTemporaryHomeAssistantState(bytes, screenID: "red-alert", revision: revision,
+                                                           configuration: configuration, now: time)
+        }
+
+        let active = try state("on", id: "activation-one", start: now)
+        try receive(active, revision: "retired-revision")
+        try receive(state("on", id: "activation-one", start: now, entity: "sensor.other"))
+        XCTAssertEqual(library.selected?.id, "dashboard")
+        try receive(active)
+        XCTAssertEqual(library.selected?.id, "red-alert")
+        XCTAssertEqual(library.temporaryActivationID, "activation-one")
+        XCTAssertFalse(library.rotationIDs.filter { library.isScreenShown($0) }.contains("red-alert"))
+        try receive(state("off", id: "old", start: now))
+        XCTAssertEqual(library.selected?.id, "red-alert")
+        try receive(state("off", id: "activation-one", start: now))
+        XCTAssertEqual(library.selected?.id, "dashboard")
+        XCTAssertNil(library.temporaryActivationID)
+
+        try receive(active, at: now.addingTimeInterval(1))
+        XCTAssertEqual(library.selected?.id, "dashboard")
+        let newer = now.addingTimeInterval(3)
+        let repeatActive = try state("on", id: "activation-two", start: newer)
+        try receive(repeatActive, at: newer)
+        XCTAssertEqual(library.selected?.id, "red-alert")
+        try library.selectVisible("dashboard")
+        try receive(repeatActive, at: newer.addingTimeInterval(1))
+        XCTAssertEqual(library.selected?.id, "dashboard")
+        XCTAssertNil(library.temporaryActivationID)
+    }
+
+    @MainActor func testTwoHomeAssistantTargetsWithSameAlertIDDoNotClearEachOther() throws {
+        let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
+        let library = try ScreenLibrary(accountID: "one", rootDirectory: root)
+        try install(["dashboard", "red-alert", "other-alert"], in: library)
+        try library.selectVisible("dashboard")
+        try library.setScreenShown(false, id: "red-alert")
+        try library.setScreenShown(false, id: "other-alert")
+        let now = Date()
+        let timestamp = ISO8601DateFormatter()
+        func receive(_ state: String, _ target: String, at date: Date) throws {
+            let entity = "sensor." + target.replacingOccurrences(of: "-", with: "_")
+            let configuration = TemporaryActivationConfiguration(entityId: entity, activeState: "on", inactiveState: "off",
+                idAttribute: "alert_id", startedAtAttribute: "started_at", expiresAtAttribute: "expires_at", maxDurationSeconds: 300)
+            let revision = try XCTUnwrap(library.state.screens.first { $0.id == target }?.revision)
+            let payload = try JSONSerialization.data(withJSONObject: ["entity_id": entity, "state": state, "attributes": [
+                "alert_id": "shared-id", "started_at": timestamp.string(from: date),
+                "expires_at": timestamp.string(from: date.addingTimeInterval(60))
+            ]])
+            try library.receiveTemporaryHomeAssistantState(payload, screenID: target, revision: revision, configuration: configuration, now: date)
+        }
+
+        try receive("on", "red-alert", at: now)
+        XCTAssertEqual(library.selected?.id, "red-alert")
+        try receive("on", "other-alert", at: now.addingTimeInterval(2))
+        XCTAssertEqual(library.selected?.id, "other-alert")
+        XCTAssertEqual(library.temporaryActivationID, "shared-id")
+        try receive("off", "red-alert", at: now.addingTimeInterval(3))
+        try library.endTemporary(id: "shared-id")
+        XCTAssertEqual(library.selected?.id, "other-alert")
+        try receive("off", "other-alert", at: now.addingTimeInterval(4))
+        XCTAssertEqual(library.selected?.id, "dashboard")
+        XCTAssertNil(library.temporaryActivationID)
     }
 
     @MainActor func testExplicitActivationFromAllHiddenRestoresNeutralAcrossRelaunch() throws {
