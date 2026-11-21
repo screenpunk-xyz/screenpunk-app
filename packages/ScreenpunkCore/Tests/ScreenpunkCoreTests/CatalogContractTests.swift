@@ -8,6 +8,24 @@ final class CatalogContractTests: XCTestCase {
         return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("contracts/fixtures/conformance-catalog-v1.json"))) as? [String: Any])
     }
     private func data(_ value: Any) throws -> Data { try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys,.withoutEscapingSlashes]) }
+    func testLinkedCatalogCapabilityIsOptionalAndPublicationBindsBase() throws {
+        let entitlement = CatalogEntitlement(backupEnabled: true, reason: "enabled", versionsPerScreen: 3,
+                                            screensPerAccount: 20, packageBytes: 10_485_760, previewBytes: 524_288,
+                                            previewDimension: 2048, accountBytes: 1_073_741_824, publicationOverlapBytes: 20_971_520)
+        var capability = CatalogCapability(entitlement: entitlement, previewMediaTypes: [])
+        let encoder = JSONEncoder()
+        let decoder = JSONDecoder()
+        XCTAssertNil(try decoder.decode(CatalogCapability.self, from: encoder.encode(capability)).linkedInstallVersion)
+        capability.linkedInstallVersion = "1"
+        XCTAssertEqual(try decoder.decode(CatalogCapability.self, from: encoder.encode(capability)), capability)
+
+        let publication = CatalogLinkedPublication(catalogScreenID: "catalog-screen", baseVersionID: "base-version")
+        let encoded = try encoder.encode(publication)
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: encoded) as? [String: String],
+                       ["catalogScreenID": "catalog-screen", "baseVersionID": "base-version"])
+        XCTAssertEqual(try decoder.decode(CatalogLinkedPublication.self, from: encoded), publication)
+    }
+
     func testAssetManifestAcceptsOpaqueMediaAndRequiresHTMLEntry() throws {
         let emptyDigest = CatalogContract.digest(Data())
         let bytes = Data([1, 2, 3])

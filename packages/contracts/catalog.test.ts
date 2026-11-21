@@ -60,3 +60,46 @@ describe('catalog native package v2',()=>{
   await expect(encodeCatalogPackage({...p,schemaVersion:1})).rejects.toThrow();
  });
 });
+
+
+describe('negotiated linked catalog protocol', () => {
+ const local={libraryID:'library',localScreenID:'local-screen',localRevisionID:'local-revision',commitCounter:1};
+ const entry={catalogScreenID:'123e4567-e89b-12d3-a456-426614174001',versionID:'123e4567-e89b-12d3-a456-426614174002',sourceRevisionID:'source-revision',packageDigest:'a'.repeat(64)};
+ const subscription={schemaVersion:1,catalogScreenID:entry.catalogScreenID,copyID:'123e4567-e89b-12d3-a456-426614174003',installedVersionID:entry.versionID,installedSourceRevisionID:entry.sourceRevisionID,
+  installedDisplayVersion:1,installedPackageDigest:entry.packageDigest,linkedDeviceCount:2,...local};
+
+ it('keeps the capability optional and rejects unknown link versions', () => {
+  const legacy={version:'1',feature:CATALOG_CAPABILITY,previewMediaTypes:[],entitlement:{
+   backupEnabled:true,reason:'enabled',versionsPerScreen:3,screensPerAccount:20,packageBytes:CATALOG_LIMITS.packageBytes,
+   previewBytes:CATALOG_LIMITS.previewBytes,previewDimension:2048,accountBytes:CATALOG_LIMITS.accountBytes,
+   publicationOverlapBytes:CATALOG_LIMITS.publicationOverlapBytes
+  }};
+  validateCatalogWire('Capability',legacy);
+  validateCatalogWire('Capability',{...legacy,linkedInstallVersion:'1'});
+  expect(()=>validateCatalogWire('Capability',{...legacy,linkedInstallVersion:'2'})).toThrow();
+ });
+
+ it('binds acknowledgments and shared writes to exact identities and excludes caller authority', () => {
+  const body={schemaVersion:1,...local,...entry};
+  validateCatalogWire('LinkedInstall',body);
+  for(const bad of [
+   {...body,commitCounter:0}, {...body,packageDigest:'wrong'}, {...body,accountID:'forged'},
+   {...body,versionID:entry.versionID+'\n'}, {...body,localRevisionID:undefined}
+  ]) expect(()=>validateCatalogWire('LinkedInstall',bad)).toThrow();
+
+  const link={catalogScreenID:entry.catalogScreenID,baseVersionID:entry.versionID};
+  validateCatalogWire('LinkedPublication',link);
+  expect(()=>validateCatalogWire('LinkedPublication',{...link,baseVersionID:null})).toThrow();
+ });
+
+ it('validates subscription pages and exact unlink receipts', () => {
+  const current={...fixture.missingVersion,catalogScreenID:entry.catalogScreenID};
+  validateCatalogWire('LinkedUpdates',{schemaVersion:1,subscriptions:[subscription,{...subscription,current}],nextCursor:'123e4567-e89b-12d3-a456-426614174004'});
+  expect(()=>validateCatalogWire('LinkedUpdates',{schemaVersion:1,subscriptions:[{...subscription,current:{}}]})).toThrow();
+  expect(()=>validateCatalogWire('LinkedSubscription',{...subscription,installedPackageDigest:undefined})).toThrow();
+  expect(()=>validateCatalogWire('LinkedSubscription',{...subscription,installedDisplayVersion:0})).toThrow();
+  expect(()=>validateCatalogWire('LinkedUpdates',{schemaVersion:1,subscriptions:[],nextCursor:'x'.repeat(257)})).toThrow();
+  validateCatalogWire('LinkedDeleteResult',{schemaVersion:1,catalogScreenID:entry.catalogScreenID,deleted:true});
+  expect(()=>validateCatalogWire('LinkedDeleteResult',{schemaVersion:1,catalogScreenID:entry.catalogScreenID,deleted:false})).toThrow();
+ });
+});

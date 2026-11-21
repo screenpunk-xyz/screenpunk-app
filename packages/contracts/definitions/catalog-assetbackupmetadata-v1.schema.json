@@ -581,6 +581,9 @@
         },
         "assetBackupVersion": {
           "const": "1"
+        },
+        "linkedInstallVersion": {
+          "const": "1"
         }
       },
       "required": [
@@ -1637,6 +1640,234 @@
         "sourceAppliedAt",
         "screenName",
         "package"
+      ],
+      "additionalProperties": false
+    },
+    "LinkedPublication": {
+      "type": "object",
+      "properties": {
+        "catalogScreenID": {
+          "type": "string",
+          "minLength": 36,
+          "maxLength": 36,
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "baseVersionID": {
+          "type": "string",
+          "minLength": 36,
+          "maxLength": 36,
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        }
+      },
+      "required": [
+        "catalogScreenID",
+        "baseVersionID"
+      ],
+      "additionalProperties": false
+    },
+    "LinkedInstall": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "catalogScreenID": {
+          "type": "string",
+          "minLength": 36,
+          "maxLength": 36,
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "versionID": {
+          "type": "string",
+          "minLength": 36,
+          "maxLength": 36,
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "sourceRevisionID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$(?![\\s\\S])"
+        },
+        "packageDigest": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64,
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "libraryID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$(?![\\s\\S])"
+        },
+        "localScreenID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$(?![\\s\\S])"
+        },
+        "localRevisionID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$(?![\\s\\S])"
+        },
+        "commitCounter": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "catalogScreenID",
+        "versionID",
+        "sourceRevisionID",
+        "packageDigest",
+        "libraryID",
+        "localScreenID",
+        "localRevisionID",
+        "commitCounter"
+      ],
+      "additionalProperties": false
+    },
+    "LinkedSubscription": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "catalogScreenID": {
+          "type": "string",
+          "minLength": 36,
+          "maxLength": 36,
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "copyID": {
+          "type": "string",
+          "minLength": 36,
+          "maxLength": 36,
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "libraryID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$(?![\\s\\S])"
+        },
+        "localScreenID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$(?![\\s\\S])"
+        },
+        "localRevisionID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$(?![\\s\\S])"
+        },
+        "commitCounter": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "installedVersionID": {
+          "type": "string",
+          "minLength": 36,
+          "maxLength": 36,
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "current": {
+          "$ref": "#/$defs/Version"
+        },
+        "linkedDeviceCount": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "installedSourceRevisionID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$(?![\\s\\S])"
+        },
+        "installedDisplayVersion": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "installedPackageDigest": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64,
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "catalogScreenID",
+        "copyID",
+        "libraryID",
+        "localScreenID",
+        "localRevisionID",
+        "commitCounter",
+        "installedVersionID",
+        "linkedDeviceCount",
+        "installedSourceRevisionID",
+        "installedDisplayVersion",
+        "installedPackageDigest"
+      ],
+      "additionalProperties": false
+    },
+    "LinkedUpdates": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "subscriptions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LinkedSubscription"
+          },
+          "maxItems": 20,
+          "minItems": 0
+        },
+        "nextCursor": {
+          "type": "string",
+          "minLength": 36,
+          "maxLength": 36,
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "subscriptions"
+      ],
+      "additionalProperties": false
+    },
+    "LinkedDeleteResult": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "catalogScreenID": {
+          "type": "string",
+          "minLength": 36,
+          "maxLength": 36,
+          "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+        },
+        "deleted": {
+          "const": true
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "catalogScreenID",
+        "deleted"
       ],
       "additionalProperties": false
     }

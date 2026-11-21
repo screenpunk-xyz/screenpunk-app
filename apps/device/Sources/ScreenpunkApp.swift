@@ -132,7 +132,7 @@ struct DeviceRootView: View {
                     Text("Keep holding while you talk. Lift your fingers to send.")
                     Text(speech.transcript).font(.title3).multilineTextAlignment(.center)
                 }.padding(40).frame(maxWidth: 650).allowsHitTesting(false)
-            } else if !showsCloudOnboarding && !model.settingsOpen && !model.accountOperationInProgress && (model.busy || model.requestPending || model.routeChangeBlocked || model.canRetry || model.canCancelRequest || speech.error != nil || model.presentedStatusMessage != nil) {
+            } else if !showsCloudOnboarding && !model.settingsOpen && !model.accountOperationInProgress && (model.busy || model.requestPending || model.routeChangeBlocked || model.canRetry || model.canCancelRequest || speech.error != nil || model.presentedStatusMessage != nil || model.linkedEditOptions(for: model.screen?.id)?.hasConflict == true) {
                 GeometryReader { geometry in
                     VStack {
                         Spacer()
@@ -182,6 +182,16 @@ struct DeviceRootView: View {
             Text("You can also manage Screenpunk’s Apple sign-in access in your Apple Account settings.")
         }
         .modifier(AccountCreationAlert(model: model, isHost: !model.settingsOpen))
+        .alert("Which iPads should this edit update?", isPresented: Binding(
+            get: { model.linkedEditPrompt != nil },
+            set: { if !$0 { model.cancelLinkedEditPrompt() } }
+        ), presenting: model.linkedEditPrompt) { prompt in
+            Button(prompt.options.updateAllTitle) { model.confirmLinkedEdit(prompt, scope: .all) }
+            Button("Only this iPad") { model.confirmLinkedEdit(prompt, scope: .thisDevice) }
+            Button("Cancel", role: .cancel) { model.cancelLinkedEditPrompt() }
+        } message: { prompt in
+            Text("Update “\(prompt.options.screenName)” across linked iPads, or save “\(prompt.options.forkName)” on just this iPad.")
+        }
         .sheet(item: $onboardingHelp, onDismiss: {
             onboardingHelpInFlight = false
             advanceOnboarding()
@@ -1203,6 +1213,8 @@ struct DeviceSettingsView: View {
     @State private var selection: DeviceSettingsPage? = .account
     @State private var showBilling = false
     @State private var screenToRemove: ScreenLibrary.Saved?
+    @State private var linkedConflictToDiscard: DeviceModel.LinkedEditOptions?
+    @State private var linkedConflictError: String?
     @State private var sheet: SettingsSheet?
     private enum SettingsSheet: String, Identifiable {
         case cloudListener, catalog, editKeyboardRequest
@@ -1254,6 +1266,7 @@ struct DeviceSettingsView: View {
         }
         .onChange(of: model.permissionOwner) { _ in
             path.removeAll(); renameTarget = nil; screenToRemove = nil
+            linkedConflictToDiscard = nil; linkedConflictError = nil
             customConnectionToRemove = nil; customConnectionError = nil
         }
         .alert("Rename screen", isPresented: Binding(get: { renameTarget != nil }, set: { if !$0 { renameTarget = nil } }), presenting: renameTarget) { target in
@@ -1280,6 +1293,15 @@ struct DeviceSettingsView: View {
             Button("Cancel", role: .cancel) {}
         } message: { _ in
             Text("Every screen using this connection will need to be set up and approved again.")
+        }
+        .alert("Discard this iPad’s edit?", isPresented: Binding(
+            get: { linkedConflictToDiscard != nil },
+            set: { if !$0 { linkedConflictToDiscard = nil } }
+        ), presenting: linkedConflictToDiscard) { options in
+            Button("Discard edit", role: .destructive) { resolveLinkedConflict(options, keep: false) }
+            Button("Cancel", role: .cancel) {}
+        } message: { _ in
+            Text("The local edit will be removed. This iPad will keep following the shared screen.")
         }
         .alert("Remove screen?", isPresented: Binding(get: { screenToRemove != nil }, set: { if !$0 { screenToRemove = nil } })) {
             Button("Cancel", role: .cancel) { screenToRemove = nil }
@@ -1570,6 +1592,7 @@ struct DeviceSettingsView: View {
     private func screenDetails(_ saved: ScreenLibrary.Saved, owner: String) -> some View {
         let manifest = model.installedManifests.first { $0.revision == saved.revision }
         let aliases = Set(manifest?.connections.map(\.alias) ?? [])
+        let linked = model.linkedEditOptions(for: saved.id)
         return Form {
             Section {
                 Button("Rename screen") {
@@ -1581,12 +1604,13 @@ struct DeviceSettingsView: View {
                 }
                 if saved.id == model.screen?.id {
                     Button("Edit this screen with keyboard") { sheet = .editKeyboardRequest }
-                        .disabled(model.routeChangeBlocked || model.accountOperationInProgress)
+                        .disabled(model.routeChangeBlocked || model.accountOperationInProgress || linked?.blocksEditing == true)
                 }
-                if model.rollbackScreenID == saved.id {
+                if model.rollbackScreenID == saved.id && linked == nil {
                     Button("Restore previous version", action: model.rollback)
                 }
             }
+            if let linked { linkedScreenSettings(linked) }
             if let manifest {
                 if manifest.connections.contains(where: { $0.publicHTTP != nil }) {
                     Section("Public Data") {
@@ -1625,6 +1649,36 @@ struct DeviceSettingsView: View {
         }
         .navigationTitle(saved.displayName)
         .disabled(model.accountOperationInProgress)
+    }
+
+    @ViewBuilder private func linkedScreenSettings(_ linked: DeviceModel.LinkedEditOptions) -> some View {
+        Section("Catalog Link") {
+            LabeledContent("Shared version", value: "Version \(linked.version)")
+            if let count = linked.deviceCount {
+                LabeledContent("Linked iPads", value: String(count))
+            }
+            if linked.hasConflict {
+                Text("Another iPad updated this screen. Your edit is saved on this iPad.")
+                Button("Keep edit on this iPad") { resolveLinkedConflict(linked, keep: true) }
+                    .disabled(model.routeChangeBlocked)
+                    .accessibilityHint("Saves the edit as " + linked.forkName)
+                Button("Discard this iPad’s edit", role: .destructive) { linkedConflictToDiscard = linked }
+                    .disabled(model.routeChangeBlocked)
+                if let linkedConflictError {
+                    Text(linkedConflictError).foregroundStyle(.secondary)
+                }
+            } else if linked.pendingPublication {
+                Text("Your changes are waiting to update the linked iPads.")
+            }
+        }
+    }
+
+    private func resolveLinkedConflict(_ options: DeviceModel.LinkedEditOptions, keep: Bool) {
+        do {
+            try model.resolveLinkedEditConflict(options, keepOnThisIPad: keep)
+            linkedConflictError = nil
+            if keep { path.removeAll() }
+        } catch { linkedConflictError = error.localizedDescription }
     }
 
     private func sharedLink(_ provider: DeviceSettingsPage) -> some View {
@@ -1854,7 +1908,9 @@ private struct CatalogScreenPicker: View {
                             .accessibilityLabel("Add \(screen.latest.screenName) to this device")
                         }
                     } footer: {
-                        Text("Adds the latest saved version. Connections may need to be set up on this device.")
+                        Text(model.catalogPickerFollowsUpdates
+                             ? "Screens added here follow shared updates. You can make a separate copy when you edit on this iPad."
+                             : "Adds the latest saved version. Connections may need to be set up on this device.")
                     }
                 }
             }
@@ -1883,6 +1939,7 @@ private struct KeyboardRequestEditor: View {
     @Environment(\.dismiss) private var dismiss
     @State private var text: String
     @State private var submitted = false
+    @State private var linkedEdit: ScreenLibrary.LinkedCatalogEditScope?
     @FocusState private var instructionsFocused: Bool
 
     init(model: DeviceModel, creatingNew: Bool) {
@@ -1893,6 +1950,7 @@ private struct KeyboardRequestEditor: View {
         _text = State(initialValue: model.keyboardDraft(owner: model.keyboardRequestScope, screenID: creatingNew ? nil : model.screen?.id))
     }
     var body: some View {
+        let options = model.linkedEditOptions(for: screenID)
         NavigationStack {
             Form {
                 Section(creatingNew ? "Describe a new screen" : "Describe your changes") {
@@ -1906,9 +1964,19 @@ private struct KeyboardRequestEditor: View {
                 if let message = model.presentedStatusMessage {
                     DismissibleMessage(message.text, onDismiss: { model.dismissStatusMessage(id: message.id) }).id(message.id)
                 }
-                Section {
-                    Text(creatingNew ? "Creates a separate screen. Your existing screens stay saved." : "Sends these changes for the selected screen through your configured agent.")
-                        .foregroundStyle(.secondary)
+                if let options {
+                    Section {
+                        Picker("Apply changes to", selection: $linkedEdit) {
+                            Text("Choose").tag(nil as ScreenLibrary.LinkedCatalogEditScope?)
+                            Text(options.updateAllTitle).tag(ScreenLibrary.LinkedCatalogEditScope?.some(.all))
+                            Text("Only this iPad").tag(ScreenLibrary.LinkedCatalogEditScope?.some(.thisDevice))
+                        }
+                        .accessibilityIdentifier("request.linkedEditScope")
+                    } footer: {
+                        if linkedEdit == .thisDevice {
+                            Text("This iPad will use “\(options.forkName)”. Other iPads keep the linked screen.")
+                        }
+                    }
                 }
             }
             .navigationTitle(creatingNew ? "New screen" : "Edit screen")
@@ -1916,11 +1984,13 @@ private struct KeyboardRequestEditor: View {
                 ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Send") {
-                        if model.submitKeyboardRequest(text, owner: owner, screenID: screenID, revision: revision, creatingNew: creatingNew) {
+                        if model.submitKeyboardRequest(text, owner: owner, screenID: screenID, revision: revision,
+                                                       creatingNew: creatingNew, linkedEdit: linkedEdit) {
                             submitted = true; dismiss()
                         }
                     }
-                    .disabled(submitted || KeyboardRequestText.normalized(text) == nil || model.busy || model.requestPending || model.routeChangeBlocked || model.accountOperationInProgress || model.keyboardRequestScope != owner)
+                    .disabled(submitted || KeyboardRequestText.normalized(text) == nil || model.busy || model.requestPending || model.routeChangeBlocked || model.accountOperationInProgress ||
+                              model.keyboardRequestScope != owner || options?.blocksEditing == true || (options != nil && linkedEdit == nil))
                     .accessibilityIdentifier("request.send")
                 }
             }
@@ -1955,6 +2025,10 @@ private struct RequestStatusPill: View {
                 if model.canCancelRequest { Button("Cancel saved request", role: .cancel, action: model.cancelRequest).buttonStyle(.bordered) }
             }
             if let text = speechError?.text ?? message?.text { statusText(text) }
+            if model.linkedEditOptions(for: model.screen?.id)?.hasConflict == true {
+                Button("Review shared edit", action: model.openConnectionSettings)
+                    .buttonStyle(.borderedProminent)
+            }
             if dismissible, let id = presentationID {
                 Button { dismissMessage(id: id) } label: {
                     Label("Dismiss", systemImage: "xmark").frame(minWidth: 80, minHeight: 44)

@@ -39,9 +39,10 @@ import ScreenpunkCore
         var packagePaths: [String] { catalogAssetPaths ?? artifact.files.map(\.path) }
         var hasNativeAssets: Bool { catalogAssetPaths != nil || catalogPackageSchema == 2 }
     }
-    struct State: Codable { var screens: [Saved] = []; var selectedID: String?; var previous: Saved?; var lastRequest: String?; var pendingID: String?; var pendingScreenID: String?; var consumedID: String?; var cancelledRequests: [String]?; var cancelIntents: [String]?; var lastInstruction: String?; var keyboardDrafts: [String: String]?; var submissionKey: String?; var submissionText: String?; var submissionScreen: ScreenArtifact?; var requestDeadline: Double?; var authoring: AuthoringStoreState?; var linkedProfile: LocalProfileDescriptor?; var localRequestIDs: Set<String>?; var bundledScreenSeeds: Set<String>?; var catalog: CatalogQueue?; var hiddenScreenIDs: Set<String>?; var onboarding: Onboarding?; var publicDataRevocations: Set<String>?; var screenDataGenerations: [String: String]?; var catalogScreenIDs: [String: Set<String>]? }
+    struct State: Codable { var screens: [Saved] = []; var selectedID: String?; var previous: Saved?; var lastRequest: String?; var pendingID: String?; var pendingScreenID: String?; var consumedID: String?; var cancelledRequests: [String]?; var cancelIntents: [String]?; var lastInstruction: String?; var keyboardDrafts: [String: String]?; var submissionKey: String?; var submissionText: String?; var submissionScreen: ScreenArtifact?; var requestDeadline: Double?; var authoring: AuthoringStoreState?; var linkedProfile: LocalProfileDescriptor?; var localRequestIDs: Set<String>?; var bundledScreenSeeds: Set<String>?; var catalog: CatalogQueue?; var hiddenScreenIDs: Set<String>?; var onboarding: Onboarding?; var publicDataRevocations: Set<String>?; var screenDataGenerations: [String: String]?; var catalogScreenIDs: [String: Set<String>]?; var catalogLinks: [String: LinkedCatalogInstall]?; var catalogUnlinks: [LinkedCatalogInstall]?; var catalogLinkLibraryID: String?; var linkedEdits: [String: LinkedCatalogEdit]?; var linkedRollback: [String: Saved]?; var catalogForks: [String: CatalogForkPublication]?; var linkedConflictPins: [String: [String]]? }
     private(set) var state = State()
     var onCatalogRevisionCommitted: (() -> Void)?
+    var onCatalogLinksChanged: (() -> Void)?
     private let root: URL
     let screenDataArchive: DeviceScreenDataArchive
     private let screenDataLocalDeviceIds: Set<String>
@@ -331,9 +332,298 @@ import ScreenpunkCore
             pruneUnusedRevisions()
         } catch { if !committing { try? FileManager.default.removeItem(at: directory) }; throw error }
     }
+    enum LinkedCatalogEditScope: String, Codable { case all, thisDevice }
+
+    struct LinkedCatalogInstall: Codable, Equatable {
+        let screenID: String
+        let catalogScreenID: String
+        let localScreenID: String
+        let libraryID: String
+        let binding: CatalogBinding
+        var versionID: String
+        var displayVersion: Int
+        var sourceRevisionID: String
+        var packageDigest: String
+        var localRevision: String
+        var commitCounter = 1
+        var copyID: String?
+        var registered: Bool { copyID != nil }
+        var pendingRevision: String?
+        var operationID: String?
+        var pendingAppliedAt: Int64?
+        var conflict = false
+        var discardAfterRefresh: Bool?
+
+        init(screenID: String, version: CatalogVersion, libraryID: String, binding: CatalogBinding, localRevision: String,
+             localScreenID: String? = nil) {
+            self.init(screenID: screenID, catalogScreenID: version.catalogScreenID, libraryID: libraryID,
+                binding: binding, localRevision: localRevision, localScreenID: localScreenID ?? screenID,
+                versionID: version.versionID, displayVersion: version.displayVersion,
+                sourceRevisionID: version.sourceRevisionID, packageDigest: version.packageDigest)
+        }
+
+        init(screenID: String, catalogScreenID: String, libraryID: String, binding: CatalogBinding,
+             localRevision: String, localScreenID: String, versionID: String, displayVersion: Int,
+             sourceRevisionID: String, packageDigest: String) {
+            self.screenID = screenID; self.catalogScreenID = catalogScreenID
+            self.localScreenID = localScreenID; self.libraryID = libraryID; self.binding = binding
+            self.versionID = versionID; self.displayVersion = displayVersion; self.sourceRevisionID = sourceRevisionID
+            self.packageDigest = packageDigest; self.localRevision = localRevision
+        }
+    }
+
+    struct CatalogForkPublication: Codable, Equatable {
+        let saved: Saved
+        let libraryID: String
+        let binding: CatalogBinding
+        let appliedAt: Int64
+        var operationID = UUID().uuidString
+        var blockedReason: String?
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.saved.id == rhs.saved.id && lhs.saved.revision == rhs.saved.revision &&
+                lhs.binding == rhs.binding && lhs.operationID == rhs.operationID && lhs.blockedReason == rhs.blockedReason
+        }
+    }
+
+    var pendingCatalogForks: [CatalogForkPublication] {
+        (state.catalogForks ?? [:]).values.sorted { $0.appliedAt < $1.appliedAt }
+    }
+
+    func exportCatalogFork(_ fork: CatalogForkPublication) async throws -> CatalogPackageExporter.AssetExport {
+        guard state.catalogForks?[fork.saved.id] == fork, fork.blockedReason == nil else {
+            throw DeviceError.message("This catalog copy changed before it could be backed up.")
+        }
+        return try await exportLinkedAssets(fork.saved)
+    }
+
+    func catalogForkBegin(_ fork: CatalogForkPublication, declaration: CatalogObjectDeclaration) throws -> CatalogBeginBackup {
+        guard state.catalogForks?[fork.saved.id] == fork, fork.blockedReason == nil else {
+            throw DeviceError.message("This catalog copy changed before it could be backed up.")
+        }
+        let begin = CatalogBeginBackup(operationID: fork.operationID, libraryID: fork.libraryID, localScreenID: fork.saved.id,
+            sourceRevisionID: fork.saved.revision, parentRevisionIDs: [], predecessorRevisionID: nil, commitCounter: 1,
+            origin: "seed", sourceAppliedAt: CatalogContract.timestamp(Date(timeIntervalSince1970: Double(fork.appliedAt) / 1000)),
+            screenName: fork.saved.artifact.title, package: declaration)
+        try CatalogContract.validateBegin(begin, assetManifest: true)
+        return begin
+    }
+
+    func acknowledgeCatalogFork(_ fork: CatalogForkPublication, catalogScreenID: String) throws {
+        guard state.catalogForks?[fork.saved.id] == fork else { return }
+        var next = state
+        next.catalogForks?.removeValue(forKey: fork.saved.id)
+        if next.screens.contains(where: { $0.id == fork.saved.id }) {
+            if next.catalogScreenIDs == nil { next.catalogScreenIDs = [:] }
+            next.catalogScreenIDs?[fork.saved.id, default: []].insert(catalogScreenID)
+            // If ordinary backups are enabled, extend the explicit fork's actual copy
+            // sequence rather than replay its seed through the normal backup path.
+            if next.catalog == nil {
+                next.catalog = CatalogQueue(binding: fork.binding, libraryID: fork.libraryID, captureAllowed: false)
+                next.catalog?.knownSavedRevisions = []
+            }
+            if next.catalog?.binding == fork.binding, next.catalog?.libraryID == fork.libraryID {
+                var copy = CatalogCopy()
+                copy.localScreenID = fork.saved.id; copy.counter = 1; copy.lastQueuedCounter = 1
+                copy.head = fork.saved.revision; copy.acknowledgedCounter = 1; copy.acknowledgedRevision = fork.saved.revision
+                next.catalog?.copies[fork.saved.id] = copy
+                next.catalog?.knownSavedRevisions?.insert(fork.saved.revision)
+            }
+        }
+        try commit(next, captureCatalog: false)
+        pruneUnusedRevisions()
+    }
+
+    func failCatalogFork(_ fork: CatalogForkPublication, reason: String) throws {
+        guard state.catalogForks?[fork.saved.id] == fork else { return }
+        var next = state
+        next.catalogForks?[fork.saved.id]?.blockedReason = reason
+        try commit(next, captureCatalog: false)
+    }
+
+    func restartCatalogFork(_ fork: CatalogForkPublication) throws {
+        guard state.catalogForks?[fork.saved.id] == fork else { return }
+        var next = state
+        next.catalogForks?[fork.saved.id]?.operationID = UUID().uuidString
+        next.catalogForks?[fork.saved.id]?.blockedReason = nil
+        try commit(next, captureCatalog: false)
+    }
+
+    struct LinkedCatalogEdit: Codable, Equatable {
+        var scope: LinkedCatalogEditScope
+        var base: LinkedCatalogInstall
+        var forkName: String?
+    }
+
+    var linkedCatalogScreens: [LinkedCatalogInstall] { state.screens.compactMap { state.catalogLinks?[$0.id] } }
+    var pendingCatalogUnlinks: [LinkedCatalogInstall] { state.catalogUnlinks ?? [] }
+
+    func hasDiscoverableCatalogProducerCopies(binding: CatalogBinding) -> Bool {
+        guard state.catalog?.binding == binding else { return false }
+        return state.screens.contains { saved in
+            state.catalogLinks?[saved.id] == nil && state.catalog?.copies[saved.id]?.acknowledgedRevision != nil
+        }
+    }
+
+    func adoptCatalogProducerLink(catalogScreenID: String, libraryID: String, localScreenID: String, localRevisionID: String,
+                                  commitCounter: Int, copyID: String, versionID: String, sourceRevisionID: String, displayVersion: Int,
+                                  packageDigest: String, binding: CatalogBinding) throws -> LinkedCatalogInstall? {
+        guard state.pendingID == nil, state.submissionKey == nil,
+              let queue = state.catalog, queue.binding == binding, queue.libraryID == libraryID,
+              let copy = queue.copies.first(where: { $0.value.localScreenID == localScreenID }),
+              copy.value.acknowledgedRevision == localRevisionID, copy.value.acknowledgedCounter == commitCounter,
+              state.catalogScreenIDs?[copy.key]?.contains(catalogScreenID) == true,
+              state.catalogLinks?[copy.key] == nil,
+              let saved = state.screens.first(where: { $0.id == copy.key }) else { return nil }
+        var link = LinkedCatalogInstall(screenID: copy.key, catalogScreenID: catalogScreenID,
+            libraryID: libraryID, binding: binding, localRevision: localRevisionID, localScreenID: localScreenID,
+            versionID: versionID, displayVersion: displayVersion, sourceRevisionID: sourceRevisionID, packageDigest: packageDigest)
+        link.copyID = copyID
+        link.commitCounter = commitCounter
+        var next = state
+        if saved.revision != localRevisionID {
+            // This edit predates discovery of the shared subscription. Never use
+            // the ordinary backup queue to publish it to the newly shared screen.
+            link.pendingRevision = saved.revision
+            link.conflict = true
+            let pending = queue.entries.filter { $0.screenID == saved.id }.map(\.revision)
+            if !pending.isEmpty {
+                if next.linkedConflictPins == nil { next.linkedConflictPins = [:] }
+                next.linkedConflictPins?[saved.id] = pending
+            }
+            if let previous = state.previous, previous.id == saved.id, previous.revision == localRevisionID {
+                if next.linkedRollback == nil { next.linkedRollback = [:] }
+                next.linkedRollback?[saved.id] = previous
+            }
+        }
+        next.catalog?.entries.removeAll { $0.screenID == saved.id }
+        if next.catalogLinks == nil { next.catalogLinks = [:] }
+        next.catalogLinks?[copy.key] = link
+        try commit(next, captureCatalog: false)
+        return link
+    }
+
+    func linkedCatalogScreen(id: String) -> LinkedCatalogInstall? { state.catalogLinks?[id] }
+
+    func markLinkedCatalogRegistered(expecting link: LinkedCatalogInstall, copyID: String) throws {
+        guard var current = state.catalogLinks?[link.screenID], current == link, !current.registered else { return }
+        current.copyID = copyID
+        var next = state
+        next.catalogLinks?[link.screenID] = current
+        try commit(next, captureCatalog: false)
+    }
+
+    func exportLinkedCatalogEdit(_ link: LinkedCatalogInstall) async throws -> CatalogPackageExporter.AssetExport {
+        guard state.catalogLinks?[link.screenID] == link, let revision = link.pendingRevision, !link.conflict,
+              let saved = state.screens.first(where: { $0.id == link.screenID && $0.revision == revision }) else {
+            throw DeviceError.message("This linked edit changed before it could be published.")
+        }
+        return try await exportLinkedAssets(saved)
+    }
+
+    private func exportLinkedAssets(_ saved: Saved) async throws -> CatalogPackageExporter.AssetExport {
+        let directory = root.appendingPathComponent(saved.revision, isDirectory: true)
+        let title = saved.artifact.title, entry = saved.artifact.entry, paths = saved.packagePaths, schemaVersion = saved.catalogPackageSchema ?? 1
+        let work = Task.detached(priority: .utility) {
+            try CatalogPackageExporter.exportAssets(directory: directory, title: title, entry: entry, paths: paths, schemaVersion: schemaVersion)
+        }
+        return try await withTaskCancellationHandler(operation: { try await work.value }, onCancel: { work.cancel() })
+    }
+
+    func linkedCatalogBegin(_ link: LinkedCatalogInstall, declaration: CatalogObjectDeclaration) throws -> CatalogBeginBackup {
+        guard state.catalogLinks?[link.screenID] == link, link.registered, !link.conflict,
+              let revision = link.pendingRevision, let operation = link.operationID, let applied = link.pendingAppliedAt,
+              let saved = state.screens.first(where: { $0.id == link.screenID && $0.revision == revision }),
+              link.commitCounter < 9_007_199_254_740_991 else { throw DeviceError.message("This linked edit changed before it could be published.") }
+        let begin = CatalogBeginBackup(operationID: operation, libraryID: link.libraryID, localScreenID: link.localScreenID,
+            sourceRevisionID: revision, parentRevisionIDs: [link.localRevision], predecessorRevisionID: link.localRevision,
+            commitCounter: link.commitCounter + 1, origin: "applied",
+            sourceAppliedAt: CatalogContract.timestamp(Date(timeIntervalSince1970: Double(applied) / 1000)),
+            screenName: saved.artifact.title, package: declaration)
+        try CatalogContract.validateBegin(begin, assetManifest: true)
+        return begin
+    }
+
+    func acknowledgeLinkedCatalogPublication(_ link: LinkedCatalogInstall, versionID: String, displayVersion: Int, packageDigest: String) throws {
+        guard var current = state.catalogLinks?[link.screenID], current == link, let revision = link.pendingRevision,
+              displayVersion > current.displayVersion, current.commitCounter < 9_007_199_254_740_991 else { return }
+        current.versionID = versionID; current.displayVersion = displayVersion; current.sourceRevisionID = revision
+        current.localRevision = revision; current.packageDigest = packageDigest; current.commitCounter += 1
+        current.pendingRevision = nil; current.operationID = nil; current.pendingAppliedAt = nil; current.conflict = false
+        var next = state
+        next.catalogLinks?[link.screenID] = current
+        next.linkedRollback?.removeValue(forKey: link.screenID)
+        if next.previous?.id == link.screenID { next.previous = nil }
+        try commit(next, captureCatalog: false)
+        pruneUnusedRevisions()
+    }
+
+    func recordLinkedCatalogConflict(_ link: LinkedCatalogInstall) throws {
+        guard var current = state.catalogLinks?[link.screenID], current == link, current.pendingRevision != nil else { return }
+        current.conflict = true
+        var next = state
+        next.catalogLinks?[link.screenID] = current
+        try commit(next, captureCatalog: false)
+    }
+
+    func restartLinkedCatalogPublication(_ link: LinkedCatalogInstall) throws {
+        guard var current = state.catalogLinks?[link.screenID], current == link, current.pendingRevision != nil, !current.conflict else { return }
+        current.operationID = UUID().uuidString
+        var next = state
+        next.catalogLinks?[link.screenID] = current
+        try commit(next, captureCatalog: false)
+    }
+
+    func acknowledgeCatalogUnlink(_ link: LinkedCatalogInstall) throws {
+        var next = state
+        next.catalogUnlinks?.removeAll { $0.screenID == link.screenID && $0.binding == link.binding && $0.catalogScreenID == link.catalogScreenID }
+        try commit(next, captureCatalog: false)
+    }
+
+    private func detachCatalogLink(_ id: String, in next: inout State) {
+        guard let link = next.catalogLinks?.removeValue(forKey: id) else { return }
+        // Registration may have completed before its response reached this device.
+        if !(next.catalogUnlinks ?? []).contains(link) { next.catalogUnlinks = (next.catalogUnlinks ?? []) + [link] }
+        next.catalogScreenIDs?.removeValue(forKey: id)
+        next.linkedRollback?.removeValue(forKey: id)
+        next.linkedConflictPins?.removeValue(forKey: id)
+    }
+
+    private func linkedUpdateAllowed(_ screen: CatalogScreen, expecting link: LinkedCatalogInstall) -> Bool {
+        state.catalogLinks?[link.screenID] == link && screen.catalogScreenID == link.catalogScreenID &&
+            screen.latest.catalogScreenID == link.catalogScreenID &&
+            (screen.latest.displayVersion > link.displayVersion || (link.discardAfterRefresh == true && screen.latest.versionID == link.versionID)) &&
+            state.screens.contains(where: { $0.id == link.screenID && ($0.revision == link.localRevision || link.discardAfterRefresh == true) }) &&
+            link.pendingRevision == nil && !link.conflict && state.pendingID == nil && state.submissionKey == nil
+    }
+
+    private func commitCatalogInstallation(_ saved: Saved, screen: CatalogScreen, linkedBinding: CatalogBinding?, replacing link: LinkedCatalogInstall?) throws {
+        var next = state
+        if let link, let index = next.screens.firstIndex(where: { $0.id == link.screenID }) {
+            next.screens[index] = saved
+            if next.previous?.id == saved.id { next.previous = nil }
+            var updated = LinkedCatalogInstall(screenID: saved.id, version: screen.latest, libraryID: link.libraryID, binding: link.binding, localRevision: saved.revision, localScreenID: link.localScreenID)
+            updated.commitCounter = link.commitCounter
+            next.catalogLinks?[saved.id] = updated
+        } else {
+            next.screens.append(saved)
+            if let linkedBinding {
+                let libraryID = next.catalogLinkLibraryID ?? next.catalog?.libraryID ?? UUID().uuidString
+                next.catalogLinkLibraryID = libraryID
+                var links = next.catalogLinks ?? [:]
+                links[saved.id] = .init(screenID: saved.id, version: screen.latest, libraryID: libraryID, binding: linkedBinding, localRevision: saved.revision)
+                next.catalogLinks = links
+            }
+        }
+        if next.catalogScreenIDs == nil { next.catalogScreenIDs = [:] }
+        next.catalogScreenIDs?[saved.id, default: []].insert(screen.catalogScreenID)
+        try commit(next, stagedDirectory: saved.revision, captureCatalog: linkedBinding == nil && link == nil)
+        pruneUnusedRevisions()
+    }
+
     func containsCatalogScreen(_ screen: CatalogScreen) -> Bool {
         let versions = [screen.latest] + screen.history
-        return state.screens.contains { saved in
+        return (state.catalogUnlinks ?? []).contains { $0.catalogScreenID == screen.catalogScreenID } || state.screens.contains { saved in
             state.catalogScreenIDs?[saved.id]?.contains(screen.catalogScreenID) == true ||
                 versions.contains { version in
                     version.sourceRevisionID == saved.revision ||
@@ -352,14 +642,28 @@ import ScreenpunkCore
         try commit(next, captureCatalog: false)
     }
 
-    func installCatalogScreen(_ screen: CatalogScreen, package: CatalogPackage) throws {
+    func installCatalogScreen(_ screen: CatalogScreen, package: CatalogPackage, linkedBinding: CatalogBinding? = nil) throws {
         guard !containsCatalogScreen(screen) else { throw DeviceError.message("This screen is already on this device.") }
         guard state.pendingID == nil, state.submissionKey == nil else {
             throw DeviceError.message("Finish or cancel the current request before adding a screen.")
         }
-        _ = try CatalogContract.encodePackage(package)
+        try stageCatalogPackage(screen, package: package, linkedBinding: linkedBinding, replacing: nil)
+    }
+
+    func updateLinkedCatalogScreen(_ screen: CatalogScreen, package: CatalogPackage, expecting link: LinkedCatalogInstall) throws -> Bool {
+        guard linkedUpdateAllowed(screen, expecting: link) else { return false }
+        try stageCatalogPackage(screen, package: package, linkedBinding: nil, replacing: link)
+        return true
+    }
+
+    private func stageCatalogPackage(_ screen: CatalogScreen, package: CatalogPackage, linkedBinding: CatalogBinding?, replacing link: LinkedCatalogInstall?) throws {
+        let encoded = try CatalogContract.encodePackage(package)
+        if linkedBinding != nil || link != nil {
+            guard screen.latest.catalogScreenID == screen.catalogScreenID, encoded.count == screen.latest.sizeBytes,
+                  CatalogContract.digest(encoded) == screen.latest.packageDigest else { throw DeviceError.message("The catalog package did not match this version.") }
+        }
         guard package.schemaVersion == screen.latest.packageSchema else { throw DeviceError.message("The catalog package format changed.") }
-        if package.schemaVersion == 1 {
+        if package.schemaVersion == 1, linkedBinding == nil, link == nil {
             let files: [ScreenFile] = try package.files.map { file in
                 guard let bytes = Data(base64Encoded: file.contentBase64), let content = String(data: bytes, encoding: .utf8) else { throw DeviceError.message("The catalog screen contains an invalid file.") }
                 return .init(path: file.path, content: content)
@@ -382,14 +686,12 @@ import ScreenpunkCore
                 if !file.mediaType.hasPrefix("audio/"), let text = String(data: bytes, encoding: .utf8) { textFiles.append(.init(path: file.path, content: text)) }
             }
             _ = try PackageAssetStore.load(directory: directory)
-            var next = state
-            let saved = Saved(id: UUID().uuidString, revision: revision, artifact: .init(title: package.screen.title, entry: package.screen.entry, files: textFiles), catalogPackageSchema: 2, catalogAssetPaths: package.files.map(\.path))
-            next.screens.append(saved)
-            if next.catalogScreenIDs == nil { next.catalogScreenIDs = [:] }
-            next.catalogScreenIDs?[saved.id, default: []].insert(screen.catalogScreenID)
+            let saved = Saved(id: link?.screenID ?? UUID().uuidString, revision: revision,
+                              artifact: .init(title: package.screen.title, entry: package.screen.entry, files: textFiles),
+                              catalogPackageSchema: package.schemaVersion,
+                              catalogAssetPaths: package.schemaVersion == 2 ? package.files.map(\.path) : nil)
             committing = true
-            try commit(next, stagedDirectory: revision)
-            pruneUnusedRevisions()
+            try commitCatalogInstallation(saved, screen: screen, linkedBinding: linkedBinding, replacing: link)
         } catch { if !committing { try? FileManager.default.removeItem(at: directory) }; throw error }
     }
 
@@ -424,11 +726,22 @@ import ScreenpunkCore
         try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: directory.path)
     }
 
-    func installCatalogAssets(_ screen: CatalogScreen, manifest: CatalogAssetManifest, staged directory: URL) throws {
+    func installCatalogAssets(_ screen: CatalogScreen, manifest: CatalogAssetManifest, staged directory: URL, linkedBinding: CatalogBinding? = nil) throws {
         guard !containsCatalogScreen(screen) else { throw DeviceError.message("This screen is already on this device.") }
         guard state.pendingID == nil, state.submissionKey == nil else {
             throw DeviceError.message("Finish or cancel the current request before adding a screen.")
         }
+        try stageCatalogAssets(screen, manifest: manifest, directory: directory, linkedBinding: linkedBinding, replacing: nil)
+    }
+
+    func updateLinkedCatalogAssets(_ screen: CatalogScreen, manifest: CatalogAssetManifest, staged directory: URL, expecting link: LinkedCatalogInstall) throws -> Bool {
+        guard linkedUpdateAllowed(screen, expecting: link) else { return false }
+        try stageCatalogAssets(screen, manifest: manifest, directory: directory, linkedBinding: nil, replacing: link)
+        return true
+    }
+
+    private func stageCatalogAssets(_ screen: CatalogScreen, manifest: CatalogAssetManifest, directory: URL,
+                                    linkedBinding: CatalogBinding?, replacing link: LinkedCatalogInstall?) throws {
         guard activeCatalogRestoreDirectories.contains(directory.lastPathComponent),
               screen.latest.packageSchema == 3, screen.latest.packageStorage == "assets",
               try CatalogContract.validateAssetManifest(manifest) == screen.latest.sizeBytes,
@@ -455,15 +768,10 @@ import ScreenpunkCore
             throw DeviceError.message("The restored screen is missing its SDK manifest.")
         }
         let revision = UUID().uuidString
-        let saved = Saved(id: UUID().uuidString, revision: revision, artifact: .init(title: manifest.screen.title, entry: manifest.screen.entry, files: metadata),
+        let saved = Saved(id: link?.screenID ?? UUID().uuidString, revision: revision, artifact: .init(title: manifest.screen.title, entry: manifest.screen.entry, files: metadata),
                           catalogPackageSchema: manifest.schemaVersion, catalogAssetPaths: manifest.files.map(\.path))
-        var next = state
-        next.screens.append(saved)
-        if next.catalogScreenIDs == nil { next.catalogScreenIDs = [:] }
-        next.catalogScreenIDs?[saved.id, default: []].insert(screen.catalogScreenID)
         try FileManager.default.moveItem(at: directory, to: root.appendingPathComponent(revision, isDirectory: true))
-        try commit(next, stagedDirectory: revision)
-        pruneUnusedRevisions()
+        try commitCatalogInstallation(saved, screen: screen, linkedBinding: linkedBinding, replacing: link)
     }
 
     /// Upgrade only the exact pristine shipped Weather package. A committed replacement
@@ -691,6 +999,7 @@ import ScreenpunkCore
         var next = state
         var authoring = next.authoring ?? .init(); var knownScreens = authoring.knownScreenIDs ?? []; knownScreens.insert(id); authoring.knownScreenIDs = knownScreens; next.authoring = authoring
         next.screens.removeAll { $0.id == id }
+        detachCatalogLink(id, in: &next)
         next.hiddenScreenIDs?.remove(id)
         if next.hiddenScreenIDs?.isEmpty == true { next.hiddenScreenIDs = nil }
         if next.selectedID == id {
@@ -751,7 +1060,7 @@ import ScreenpunkCore
     }
 
     func rollback() throws {
-        guard !needsAgentSetup, let previous = state.previous, let position = state.screens.firstIndex(where: { $0.id == previous.id }) else { return }
+        guard !needsAgentSetup, let previous = state.previous, state.catalogLinks?[previous.id] == nil, let position = state.screens.firstIndex(where: { $0.id == previous.id }) else { return }
         try temporary.manualSelection()
         var next = state; next.previous = next.screens[position]; next.screens[position] = previous
         if isScreenShown(previous.id) { next.selectedID = previous.id }
@@ -759,6 +1068,7 @@ import ScreenpunkCore
         try commit(next)
     }
     private func clearTerminalDelivery(_ id: String, in next: inout State) {
+        next.linkedEdits?.removeValue(forKey: id)
         if next.submissionKey == id {
             next.submissionKey = nil; next.submissionText = nil; next.submissionScreen = nil
             next.requestDeadline = nil
@@ -769,7 +1079,11 @@ import ScreenpunkCore
     }
     private func commit(_ proposed: State, stagedDirectory: String? = nil, captureCatalog: Bool = true) throws {
         let previousCatalogRevision = state.catalog?.entries.last?.id
+        let previousLinks = state.catalogLinks
+        let previousUnlinks = state.catalogUnlinks
+        let previousForks = state.catalogForks
         defer {
+            if previousLinks != state.catalogLinks || previousUnlinks != state.catalogUnlinks || previousForks != state.catalogForks { onCatalogLinksChanged?() }
             if let latest = state.catalog?.entries.last?.id, latest != previousCatalogRevision,
                captureCatalog, stagedDirectory != nil {
                 onCatalogRevisionCommitted?()
@@ -843,7 +1157,10 @@ import ScreenpunkCore
         return state
     }
     private func pruneUnusedRevisions() {
-        let retained = Set(state.screens.map(\.revision) + [state.previous?.revision].compactMap { $0 } + (state.authoring?.revisionPins?.values.map(\.revision) ?? []) + (state.catalog?.entries.map(\.revision) ?? []))
+        var retained = Set(state.screens.map(\.revision) + [state.previous?.revision].compactMap { $0 } + (state.authoring?.revisionPins?.values.map(\.revision) ?? []) + (state.catalog?.entries.map(\.revision) ?? []))
+        if let rollback = state.linkedRollback { retained.formUnion(rollback.values.map(\.revision)) }
+        if let forks = state.catalogForks { retained.formUnion(forks.values.map { $0.saved.revision }) }
+        if let pins = state.linkedConflictPins { retained.formUnion(pins.values.joined()) }
         for url in (try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? [] {
             let name = url.lastPathComponent
             if UUID(uuidString: name) != nil && !retained.contains(name) { try? FileManager.default.removeItem(at: url) }
@@ -1002,11 +1319,13 @@ import ScreenpunkCore
         try saveAuthoringRequestV2(request, text: nil, screen: nil)
     }
     /// Preparation is one durable transaction: no orphan pin can exist without visible pending work.
-    func prepareAuthoringRequest(_ request: AuthoringRequestV2, text: String, screen: ScreenArtifact?) throws {
+    func prepareAuthoringRequest(_ request: AuthoringRequestV2, text: String, screen: ScreenArtifact?,
+                                 linkedEdit: LinkedCatalogEditScope? = nil, forkName: String? = nil) throws {
         guard text == request.context.userRequest else { throw DeviceError.message("The prepared instructions differ from the sealed request.") }
-        try saveAuthoringRequestV2(request, text: text, screen: screen)
+        try saveAuthoringRequestV2(request, text: text, screen: screen, linkedEdit: linkedEdit, forkName: forkName)
     }
-    private func saveAuthoringRequestV2(_ request: AuthoringRequestV2, text: String?, screen: ScreenArtifact?) throws {
+    private func saveAuthoringRequestV2(_ request: AuthoringRequestV2, text: String?, screen: ScreenArtifact?,
+                                        linkedEdit: LinkedCatalogEditScope? = nil, forkName: String? = nil) throws {
         _ = try AuthoringV2Contract.validateRequest(JSONEncoder().encode(request))
         guard request.context.libraryID == libraryOwner else { throw DeviceError.message("The request belongs to another library.") }
         if let existing = state.authoring?.requestDigests[request.requestID] {
@@ -1016,6 +1335,7 @@ import ScreenpunkCore
                   state.authoring?.receipts.values.contains(where: { $0.requestID == request.requestID }) != true,
                   !(state.authoring?.cancelledRequestIDs ?? []).contains(request.requestID) else { throw DeviceError.message("This authoring request has already ended.") }
             var next = state
+            try recordLinkedEdit(request, scope: linkedEdit, forkName: forkName, in: &next)
             try prepareDelivery(request, text: text, screen: screen, in: &next)
             try commit(next); return
         }
@@ -1044,9 +1364,88 @@ import ScreenpunkCore
         try AuthoringStore.saveRequest(request, pin: pin, in: &authoring)
         if request.delivery.route == "local" { next.localRequestIDs = (next.localRequestIDs ?? []).union([request.requestID]) }
         next.authoring = authoring
-        if let text { try prepareDelivery(request, text: text, screen: screen, in: &next) }
+        if let text {
+            try recordLinkedEdit(request, scope: linkedEdit, forkName: forkName, in: &next)
+            try prepareDelivery(request, text: text, screen: screen, in: &next)
+        }
         try commit(next)
     }
+    private func recordLinkedEdit(_ request: AuthoringRequestV2, scope: LinkedCatalogEditScope?, forkName: String?, in next: inout State) throws {
+        guard let link = next.catalogLinks?[request.context.screenID] else {
+            if scope != nil { throw DeviceError.message("This screen no longer follows the catalog.") }
+            return
+        }
+        guard let scope, link.localRevision == request.context.baseRevision, link.pendingRevision == nil, !link.conflict else {
+            throw DeviceError.message("Choose how to edit this linked screen once it is up to date.")
+        }
+        let name = try scope == .thisDevice ? validatedForkName(forkName) : nil
+        let edit = LinkedCatalogEdit(scope: scope, base: link, forkName: name)
+        var edits = next.linkedEdits ?? [:]
+        if let previous = edits[request.requestID] {
+            guard previous.scope == scope, previous.forkName == name, previous.base.localRevision == link.localRevision,
+                  previous.base.versionID == link.versionID, previous.base.binding == link.binding else {
+                throw DeviceError.message("This request is already bound to a different edit choice.")
+            }
+        } else { edits[request.requestID] = edit }
+        next.linkedEdits = edits
+    }
+
+    private func validatedForkName(_ name: String?) throws -> String {
+        let normalized = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !normalized.isEmpty, normalized.utf16.count <= 100,
+              !normalized.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
+            throw DeviceError.message("Choose a screen name with 1 to 100 characters.")
+        }
+        return normalized
+    }
+
+    private func replacingLinkedScreen(_ current: Saved, with saved: Saved, name: String, appliedAt: Int64, in next: inout State) {
+        let fork = Saved(id: UUID().uuidString, revision: saved.revision,
+                         artifact: .init(title: name, entry: saved.artifact.entry, files: saved.artifact.files),
+                         catalogPackageSchema: saved.catalogPackageSchema, catalogAssetPaths: saved.catalogAssetPaths)
+        guard let index = next.screens.firstIndex(where: { $0.id == current.id }) else { return }
+        next.screens[index] = fork
+        if let link = next.catalogLinks?[current.id] {
+            if next.catalogForks == nil { next.catalogForks = [:] }
+            next.catalogForks?[fork.id] = .init(saved: fork, libraryID: link.libraryID, binding: link.binding, appliedAt: appliedAt)
+        }
+        detachCatalogLink(current.id, in: &next)
+        if next.hiddenScreenIDs?.remove(current.id) != nil { next.hiddenScreenIDs?.insert(fork.id) }
+        if next.selectedID == current.id { next.selectedID = fork.id }
+        if next.previous?.id == current.id { next.previous = nil }
+    }
+
+    func resolveLinkedCatalogConflictAsFork(id: String, name: String) throws {
+        guard state.pendingID == nil, state.submissionKey == nil,
+              let link = state.catalogLinks?[id], link.conflict, let saved = state.screens.first(where: { $0.id == id && $0.revision == link.pendingRevision }) else { return }
+        let name = try validatedForkName(name)
+        var next = state
+        replacingLinkedScreen(saved, with: saved, name: name, appliedAt: Int64(Date().timeIntervalSince1970 * 1000), in: &next)
+        try commit(next, stagedDirectory: saved.revision)
+        pruneUnusedRevisions()
+    }
+
+    func discardLinkedCatalogConflict(id: String) throws {
+        guard state.pendingID == nil, state.submissionKey == nil,
+              var link = state.catalogLinks?[id], link.conflict,
+              let index = state.screens.firstIndex(where: { $0.id == id && $0.revision == link.pendingRevision }) else { return }
+        var next = state
+        if let base = state.linkedRollback?[id], base.id == id, base.revision == link.localRevision {
+            next.screens[index] = base
+        } else {
+            // Legacy producer history may have rotated its only rollback slot.
+            // Keep displaying the local edit until the authorized fetch succeeds.
+            link.discardAfterRefresh = true
+        }
+        if next.previous?.id == id { next.previous = nil }
+        next.linkedRollback?.removeValue(forKey: id)
+        next.linkedConflictPins?.removeValue(forKey: id)
+        link.pendingRevision = nil; link.operationID = nil; link.pendingAppliedAt = nil; link.conflict = false
+        next.catalogLinks?[id] = link
+        try commit(next, captureCatalog: false)
+        pruneUnusedRevisions()
+    }
+
     private func prepareDelivery(_ request: AuthoringRequestV2, text: String, screen: ScreenArtifact?, in next: inout State) throws {
         guard (next.pendingID == nil || next.pendingID == request.requestID),
               (next.submissionKey == nil || next.submissionKey == request.requestID) else { throw DeviceError.message("Resolve the current request before preparing another.") }
@@ -1102,7 +1501,8 @@ import ScreenpunkCore
         guard let request = state.authoring?.requests[result.requestID] else { throw DeviceError.message("The original authoring snapshot is missing.") }
         var next = state; var authoring = next.authoring ?? .init()
         let current = next.screens.first { $0.id == request.context.screenID }
-        if current?.hasNativeAssets == true, current?.revision == request.context.baseRevision, result.screen != nil {
+        if let current, (current.hasNativeAssets || state.catalogLinks?[current.id] != nil),
+           current.revision == request.context.baseRevision, result.screen != nil {
             return try rejectAuthoringResult(result, reason: "This screen requires an agent that supports package assets.", now: now)
         }
         let receipt = try AuthoringStore.apply(result, to: &authoring, currentScreenRevision: current?.revision, cancelled: (state.cancelledRequests ?? []).contains(result.requestID), now: now)
@@ -1154,6 +1554,14 @@ import ScreenpunkCore
         guard let request = state.authoring?.requestsV2?[result.requestID], request.context.libraryID == libraryOwner else { throw DeviceError.message("The original authoring snapshot is missing or belongs to another library.") }
         var next = state; var authoring = next.authoring ?? .init()
         let current = next.screens.first { $0.id == request.context.screenID }
+        let linkedEdit = state.linkedEdits?[result.requestID]
+        if result.screen != nil, let current, let link = state.catalogLinks?[current.id] {
+            guard let linkedEdit, linkedEdit.base.localRevision == link.localRevision,
+                  linkedEdit.base.versionID == link.versionID, linkedEdit.base.binding == link.binding,
+                  linkedEdit.base.screenID == link.screenID, link.pendingRevision == nil, !link.conflict else {
+                return try rejectAuthoringResult(result, reason: "The catalog version changed before this edit could be applied.", now: now)
+            }
+        }
         let receipt = try AuthoringStore.apply(result, to: &authoring, currentScreenRevision: current?.revision, cancelled: (state.cancelledRequests ?? []).contains(result.requestID), now: now)
         next.authoring = authoring
         var stagedRevision: String?
@@ -1202,9 +1610,21 @@ import ScreenpunkCore
                     saved = Saved(id: request.context.screenID, revision: revision, artifact: artifact)
                 }
                 stagedRevision = revision
-                if let index = next.screens.firstIndex(where: { $0.id == saved.id }) { next.previous = next.screens[index]; next.screens[index] = saved }
-                else { next.screens.append(saved) }
-                if selectsInstalledRevision(saved.id) { next.selectedID = saved.id }; next.lastRequest = result.requestID
+                if let linkedEdit, linkedEdit.scope == .thisDevice, let current, let name = linkedEdit.forkName {
+                    replacingLinkedScreen(current, with: saved, name: name, appliedAt: now, in: &next)
+                } else {
+                    if let index = next.screens.firstIndex(where: { $0.id == saved.id }) { next.previous = next.screens[index]; next.screens[index] = saved }
+                    else { next.screens.append(saved) }
+                    if linkedEdit?.scope == .all, let current {
+                        if next.linkedRollback == nil { next.linkedRollback = [:] }
+                        next.linkedRollback?[saved.id] = current
+                        next.catalogLinks?[saved.id]?.pendingRevision = revision
+                        next.catalogLinks?[saved.id]?.operationID = UUID().uuidString
+                        next.catalogLinks?[saved.id]?.pendingAppliedAt = now
+                    }
+                    if selectsInstalledRevision(saved.id) { next.selectedID = saved.id }
+                }
+                next.lastRequest = result.requestID
             } catch {
                 try? FileManager.default.removeItem(at: directory)
                 return try rejectAuthoringResult(result, reason: "The screen package could not be installed: " + error.localizedDescription, now: now)
@@ -1491,7 +1911,8 @@ extension ScreenLibrary {
         var next = state
         var changed = state.catalog == nil || state.catalog?.captureAllowed == false
         if next.catalog == nil {
-            next.catalog = CatalogQueue(binding: binding, maxRevisions: max(1, min(100, maxRevisions)), maxBytes: max(1, min(100 * 1024 * 1024, maxBytes)))
+            next.catalog = CatalogQueue(binding: binding, libraryID: next.catalogLinkLibraryID ?? UUID().uuidString,
+                                        maxRevisions: max(1, min(100, maxRevisions)), maxBytes: max(1, min(100 * 1024 * 1024, maxBytes)))
             next.catalog?.knownSavedRevisions = []
             next.catalog?.seedAnnounced = true
             next.catalog?.status = "Current screens are queued for backup."
@@ -1524,6 +1945,7 @@ extension ScreenLibrary {
     }
 
     private func needsCatalogSeed(_ saved: Saved, in state: State) -> Bool {
+        guard state.catalogLinks?[saved.id] == nil, state.catalogForks?[saved.id] == nil else { return false }
         guard let queue = state.catalog, let copy = queue.copies[saved.id] else { return true }
         if saved.revision == copy.head || saved.revision == copy.acknowledgedRevision || queue.knownSavedRevisions?.contains(saved.revision) == true ||
             queue.entries.contains(where: { $0.screenID == saved.id && $0.revision == saved.revision }) { return false }
@@ -1531,7 +1953,7 @@ extension ScreenLibrary {
     }
 
     private func captureCatalogRevision(_ saved: Saved, origin: String, in next: inout State) {
-        guard var queue = next.catalog, catalogWorkAllowed(binding: queue.binding), !queue.authPaused else { return }
+        guard next.catalogLinks?[saved.id] == nil, next.catalogForks?[saved.id] == nil, var queue = next.catalog, catalogWorkAllowed(binding: queue.binding), !queue.authPaused else { return }
         var copy = queue.copies[saved.id] ?? CatalogCopy()
         // Journal recovery/replay must not assign a new operation or counter.
         guard copy.head != saved.revision else { return }

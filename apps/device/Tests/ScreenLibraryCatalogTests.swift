@@ -30,6 +30,157 @@ final class ScreenLibraryCatalogTests: XCTestCase {
     private func artifact(_ title: String) -> ScreenArtifact { .init(title: title, files: [.init(path: "index.html", content: "<html><body>\(title)</body></html>")]) }
     private var binding: ScreenLibrary.CatalogBinding { .init(origin: "https://example.test", accountID: "account", userID: "user", deviceID: "device", libraryID: "library") }
 
+    @MainActor func testLinkedCatalogInstallReopensAndAppliesNewerVersionInPlace() throws {
+        let root = directory()
+        defer { CatalogFixture.cleanup(root) }
+        var library = try CatalogFixture.open(root, binding: binding)
+        let (first, firstPackage) = try linkedFixture(version: 1)
+        let (second, secondPackage) = try linkedFixture(version: 2)
+        try library.installCatalogScreen(first, package: firstPackage, linkedBinding: binding)
+        let installed = try XCTUnwrap(library.state.screens.first)
+        try library.renameScreen(installed.id, to: "My display name")
+        let link = try XCTUnwrap(library.linkedCatalogScreen(id: installed.id))
+        try library.markLinkedCatalogRegistered(expecting: link, copyID: "copy")
+        library = try CatalogFixture.open(root, binding: binding)
+        let registered = try XCTUnwrap(library.linkedCatalogScreen(id: installed.id))
+        XCTAssertTrue(registered.registered)
+        XCTAssertTrue(try library.updateLinkedCatalogScreen(second, package: secondPackage, expecting: registered))
+        let updated = try XCTUnwrap(library.state.screens.first)
+        XCTAssertEqual(updated.id, installed.id)
+        XCTAssertEqual(updated.displayName, "My display name")
+        XCTAssertNotEqual(updated.revision, installed.revision)
+        XCTAssertFalse(try library.updateLinkedCatalogScreen(second, package: secondPackage, expecting: registered))
+        let current = try XCTUnwrap(library.linkedCatalogScreen(id: installed.id))
+        XCTAssertEqual(current.versionID, second.latest.versionID)
+        XCTAssertFalse(current.registered)
+        XCTAssertTrue(library.containsCatalogScreen(second))
+        XCTAssertNil(library.catalogQueue)
+    }
+
+    @MainActor func testOnlyHereEditSurvivesReopenAndPublishesNamedForkWithBackupsOff() async throws {
+        let root = directory()
+        defer { CatalogFixture.cleanup(root) }
+        var library = try CatalogFixture.open(root, binding: binding)
+        let (first, package) = try linkedFixture(version: 1)
+        try library.installCatalogScreen(first, package: package, linkedBinding: binding)
+        let original = try XCTUnwrap(library.state.screens.first)
+        let edit = try prepareLinkedEdit(library, saved: original, scope: .thisDevice, forkName: "Linked sample — Test iPad")
+        library = try CatalogFixture.open(root, binding: binding)
+        let receipt = try library.applyAuthoringResult(edit, now: 2_000)
+        XCTAssertEqual(receipt.status, "applied", receipt.message ?? "")
+        XCTAssertEqual(try library.applyAuthoringResult(edit, now: 2_001), receipt)
+        let fork = try XCTUnwrap(library.state.screens.first)
+        XCTAssertEqual(library.state.screens.count, 1)
+        XCTAssertNotEqual(fork.id, original.id)
+        XCTAssertEqual(fork.displayName, "Linked sample — Test iPad")
+        XCTAssertTrue(library.linkedCatalogScreens.isEmpty)
+        XCTAssertEqual(library.pendingCatalogUnlinks.first?.screenID, original.id)
+        let pending = try XCTUnwrap(library.pendingCatalogForks.first)
+        let exported = try await library.exportCatalogFork(pending)
+        let begin = try library.catalogForkBegin(pending, declaration: exported.declaration)
+        XCTAssertEqual(begin.screenName, fork.displayName)
+        XCTAssertEqual(begin.localScreenID, fork.id)
+        XCTAssertEqual(begin.commitCounter, 1)
+        XCTAssertFalse(library.catalogBackupsPreference(binding: binding))
+        try library.acknowledgeCatalogFork(pending, catalogScreenID: "new-catalog")
+        XCTAssertTrue(library.pendingCatalogForks.isEmpty)
+        XCTAssertEqual(library.catalogQueue?.copies[fork.id]?.acknowledgedRevision, fork.revision)
+    }
+
+    @MainActor func testSharedConflictRetainsExactBaseAfterUnrelatedEdit() async throws {
+        let root = directory()
+        defer { CatalogFixture.cleanup(root) }
+        var library = try CatalogFixture.open(root, binding: binding)
+        let (first, package) = try linkedFixture(version: 1)
+        let (second, secondPackage) = try linkedFixture(version: 2)
+        try library.installCatalogScreen(first, package: package, linkedBinding: binding)
+        let original = try XCTUnwrap(library.state.screens.first)
+        let link = try XCTUnwrap(library.linkedCatalogScreen(id: original.id))
+        try library.markLinkedCatalogRegistered(expecting: link, copyID: "copy")
+        let edit = try prepareLinkedEdit(library, saved: original, scope: .all)
+        XCTAssertEqual(try library.applyAuthoringResult(edit, now: 2_000).status, "applied")
+        let outgoing = try XCTUnwrap(library.linkedCatalogScreen(id: original.id))
+        let exported = try await library.exportLinkedCatalogEdit(outgoing)
+        let begin = try library.linkedCatalogBegin(outgoing, declaration: exported.declaration)
+        XCTAssertEqual(begin.predecessorRevisionID, original.revision)
+        XCTAssertEqual(begin.commitCounter, 2)
+        XCTAssertFalse(try library.updateLinkedCatalogScreen(second, package: secondPackage, expecting: outgoing))
+        try library.recordLinkedCatalogConflict(outgoing)
+        try library.install(artifact("Unrelated"), requestID: "other-1", replacing: "other")
+        try library.install(artifact("Other edit"), requestID: "other-2", replacing: "other")
+        library = try CatalogFixture.open(root, binding: binding)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(original.revision).path))
+        try library.discardLinkedCatalogConflict(id: original.id)
+        XCTAssertEqual(library.state.screens.first(where: { $0.id == original.id })?.revision, original.revision)
+        let restored = try XCTUnwrap(library.linkedCatalogScreen(id: original.id))
+        XCTAssertTrue(try library.updateLinkedCatalogScreen(second, package: secondPackage, expecting: restored))
+    }
+
+    @MainActor func testDirtyOriginalProducerAdoptsAsConflictAndWaitsForVerifiedReplacement() throws {
+        let root = directory()
+        defer { CatalogFixture.cleanup(root) }
+        var library = try CatalogFixture.open(root, binding: binding)
+        try CatalogFixture.enable(library, binding: binding)
+        try library.install(artifact("Original"), requestID: "original", replacing: "producer")
+        let original = try XCTUnwrap(library.state.screens.first)
+        let initialIntent = try XCTUnwrap(library.catalogQueue?.entries.first)
+        let firstDigest = try XCTUnwrap(initialIntent.packageDigest)
+        try library.recordCatalogIdentity("linked-screen", screenID: original.id)
+        try library.acknowledgeCatalogIntent(id: initialIntent.id, binding: binding)
+        let queue = try XCTUnwrap(library.catalogQueue)
+        let copy = try XCTUnwrap(queue.copies[original.id])
+        try library.install(artifact("First local edit"), requestID: "edit-1", replacing: original.id)
+        let intermediate = try XCTUnwrap(library.state.screens.first)
+        try library.install(artifact("Second local edit"), requestID: "edit-2", replacing: original.id)
+        let local = try XCTUnwrap(library.state.screens.first)
+        let link = try XCTUnwrap(library.adoptCatalogProducerLink(catalogScreenID: "linked-screen", libraryID: queue.libraryID,
+            localScreenID: copy.localScreenID, localRevisionID: original.revision, commitCounter: copy.acknowledgedCounter,
+            copyID: "upstream-copy", versionID: "version-1", sourceRevisionID: original.revision,
+            displayVersion: 1, packageDigest: firstDigest, binding: binding))
+        XCTAssertEqual(link.localScreenID, copy.localScreenID)
+        XCTAssertNotEqual(link.screenID, copy.localScreenID)
+        XCTAssertTrue(link.conflict)
+        XCTAssertEqual(link.pendingRevision, local.revision)
+        XCTAssertEqual(library.state.screens.first?.revision, local.revision)
+        XCTAssertTrue(library.catalogQueue?.entries.isEmpty == true)
+
+        library = try CatalogFixture.open(root, binding: binding)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(intermediate.revision).path))
+        try library.discardLinkedCatalogConflict(id: original.id)
+        let discarding = try XCTUnwrap(library.linkedCatalogScreen(id: original.id))
+        XCTAssertEqual(discarding.discardAfterRefresh, true)
+        XCTAssertEqual(library.state.screens.first?.revision, local.revision)
+        let (remote, package) = try linkedFixture(version: 2)
+        XCTAssertTrue(try library.updateLinkedCatalogScreen(remote, package: package, expecting: discarding))
+        XCTAssertEqual(library.state.screens.first?.id, original.id)
+        XCTAssertEqual(library.state.screens.first?.artifact.title, package.screen.title)
+    }
+
+    @MainActor private func prepareLinkedEdit(_ library: ScreenLibrary, saved: ScreenLibrary.Saved,
+                                               scope: ScreenLibrary.LinkedCatalogEditScope, forkName: String? = nil) throws -> AuthoringResultV2 {
+        let request = try library.makeAuthoringRequestV2(from: .init(requestID: UUID().uuidString, createdAt: 1_000,
+            deadlineAt: 600_000, designGuidance: AuthoringContract.designGuidance, runtime: AuthoringContract.runtime,
+            services: [], context: .init(profileID: "profile", deviceID: "device", screenID: saved.id, baseRevision: saved.revision,
+                userRequest: "Update this screen.", viewport: .init(width: 1_024, height: 768, orientation: "landscape")),
+            delivery: .init(route: "local")))
+        try library.prepareAuthoringRequest(request, text: request.context.userRequest, screen: nil, linkedEdit: scope, forkName: forkName)
+        return .init(requestID: request.requestID, inputDigest: request.delivery.snapshotDigest, baseRevision: saved.revision,
+                     preferenceRevisions: [:], operationID: UUID().uuidString,
+                     screen: .init(title: "Edited", files: [.write(path: "index.html", content: "<html>Edited</html>")]))
+    }
+
+    private func linkedFixture(version: Int) throws -> (CatalogScreen, CatalogPackage) {
+        let file = Data("<html><body>Version \(version)</body></html>".utf8)
+        let package = CatalogPackage(screen: .init(title: "Linked sample", entry: "index.html", requiredAssets: [], externalDependencies: []),
+            files: [.init(path: "index.html", mediaType: "text/html", byteLength: file.count, digest: CatalogContract.digest(file), contentBase64: file.base64EncodedString())])
+        let bytes = try CatalogContract.encodePackage(package)
+        let metadata = CatalogVersion(versionID: "version-\(version)", catalogScreenID: "linked-screen", displayVersion: version,
+            sourceRevisionID: "source-\(version)", parentRevisionIDs: [], copyID: "copy-source", commitCounter: version,
+            screenName: package.screen.title, sourceAppliedAt: "2026-11-21T00:00:00.000Z", backedUpAt: "2026-11-21T00:00:00.000Z",
+            packageDigest: CatalogContract.digest(bytes), sizeBytes: bytes.count, deviceDisplayName: "Source iPad", deviceLinked: true, preview: .init())
+        return (.init(catalogScreenID: metadata.catalogScreenID, latest: metadata, history: []), package)
+    }
+
     @MainActor func testAssetRestoreStagingSurvivesReopenAndKeepsLargeRawFiles() async throws {
         let root = directory(); defer { CatalogFixture.cleanup(root) }
         let entry = Data("<html><body>Large screen</body></html>".utf8)

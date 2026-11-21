@@ -454,6 +454,52 @@ struct AgentStatus: Decodable {
         private enum CodingKeys: CodingKey { case missingFiles }
     }
 
+    private static let linkedCatalogPath = "/api/catalog/linked-installs"
+    nonisolated static func validCatalogIdentifier(_ value: String) -> Bool {
+        CatalogLinkedInstall.validIdentifier(value)
+    }
+
+    func registerCatalogLink(_ link: CatalogLinkedInstallRequest, token: String) async throws -> CatalogLinkedInstall {
+        guard [link.catalogScreenID, link.versionID, link.sourceRevisionID, link.libraryID, link.localScreenID, link.localRevisionID]
+            .allSatisfy(Self.validCatalogIdentifier) else {
+            throw DeviceError.message("The linked screen reference is invalid.")
+        }
+        let reply: CatalogLinkedInstall = try await catalogRequest(Self.linkedCatalogPath, method: "POST",
+            bytes: CatalogContract.canonical(link), token: token)
+        try reply.validate()
+        guard reply.matches(link) else {
+            throw DeviceError.message("Cloud returned a different linked screen.")
+        }
+        return reply
+    }
+
+    func catalogLinkUpdates(cursor: String?, token: String) async throws -> CatalogLinkedUpdates {
+        var path = URLComponents()
+        path.path = Self.linkedCatalogPath + "/updates"
+        if let cursor { path.queryItems = [.init(name: "cursor", value: cursor)] }
+        let data = try await catalogBytes(path.string!, method: "GET", bytes: nil, token: token,
+                                          requestLimit: 0, responseLimit: 2 * 1024 * 1024, contentType: "application/json")
+        let page = try JSONDecoder().decode(CatalogLinkedUpdates.self, from: data)
+        guard page.schemaVersion == 1, page.subscriptions.count <= 100,
+              page.nextCursor.map({ (1...1024).contains($0.utf8.count) }) != false else {
+            throw DeviceError.message("Cloud returned an invalid linked screen page.")
+        }
+        for entry in page.subscriptions { try entry.validate() }
+        return page
+    }
+
+    func deleteCatalogLink(catalogScreenID: String, copyID: String, token: String) async throws {
+        struct Receipt: Decodable { var schemaVersion: Int; var catalogScreenID: String; var deleted: Bool }
+        guard [catalogScreenID, copyID].allSatisfy(Self.validCatalogIdentifier) else {
+            throw DeviceError.message("The linked screen reference is invalid.")
+        }
+        let path = Self.linkedCatalogPath + "/" + catalogScreenID + "?copyID=" + copyID
+        let reply: Receipt = try await catalogRequest(path, method: "DELETE", token: token)
+        guard reply.schemaVersion == 1, reply.catalogScreenID == catalogScreenID, reply.deleted else {
+            throw DeviceError.message("Cloud did not confirm removal of the linked screen.")
+        }
+    }
+
     static let assetBackupsPath = "/api/catalog/asset-backups"
     static let assetOperationsPath = assetBackupsPath + "/operations/"
     static let assetUploadsPath = assetBackupsPath + "/uploads/"
@@ -529,6 +575,7 @@ struct AgentStatus: Decodable {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue(CatalogContract.version, forHTTPHeaderField: "X-Screenpunk-Catalog-Version")
         request.setValue(CatalogContract.assetBackupVersion, forHTTPHeaderField: "X-Screenpunk-Catalog-Assets")
+        request.setValue("1", forHTTPHeaderField: "X-Screenpunk-Catalog-Links")
         if let bytes { request.httpBody = bytes; request.setValue(contentType, forHTTPHeaderField: "Content-Type") }
         let transport = URLSession(configuration: .ephemeral, delegate: NoRedirects(), delegateQueue: nil)
         defer { transport.invalidateAndCancel() }

@@ -192,14 +192,27 @@ public struct CatalogCapability: Codable, Sendable, Equatable {
     public var entitlement: CatalogEntitlement
     public var previewBackfillVersion: String?
     public var assetBackupVersion: String?
+    public var linkedInstallVersion: String?
     public var previewMediaTypes: [String]
-    public init(version: String = "1", feature: String = "catalog-backup-v1", entitlement: CatalogEntitlement, previewMediaTypes: [String], previewBackfillVersion: String? = nil, assetBackupVersion: String? = nil) {
+    public init(version: String = "1", feature: String = "catalog-backup-v1", entitlement: CatalogEntitlement, previewMediaTypes: [String], previewBackfillVersion: String? = nil, assetBackupVersion: String? = nil, linkedInstallVersion: String? = nil) {
         self.version = version
         self.feature = feature
         self.entitlement = entitlement
         self.previewMediaTypes = previewMediaTypes
         self.previewBackfillVersion = previewBackfillVersion
         self.assetBackupVersion = assetBackupVersion
+        self.linkedInstallVersion = linkedInstallVersion
+    }
+}
+
+/// A shared publication compares the current catalog head with the immutable version originally edited.
+public struct CatalogLinkedPublication: Codable, Sendable, Equatable {
+    public var catalogScreenID: String
+    public var baseVersionID: String
+
+    public init(catalogScreenID: String, baseVersionID: String) {
+        self.catalogScreenID = catalogScreenID
+        self.baseVersionID = baseVersionID
     }
 }
 

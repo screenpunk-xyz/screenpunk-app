@@ -7,20 +7,34 @@ import { validateScreenDataDeclaration } from './screen-data';
 export const CATALOG_CAPABILITY = 'catalog-backup-v1';
 export const CATALOG_VERSION = '1';
 export const CATALOG_ASSET_BACKUP_VERSION = '1';
+export const CATALOG_LINKED_INSTALL_VERSION = '1';
+export const CATALOG_LINKED_INSTALL_HEADER = 'X-Screenpunk-Catalog-Links';
 export const CATALOG_ASSET_CHUNK_BYTES = 512 * 1024;
 export const CATALOG_ASSET_BEGIN_BYTES = 256 * 1024;
 export const CATALOG_ASSET_FILE_COUNT = 512;
 export const CATALOG_LIMITS = Object.freeze({ versionsPerScreen:3, screensPerAccount:20, packageBytes:10*1024*1024, previewBytes:512*1024, previewDimension:2048, accountBytes:1024*1024*1024, publicationOverlapBytes:20*1024*1024, queueRevisions:100, queueBytes:100*1024*1024, files:20, fileBytes:204800 });
-export const CATALOG_ROUTES = Object.freeze({ capabilities:'/api/catalog/capabilities', begin:'/api/catalog/backups/begin', uploads:'/api/catalog/backups/', operations:'/api/catalog/backups/operations/', list:'/api/catalog', screens:'/api/catalog/screens/', previewCandidates:'/api/catalog/preview-candidates', previewBegin:'/api/catalog/previews/begin', previewUploads:'/api/catalog/previews/', previewOperations:'/api/catalog/previews/operations/' });
+export const CATALOG_ROUTES = Object.freeze({ capabilities:'/api/catalog/capabilities', begin:'/api/catalog/backups/begin', uploads:'/api/catalog/backups/', operations:'/api/catalog/backups/operations/', list:'/api/catalog', screens:'/api/catalog/screens/', previewCandidates:'/api/catalog/preview-candidates', previewBegin:'/api/catalog/previews/begin', previewUploads:'/api/catalog/previews/', previewOperations:'/api/catalog/previews/operations/', linkedInstalls:'/api/catalog/linked-installs', linkedUpdates:'/api/catalog/linked-installs/updates' });
 export type CatalogErrorCode = 'not_entitled'|'offline'|'quota_exceeded'|'invalid_package'|'conflict'|'deleted'|'retry_later'|'unauthorized'|'not_found';
 export interface CatalogError { code:CatalogErrorCode; message:string; retryAfterSeconds?:number; restartOperation?:true }
 export interface CatalogEntitlement { backupEnabled:boolean; reason:string; versionsPerScreen:number; screensPerAccount:number; packageBytes:number; previewBytes:number; previewDimension:number; accountBytes:number; publicationOverlapBytes:number }
-export interface CatalogCapability { version:'1'; feature:'catalog-backup-v1'; previewMediaTypes:('image/png'|'image/jpeg')[]; previewBackfillVersion?:'1'; assetBackupVersion?:'1'; entitlement:CatalogEntitlement }
+export interface CatalogCapability { version:'1'; feature:'catalog-backup-v1'; previewMediaTypes:('image/png'|'image/jpeg')[]; previewBackfillVersion?:'1'; assetBackupVersion?:'1'; linkedInstallVersion?:'1'; entitlement:CatalogEntitlement }
 export interface CatalogPackageFile { path:string; mediaType:string; byteLength:number; digest:string; contentBase64:string }
 export interface CatalogPackage { schemaVersion:1|2; screen:{ title:string; entry:'index.html'; requiredAssets:string[]; externalDependencies:string[] }; files:CatalogPackageFile[] }
 export type CatalogAssetFile = Omit<CatalogPackageFile,'contentBase64'>;
 export interface CatalogAssetManifest { schemaVersion:1|2; screen:CatalogPackage['screen']; files:CatalogAssetFile[] }
-export interface CatalogAssetBeginBackup { backup:CatalogBeginBackup; manifest:CatalogAssetManifest }
+export interface CatalogAssetBeginBackup { backup:CatalogBeginBackup; manifest:CatalogAssetManifest; link?:CatalogLinkedPublication }
+export interface CatalogLinkedPublication { catalogScreenID:string; baseVersionID:string }
+export interface CatalogLinkedInstall {
+ schemaVersion:1; catalogScreenID:string; versionID:string; sourceRevisionID:string; packageDigest:string;
+ libraryID:string; localScreenID:string; localRevisionID:string; commitCounter:number;
+}
+export interface CatalogLinkedSubscription {
+ schemaVersion:1; catalogScreenID:string; copyID:string; libraryID:string; localScreenID:string;
+ localRevisionID:string; commitCounter:number; installedVersionID:string; installedSourceRevisionID:string;
+ installedDisplayVersion:number; installedPackageDigest:string; linkedDeviceCount:number; current?:CatalogVersion;
+}
+export interface CatalogLinkedUpdates { schemaVersion:1; subscriptions:CatalogLinkedSubscription[]; nextCursor?:string }
+export interface CatalogLinkedDeleteResult { schemaVersion:1; catalogScreenID:string; deleted:true }
 export interface CatalogAssetBackupStatus extends CatalogBackupStatus { missingFiles:{digest:string;offset:number}[] }
 export interface CatalogObjectDeclaration { byteLength:number; digest:string }
 export interface CatalogPreviewDeclaration extends CatalogObjectDeclaration { mediaType:'image/png'|'image/jpeg'; width:number; height:number }
