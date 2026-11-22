@@ -267,6 +267,7 @@ import ScreenpunkLocalTransport
     @Published private(set) var resolvedAgentName: String?
     private var cloudSupportsV2 = false
     private var cloudSupportsConnectionPrefill = false
+    @Published private var cloudSupportsCredentialHandoff = false
     private var cloudSupportsCustomHTTP = false
     @Published private(set) var localAgent: LocalAgentConfiguration?
     @Published private(set) var localSettings: LocalAgentSettingsModel?
@@ -623,6 +624,8 @@ import ScreenpunkLocalTransport
             notices.append("This iPad couldn’t clear its saved sign-in. Unlock and restart the app, then sign out again.")
         }
         catch { notices.append("Cloud sign-out couldn’t be confirmed. You can disconnect this iPad from your account when online.") }
+        do { try credentialHelperStore.delete(Self.credentialHelperStorageKey(accountID: accountID)) }
+        catch { notices.append("Couldn’t clear the credential helper’s pairing from this iPad.") }
         email = nil
         if deleteScreens {
             do {
@@ -731,6 +734,7 @@ import ScreenpunkLocalTransport
         guard intent.origin == CloudClient.origin.absoluteString else { throw DeviceError.message("The deletion receipt belongs to a different server.") }
         guard let profileRepository, let localLedger else { throw DeviceError.message("The account was deleted, but local storage is unavailable. Reopen Screenpunk to finish removing its data.") }
         detachAccountLibrary()
+        try credentialHelperStore.delete(Self.credentialHelperStorageKey(accountID: intent.accountID))
         billing.removeDeletedAccount(origin: intent.origin, accountID: intent.accountID, activeJournalOwner: intent.billingJournalOwner)
         for profile in intent.profiles {
             guard profile.cloudAccountID == intent.accountID else { throw DeviceError.message("A saved profile belongs to another account.") }
@@ -883,6 +887,7 @@ import ScreenpunkLocalTransport
             }
             cloudAgentReady = status.agentReady && cloudBindingMatches
             cloudSupportsV2 = status.authoringCapabilities?.supportsV2 == true
+            cloudSupportsCredentialHandoff = status.authoringCapabilities?.features.contains(AuthoringContract.credentialHandoffFeature) == true
             agentReady = routePreference == .automatic ? (localAgent != nil || cloudAgentReady) : cloudAgentReady
             if let command = status.command { await applyCommand(command) }
             guard cloud.session?.accessToken == token, foreground, generation == connectionGeneration, !Task.isCancelled else { return true }
@@ -1105,6 +1110,7 @@ import ScreenpunkLocalTransport
         guard status.profileID == activeProfile?.cloudBinding?.profileID else { throw DeviceError.message("The Cloud connection changed. Review your account connection.") }
         cloudAgentReady = status.agentReady; cloudSupportsV2 = status.authoringCapabilities?.supportsV2 == true
         cloudSupportsConnectionPrefill = status.authoringCapabilities?.features.contains(AuthoringContract.connectionPrefillFeature) == true
+        cloudSupportsCredentialHandoff = status.authoringCapabilities?.features.contains(AuthoringContract.credentialHandoffFeature) == true
         cloudSupportsCustomHTTP = status.authoringCapabilities?.features.contains("custom-http-v1") == true
         if cloudAgentReady { agentReady = true }
         let supportsSelectedPackage = cloudSupportsV2 && (!requiresPackageAssets || status.authoringCapabilities?.supportsPackageAssets == true)
@@ -1367,7 +1373,8 @@ import ScreenpunkLocalTransport
         let supportsScreenData = route == .local || screenDataSocketID != nil
         let supportsCustomHTTP = preparingV2 && (route == .local || cloudSupportsCustomHTTP)
         let supportsConnectionPrefill = supportsCustomHTTP && route == .cloud && cloudSupportsConnectionPrefill
-        let request = AuthoringRequestV1(requestID: UUID().uuidString, createdAt: now, deadlineAt: now + 10 * 60 * 1000, designGuidance: AuthoringContract.designGuidance(supportsScreenData: supportsScreenData, supportsCustomHTTP: supportsCustomHTTP, supportsConnectionPrefill: supportsConnectionPrefill), runtime: AuthoringContract.runtime(supportsScreenData: supportsScreenData, supportsCustomHTTP: supportsCustomHTTP, supportsConnectionPrefill: supportsConnectionPrefill), services: services, preferences: library.preferences(profileID: profileID, deviceID: deviceID, screenID: screenID), context: .init(profileID: profileID, deviceID: deviceID, screenID: screenID, baseRevision: screen?.revision, userRequest: text, currentScreen: source, viewport: .init(width: size.width, height: size.height, scale: scale, orientation: size.width > size.height ? "landscape" : "portrait")), delivery: .init(route: route.rawValue))
+        let supportsCredentialHandoff = supportsConnectionPrefill && preparingV2 && cloudSupportsCredentialHandoff && isCredentialHelperPaired
+        let request = AuthoringRequestV1(requestID: UUID().uuidString, createdAt: now, deadlineAt: now + 10 * 60 * 1000, designGuidance: AuthoringContract.designGuidance(supportsScreenData: supportsScreenData, supportsCustomHTTP: supportsCustomHTTP, supportsConnectionPrefill: supportsConnectionPrefill, supportsCredentialHandoff: supportsCredentialHandoff), runtime: AuthoringContract.runtime(supportsScreenData: supportsScreenData, supportsCustomHTTP: supportsCustomHTTP, supportsConnectionPrefill: supportsConnectionPrefill, supportsCredentialHandoff: supportsCredentialHandoff), services: services, preferences: library.preferences(profileID: profileID, deviceID: deviceID, screenID: screenID), context: .init(profileID: profileID, deviceID: deviceID, screenID: screenID, baseRevision: screen?.revision, userRequest: text, currentScreen: source, viewport: .init(width: size.width, height: size.height, scale: scale, orientation: size.width > size.height ? "landscape" : "portrait")), delivery: .init(route: route.rawValue))
         return preparingV2 ? request : try AuthoringContract.seal(request)
     }
     private func measureRequestApply(_ requestID: String, _ apply: () throws -> ApplicationReceiptV1) rethrows -> ApplicationReceiptV1 {
@@ -1678,6 +1685,214 @@ import ScreenpunkLocalTransport
             refreshCustomConnections()
         } catch { message = "Connection access could not be approved. Review the current connection in Settings." }
     }
+
+    private struct CredentialHelperRegistration: Codable {
+        let pairID: String
+        let accountRoute: String
+        let relayOrigin: String
+        let expiresAt: Int64
+    }
+
+    private struct CredentialHelperBinding: Codable {
+        let pair: CredentialHandoffPair
+        let deviceID: String
+        let registration: CredentialHelperRegistration
+    }
+
+    private struct CredentialHandoffReply: Decodable {
+        let status: String
+        let alias: String?
+        let scope: CredentialHandoffScope?
+        let envelope: String?
+    }
+
+    struct ConnectionCredentialOffer: Equatable {
+        let scope: CredentialHandoffScope
+        fileprivate let envelope: String
+        fileprivate let revision: String
+        fileprivate let generation: UUID?
+    }
+
+    private let credentialHelperStore = KeychainCredentialStore(service: "xyz.screenpunk.credential-handoff")
+    @Published private var credentialHelperPairRevision = UUID()
+    @Published private var credentialHelperOperationInProgress = false
+    private static let credentialHelperPath = "api/device/credential-handoff/pairs"
+
+    var credentialHelperDeviceID: String? {
+        guard cloudAccountMatches, !accountOperationInProgress else { return nil }
+        return cloud.session?.deviceId
+    }
+    var canPairCredentialHelper: Bool { cloudSupportsCredentialHandoff && credentialHelperDeviceID != nil }
+    var credentialHelperExpiresAt: Date? {
+        credentialHelperBinding.map { Date(timeIntervalSince1970: Double($0.registration.expiresAt) / 1000) }
+    }
+    var isCredentialHelperPaired: Bool {
+        credentialHelperBinding.map { $0.registration.expiresAt > Self.credentialHandoffNow } ?? false
+    }
+    var credentialHelperAccountRoute: String? { credentialHelperBinding?.registration.accountRoute }
+    var credentialHelperPairID: String? { credentialHelperBinding?.pair.pairID }
+
+    private var credentialHelperStorageKey: String? {
+        guard credentialHelperDeviceID != nil, let accountID = cloud.localAccountID else { return nil }
+        return Self.credentialHelperStorageKey(accountID: accountID)
+    }
+
+    private static func credentialHelperStorageKey(accountID: String) -> String {
+        AuthoringContract.contentDigest(Data("\(CloudClient.originScope.canonicalOrigin)\n\(accountID)".utf8))
+    }
+
+    private var credentialHelperBinding: CredentialHelperBinding? {
+        guard !credentialHelperOperationInProgress, let key = credentialHelperStorageKey,
+              let data = try? credentialHelperStore.secret(for: key),
+              let binding = try? JSONDecoder().decode(CredentialHelperBinding.self, from: data),
+              binding.deviceID == credentialHelperDeviceID else { return nil }
+        return binding
+    }
+
+    func pairCredentialHelper(_ scannedCode: String) async throws {
+        guard canPairCredentialHelper, !credentialHelperOperationInProgress, credentialHelperBinding == nil,
+              let key = credentialHelperStorageKey,
+              let session = cloud.session else { throw ConnectionFailure.permissionRequired }
+        credentialHelperOperationInProgress = true
+        defer { credentialHelperOperationInProgress = false }
+        let origin = CloudClient.originScope.canonicalOrigin
+        let pair = try CredentialHandoffPair.parse(scannedCode, relayOrigin: origin)
+        let registration: CredentialHelperRegistration = try await cloud.call(Self.credentialHelperPath, method: "POST",
+            body: ["pairID": pair.pairID, "capabilityHash": pair.capabilityHash], authorizationToken: session.accessToken)
+        guard !Task.isCancelled, key == credentialHelperStorageKey, cloud.session?.accessToken == session.accessToken,
+              registration.pairID == pair.pairID, registration.relayOrigin == origin, registration.expiresAt > Self.credentialHandoffNow,
+              registration.accountRoute.utf8.count == 64,
+              registration.accountRoute.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
+            throw ConnectionFailure.permissionRequired
+        }
+        let data = try JSONEncoder().encode(CredentialHelperBinding(pair: pair, deviceID: session.deviceId, registration: registration))
+        try credentialHelperStore.put(data, for: key)
+        credentialHelperPairRevision = UUID()
+    }
+
+    func forgetCredentialHelper() async throws {
+        guard let key = credentialHelperStorageKey, let pairID = credentialHelperPairID,
+              let session = cloud.session else { throw ConnectionFailure.permissionRequired }
+        credentialHelperOperationInProgress = true
+        defer { credentialHelperOperationInProgress = false }
+        let _: EmptyResponse = try await cloud.call(Self.credentialHelperPath + "/" + pairID, method: "DELETE",
+                                                    authorizationToken: session.accessToken)
+        guard key == credentialHelperStorageKey, cloud.session?.accessToken == session.accessToken else { throw ConnectionFailure.permissionRequired }
+        try credentialHelperStore.delete(key)
+        credentialHelperPairRevision = UUID()
+    }
+
+    func suggestedCredentialOrigin(_ use: CustomConnectionUse, owner: String) -> String? {
+        guard let server = customConnectionProposal(use)?.fields[use.declaration.originField],
+              canLookForConnectionCredential(use, owner: owner, server: server) else { return nil }
+        return server
+    }
+
+    func canLookForConnectionCredential(_ use: CustomConnectionUse, owner: String, server: String) -> Bool {
+        guard (try? requireCurrentCustomConnection(use, owner: owner)) != nil, canPairCredentialHelper, isCredentialHelperPaired,
+              use.declaration.auth?.mode == "bearer",
+              connectionCredentialSource(use)?.deviceID == credentialHelperDeviceID,
+              customConnectionStatus(use.declaration)?.canReuseCredential(for: server, allowInsecureHTTP: false) != true,
+              let expected = customConnectionProposal(use)?.fields[use.declaration.originField],
+              let origin = try? CredentialHandoffScope.canonicalHTTPSOrigin(expected),
+              origin == (try? CredentialHandoffScope.canonicalHTTPSOrigin(server)) else { return false }
+        return true
+    }
+
+    func connectionCredentialOffer(_ use: CustomConnectionUse, owner: String, server: String) async throws -> ConnectionCredentialOffer? {
+        guard canLookForConnectionCredential(use, owner: owner, server: server),
+              let source = connectionCredentialSource(use), let binding = credentialHelperBinding,
+              let session = cloud.session else { return nil }
+        let origin = try CredentialHandoffScope.canonicalHTTPSOrigin(server)
+        let generation = try customHTTPVault.serviceGeneration(owner: owner, serviceID: use.declaration.id)
+        let path = "api/device/requests/" + source.requestID + "/credential-handoff"
+        var reply: CredentialHandoffReply = try await cloud.call(path, authorizationToken: session.accessToken, authoringVersion: 2)
+        if reply.status == "queued", reply.alias == use.alias {
+            reply = try await cloud.call(path + "/prepare", method: "POST",
+                body: ["pairID": binding.pair.pairID], authorizationToken: session.accessToken, authoringVersion: 2)
+        }
+        guard let scope = reply.scope, scope.alias == use.alias else { return nil }
+        func checkCurrentScope() throws {
+            guard !Task.isCancelled, cloud.session?.accessToken == session.accessToken,
+                  try customHTTPVault.serviceGeneration(owner: owner, serviceID: use.declaration.id) == generation else {
+                throw CancellationError()
+            }
+            try requireCurrentCredentialScope(scope, use: use, owner: owner, origin: origin)
+        }
+        switch reply.status {
+        case "prepared":
+            try checkCurrentScope()
+            let proof = try binding.pair.challenge(for: scope)
+            let _: CredentialHandoffReply = try await cloud.call(path, method: "POST",
+                body: ["pairID": binding.pair.pairID, "challenge": proof], authorizationToken: session.accessToken, authoringVersion: 2)
+            return nil
+        case "offered":
+            try checkCurrentScope()
+            guard let envelope = reply.envelope else { throw ConnectionFailure.validationFailed }
+            guard try !customHTTPVault.hasHandledCredentialHandoff(owner: owner, scope: scope, now: Self.credentialHandoffNow) else {
+                return nil
+            }
+            _ = try binding.pair.open(envelope, for: scope) // Authenticate the display name before review.
+            return .init(scope: scope, envelope: envelope, revision: use.screen.revision, generation: generation)
+        default: return nil
+        }
+    }
+
+    func saveConnectionCredential(_ offer: ConnectionCredentialOffer, use: CustomConnectionUse, owner: String,
+                                  fields: [String: String], certificatePin: ReviewedCertificatePin?) async throws {
+        let origin = try CredentialHandoffScope.canonicalHTTPSOrigin(fields[use.declaration.originField] ?? "")
+        guard offer.revision == use.screen.revision, let pair = credentialHelperBinding?.pair else {
+            throw ConnectionFailure.permissionRequired
+        }
+        try requireCurrentCredentialScope(offer.scope, use: use, owner: owner, origin: origin)
+        guard try customHTTPVault.serviceGeneration(owner: owner, serviceID: use.declaration.id) == offer.generation,
+              try !customHTTPVault.hasHandledCredentialHandoff(owner: owner, scope: offer.scope, now: Self.credentialHandoffNow),
+              let session = cloud.session else { throw ConnectionFailure.permissionRequired }
+        try await finishConnectionCredential(offer, status: "accepted", token: session.accessToken)
+        try Task.checkCancellation()
+        guard cloud.session?.accessToken == session.accessToken else { throw ConnectionFailure.permissionRequired }
+        try requireCurrentCredentialScope(offer.scope, use: use, owner: owner, origin: origin)
+        let token = try pair.open(offer.envelope, for: offer.scope)
+        try customHTTPVault.acceptCredentialHandoff(owner: owner, declaration: use.declaration, fields: fields, token: token,
+            certificatePin: certificatePin, scope: offer.scope, expectedGeneration: offer.generation, now: Self.credentialHandoffNow)
+        refreshCustomConnections()
+    }
+
+    func declineConnectionCredential(_ offer: ConnectionCredentialOffer, use: CustomConnectionUse, owner: String) async throws {
+        guard offer.revision == use.screen.revision, let session = cloud.session else { throw ConnectionFailure.permissionRequired }
+        try requireCurrentCredentialScope(offer.scope, use: use, owner: owner, origin: offer.scope.origin)
+        try customHTTPVault.declineCredentialHandoff(owner: owner, scope: offer.scope, now: Self.credentialHandoffNow)
+        try? await finishConnectionCredential(offer, status: "declined", token: session.accessToken)
+    }
+
+    private func finishConnectionCredential(_ offer: ConnectionCredentialOffer, status: String, token: String) async throws {
+        let path = "api/device/requests/" + offer.scope.requestID + "/credential-handoff/finish"
+        let reply: CredentialHandoffReply = try await cloud.call(path, method: "POST",
+            body: ["pairID": offer.scope.pairID, "deliveryID": offer.scope.deliveryID, "status": status],
+            authorizationToken: token, authoringVersion: 2)
+        guard reply.status == status else { throw ConnectionFailure.permissionRequired }
+    }
+
+    private func connectionCredentialSource(_ use: CustomConnectionUse) -> ScreenLibrary.CredentialHandoffSource? {
+        library?.connectionCredentialHandoffSource(screenID: use.screen.id, revision: use.screen.revision)
+    }
+
+    private func requireCurrentCredentialScope(_ scope: CredentialHandoffScope, use: CustomConnectionUse,
+                                               owner: String, origin: String) throws {
+        try requireCurrentCustomConnection(use, owner: owner)
+        guard let source = connectionCredentialSource(use), let binding = credentialHelperBinding,
+              canLookForConnectionCredential(use, owner: owner, server: origin),
+              scope.pairID == binding.pair.pairID, scope.accountRoute == binding.registration.accountRoute,
+              scope.relayOrigin == CloudClient.originScope.canonicalOrigin, scope.deviceID == credentialHelperDeviceID,
+              scope.requestID == source.requestID, scope.inputDigest == source.inputDigest,
+              scope.operationID == source.operationID, scope.screenID == use.screen.id, scope.alias == use.alias,
+              scope.serviceID == use.declaration.id, scope.declarationDigest == (try CredentialHandoffScope.declarationDigest(use.declaration)),
+              scope.origin == origin, scope.expiresAt > Self.credentialHandoffNow else {
+            throw ConnectionFailure.permissionRequired
+        }
+    }
+
+    private static var credentialHandoffNow: Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
 
     private let customHTTPVault = CustomHTTPDeviceVault()
     private(set) var customHTTP: CustomHTTPDeviceRuntime?
@@ -2027,6 +2242,9 @@ import ScreenpunkLocalTransport
         // Account deletion has its own durable recovery transaction. A revoked
         // enrollment must never erase or masquerade as completion of that flow.
         if accountDeletionIntent != nil { email = nil; return }
+        if let accountID = activeProfile?.cloudBinding?.accountID {
+            try? credentialHelperStore.delete(Self.credentialHelperStorageKey(accountID: accountID))
+        }
         library?.setCatalogBackupScope(nil)
         detachAccountLibrary()
         email = nil
@@ -2425,6 +2643,7 @@ import ScreenpunkLocalTransport
         if let previous = homeAssistant { Task { await previous.cancelPending() } }
         homeAssistant = nil; customHTTP = nil; customHTTPRendererKey = ""; manifest = nil; assets = nil; screen = nil; activeProfile = nil
         cloudSupportsConnectionPrefill = false
+        cloudSupportsCredentialHandoff = false
         cloudSupportsCustomHTTP = false
         library = nil; cloudAuthoring = nil; localAuthoring = nil; localTransport = nil; cloudAuthoringV2 = nil; localAuthoringV2 = nil; localTransportV2 = nil; localTransportAuthoringProfileID = nil; cloudAgentReady = false; cloudSupportsV2 = false; pendingID = nil; pendingScreenID = nil; consumedID = nil
         cancelledLocally = []; inventorySignature = nil

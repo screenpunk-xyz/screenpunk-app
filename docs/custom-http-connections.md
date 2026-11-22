@@ -64,9 +64,27 @@ prompt. Saved settings remain authoritative; the proposed and current server
 are displayed separately. Editing an existing connection starts with its saved
 values. Saving remains explicit, and changing settings invalidates prior grants.
 The existing vault may retain a compatible saved bearer credential only during
-an explicit save at the same canonical origin. There is no agent-visible secret
-reference or new secret provisioning/handoff surface. A new origin requires
-manual credential entry. Manual setup remains available at all times.
+an explicit save at the same canonical origin. A change of origin requires a credential explicitly provided for the new server.
+
+## Paired credential delivery
+
+On a Cloud V2 request advertising `credential-handoff-v1`, the authoring agent
+can request a delivery from the iPad’s paired helper. Complete the screen
+request with a matching HTTPS setup proposal first. Then call
+`request_credential_handoff` with the same request ID, the connection alias,
+and the public name of the credential configured on the helper. Keep that name
+out of screen files. The device and helper check the destination and exact
+declaration independently before the user can accept the token.
+
+The initial pairing uses a trusted channel between the helper operator and
+native Settings. Open **Settings → Shared Connections → Credential Helper** on
+the iPad to scan the helper’s pairing code or import its pairing file. Treat
+that pairing material as a secret. See the [helper setup instructions](../tools/credential-handoff/README.md).
+
+The token travels in an authenticated encrypted envelope. Native Settings shows
+the destination for review and saves an accepted token in the device Keychain.
+Certificate trust and per-screen approval still apply. Unpaired devices and
+older clients can use manual token entry.
 
 The first attempted unapproved declared operation opens trusted native review
 over the active screen. It identifies the screen, destination and exact GET

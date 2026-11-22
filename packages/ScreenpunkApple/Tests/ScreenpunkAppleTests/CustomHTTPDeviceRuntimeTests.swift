@@ -107,6 +107,57 @@ final class CustomHTTPDeviceRuntimeTests: XCTestCase {
         }
     }
 
+    func testCredentialHandoffOneUseAndDeclarationAndOriginBinding() throws {
+        let (vault, manifest, declaration) = try configured()
+        let old = try XCTUnwrap(vault.status(owner: owner, declaration: declaration))
+        let fields = ["server": old.origin + ":443", "tag": "weekly"]
+        let scope = try credentialScope(declaration: declaration, origin: old.origin)
+        func accept(fields: [String: String], generation: UUID?, now: Int64 = 1) throws {
+            try vault.acceptCredentialHandoff(owner: owner, declaration: declaration, fields: fields, token: "fixture-handoff",
+                certificatePin: nil, scope: scope, expectedGeneration: generation, now: now)
+        }
+        XCTAssertThrowsError(try accept(fields: fields, generation: nil))
+        XCTAssertThrowsError(try accept(fields: fields, generation: old.generation, now: scope.expiresAt))
+        XCTAssertThrowsError(try accept(fields: ["server": "https://replacement.test", "tag": "weekly"], generation: old.generation))
+        try accept(fields: fields, generation: old.generation)
+        XCTAssertTrue(try vault.hasHandledCredentialHandoff(owner: owner, scope: scope, now: 1))
+        XCTAssertFalse(vault.isApproved(owner: owner, screenID: screenID, manifest: manifest, alias: alias))
+        let saved = try XCTUnwrap(vault.status(owner: owner, declaration: declaration))
+        XCTAssertThrowsError(try accept(fields: fields, generation: saved.generation))
+        try vault.approve(owner: owner, screenID: screenID, manifest: manifest, alias: alias)
+        var altered = manifest
+        altered.connections[0].customHTTP?.operations[0].path = "/api/changed"
+        let alteredDeclaration = try XCTUnwrap(altered.connections[0].customHTTP)
+        XCTAssertThrowsError(try vault.approve(owner: owner, screenID: screenID, manifest: altered, alias: alias))
+        try vault.save(owner: owner, declaration: declaration, fields: fields, allowInsecureHTTP: false)
+        XCTAssertThrowsError(try vault.save(owner: owner, declaration: alteredDeclaration, fields: fields, allowInsecureHTTP: false))
+        try vault.save(owner: owner, declaration: alteredDeclaration, fields: fields, secret: "fixture-manual", allowInsecureHTTP: false)
+        try vault.approve(owner: owner, screenID: screenID, manifest: manifest, alias: alias)
+        XCTAssertTrue(vault.isApproved(owner: owner, screenID: screenID, manifest: manifest, alias: alias))
+    }
+
+    func testDeclinedCredentialHandoffCannotBeReplayed() throws {
+        let (vault, _, declaration) = try configured()
+        let saved = try XCTUnwrap(vault.status(owner: owner, declaration: declaration))
+        let scope = try credentialScope(declaration: declaration, origin: saved.origin)
+        try vault.declineCredentialHandoff(owner: owner, scope: scope, now: 1)
+        XCTAssertThrowsError(try vault.acceptCredentialHandoff(owner: owner, declaration: declaration, fields: saved.fields,
+            token: "fixture-handoff", certificatePin: nil, scope: scope, expectedGeneration: saved.generation, now: 2))
+        XCTAssertEqual(vault.status(owner: owner, declaration: declaration), saved)
+    }
+
+    private func credentialScope(declaration: CustomHTTPDeclaration, origin: String) throws -> CredentialHandoffScope {
+        let scope: [String: Any] = [
+            "version": 1, "accountRoute": String(repeating: "1", count: 64), "relayOrigin": "https://relay.test",
+            "deliveryID": "b7719d8a-103a-46b7-bd4c-12d9d9abf9bb", "pairID": "AAAAAAAAAAAAAAAAAAAAAA",
+            "requestID": "fixture-request", "inputDigest": String(repeating: "2", count: 64), "deviceID": "fixture-device",
+            "screenID": screenID, "operationID": "fixture-operation", "alias": alias, "name": "Read only fixture",
+            "origin": origin, "serviceID": declaration.id, "declarationDigest": try CredentialHandoffScope.declarationDigest(declaration),
+            "expiresAt": 10_000,
+        ]
+        return try JSONDecoder().decode(CredentialHandoffScope.self, from: JSONSerialization.data(withJSONObject: scope))
+    }
+
     func testCertificateRotationRequiresFreshApprovalAndCannotMoveToAnotherOrigin() throws {
         guard #available(macOS 15, iOS 18, *) else { throw XCTSkip("Pinning unavailable") }
         let origin = "https://192.168.1.23"
