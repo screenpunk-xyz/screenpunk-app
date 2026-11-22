@@ -39,8 +39,16 @@ import ScreenpunkCore
         var packagePaths: [String] { catalogAssetPaths ?? artifact.files.map(\.path) }
         var hasNativeAssets: Bool { catalogAssetPaths != nil || catalogPackageSchema == 2 }
     }
+    struct CredentialHandoffSource: Codable, Equatable {
+        var requestID: String
+        var inputDigest: String
+        var operationID: String
+        var deviceID: String
+        var deadlineAt: Int64?
+    }
     struct ConnectionSetupDraft: Codable {
         var revision: String
+        var credentialHandoff: CredentialHandoffSource?
         var proposals: [CustomHTTPSetupProposal]
     }
     struct State: Codable { var connectionSetupDrafts: [String: ConnectionSetupDraft]?; var screens: [Saved] = []; var selectedID: String?; var previous: Saved?; var lastRequest: String?; var pendingID: String?; var pendingScreenID: String?; var consumedID: String?; var cancelledRequests: [String]?; var cancelIntents: [String]?; var lastInstruction: String?; var keyboardDrafts: [String: String]?; var submissionKey: String?; var submissionText: String?; var submissionScreen: ScreenArtifact?; var requestDeadline: Double?; var authoring: AuthoringStoreState?; var linkedProfile: LocalProfileDescriptor?; var localRequestIDs: Set<String>?; var bundledScreenSeeds: Set<String>?; var catalog: CatalogQueue?; var hiddenScreenIDs: Set<String>?; var onboarding: Onboarding?; var publicDataRevocations: Set<String>?; var screenDataGenerations: [String: String]?; var catalogScreenIDs: [String: Set<String>]?; var catalogLinks: [String: LinkedCatalogInstall]?; var catalogUnlinks: [LinkedCatalogInstall]?; var catalogLinkLibraryID: String?; var linkedEdits: [String: LinkedCatalogEdit]?; var linkedRollback: [String: Saved]?; var catalogForks: [String: CatalogForkPublication]?; var linkedConflictPins: [String: [String]]? }
@@ -1514,6 +1522,12 @@ import ScreenpunkCore
     }
 
     /// The complete next index (screen, CAS mutations, receipt, outbox) is one redo transaction.
+    func connectionCredentialHandoffSource(screenID: String, revision: String) -> CredentialHandoffSource? {
+        guard state.screens.contains(where: { $0.id == screenID && $0.revision == revision }),
+              let draft = state.connectionSetupDrafts?[screenID], draft.revision == revision else { return nil }
+        return draft.credentialHandoff
+    }
+
     func connectionSetupProposal(screenID: String, revision: String, alias: String, declaration: CustomHTTPDeclaration) -> CustomHTTPSetupProposal? {
         guard state.screens.contains(where: { $0.id == screenID && $0.revision == revision }),
               let draft = state.connectionSetupDrafts?[screenID], draft.revision == revision else { return nil }
@@ -1643,7 +1657,10 @@ import ScreenpunkCore
                 stagedRevision = revision
                 if next.connectionSetupDrafts == nil { next.connectionSetupDrafts = [:] }
                 next.connectionSetupDrafts?[saved.id] = result.connectionSetupProposals.map {
-                    ConnectionSetupDraft(revision: revision, proposals: $0)
+                    ConnectionSetupDraft(revision: revision, credentialHandoff: request.delivery.route == "cloud" && request.runtime.features.contains(AuthoringContract.credentialHandoffFeature) ? .init(
+                        requestID: request.requestID, inputDigest: request.delivery.snapshotDigest, operationID: result.operationID,
+                        deviceID: request.context.deviceID, deadlineAt: request.deadlineAt
+                    ) : nil, proposals: $0)
                 }
                 if let linkedEdit, linkedEdit.scope == .thisDevice, let current, let name = linkedEdit.forkName {
                     replacingLinkedScreen(current, with: saved, name: name, appliedAt: now, in: &next)

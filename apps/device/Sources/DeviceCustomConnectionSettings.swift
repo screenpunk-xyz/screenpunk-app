@@ -11,6 +11,12 @@ struct DeviceCustomConnectionSettings: View {
     @State private var pinEnabled = false
     @State private var fingerprint = ""
     @State private var reviewingTrust = false
+    @State private var credentialOffer: DeviceModel.ConnectionCredentialOffer?
+    @State private var pendingCredentialSave: DeviceModel.ConnectionCredentialOffer?
+    @State private var handoffError: String?
+    @State private var dismissedDelivery: String?
+    @State private var handoffRetry = UUID()
+    @State private var savingCredential: Task<Void, Never>?
     @State private var secret = ""
     @State private var allowInsecureHTTP = false
     @State private var editing = false
@@ -67,15 +73,28 @@ struct DeviceCustomConnectionSettings: View {
                             .textSelection(.enabled)
                     }
                     Button("Edit connection") { editing = true }
+                    if let suggested = model.suggestedCredentialOrigin(use, owner: owner) {
+                        Button("Set up suggested server") {
+                            fields[declaration.originField] = suggested
+                            editing = true
+                        }
+                    }
                 }
                 if allowsApproval { screenApproval }
+            }
+            if enteringSettings && model.canLookForConnectionCredential(use, owner: owner, server: server) {
+                credentialHandoffSection
+            }
+            if enteringSettings && declaration.auth?.mode == "bearer",
+               let helperOrigin = try? CredentialHandoffScope.canonicalHTTPSOrigin(server) {
+                helperSetupDetails(origin: helperOrigin)
             }
             if !enteringSettings, let error {
                 Section { Text(error).foregroundStyle(.red).accessibilityIdentifier("connection.error") }
             }
         }
         .navigationTitle(declaration.label)
-        .disabled((try? model.requireCurrentCustomConnection(use, owner: owner)) == nil)
+        .disabled(savingCredential != nil || (try? model.requireCurrentCustomConnection(use, owner: owner)) == nil)
         .task(id: use.screen.revision) { loadSettings() }
         .task(id: testInProgress) {
             guard testInProgress else { return }
@@ -90,9 +109,10 @@ struct DeviceCustomConnectionSettings: View {
             testInProgress = false
         }
         .onChange(of: model.customHTTPRendererKey) { _ in if !editing { loadSettings() } }
+        .task(id: credentialLookupID) { await checkCredentialOffers() }
         .alert("Review certificate trust", isPresented: $reviewingTrust) {
-            Button("Cancel", role: .cancel) {}
-            Button("Save connection", action: save)
+            Button("Cancel", role: .cancel) { pendingCredentialSave = nil }
+            Button("Save connection") { save(offer: pendingCredentialSave) }
         } message: {
             Text(trustReview)
         }
@@ -102,7 +122,12 @@ struct DeviceCustomConnectionSettings: View {
                 fingerprint = ""
             }
         }
-        .onDisappear { secret = "" }
+        .onDisappear {
+            secret = ""
+            pendingCredentialSave = nil
+            credentialOffer = nil
+            savingCredential?.cancel()
+        }
     }
 
     private var setup: some View {
@@ -126,9 +151,9 @@ struct DeviceCustomConnectionSettings: View {
                 Text(error).foregroundStyle(.red).accessibilityIdentifier("connection.error")
             }
             Button("Save connection") {
-                error = validationMessage
+                error = validationMessage(usingCredentialOffer: false)
                 guard error == nil else { return }
-                if pinEnabled || status?.certificatePin != nil { reviewingTrust = true } else { save() }
+                if pinEnabled || status?.certificatePin != nil { reviewingTrust = true } else { save(offer: nil) }
             }.accessibilityIdentifier("custom-connection.save")
             if editing && status != nil {
                 Button("Cancel") { loadSettings(); editing = false; error = nil }
@@ -137,6 +162,89 @@ struct DeviceCustomConnectionSettings: View {
             Text("Connection settings")
         } footer: {
             Text("Connection details are saved on this device. Each screen needs its own approval.")
+        }
+    }
+
+    private var credentialHandoffSection: some View {
+        Section("Credential helper") {
+            if let offer = credentialOffer, offer.scope.deliveryID != dismissedDelivery {
+                LabeledContent("Credential", value: offer.scope.name)
+                LabeledContent("Server", value: offer.scope.origin)
+                Button("Use token on this iPad") { useCredentialOffer(offer) }
+                Button("Decline", role: .destructive) {
+                    savingCredential = Task {
+                        defer { savingCredential = nil }
+                        do {
+                            try await model.declineConnectionCredential(offer, use: use, owner: owner)
+                            dismissedDelivery = offer.scope.deliveryID
+                            credentialOffer = nil
+                            handoffError = "Token offer declined. You can still enter the token manually."
+                        } catch {
+                            handoffError = "Couldn’t decline this token offer. Try again."
+                            self.error = handoffError
+                        }
+                    }
+                }
+            } else if let handoffError {
+                Text(handoffError).font(.footnote)
+                Button("Check for a token again") { handoffRetry = UUID() }
+            } else {
+                Text("Waiting for a token from your paired helper. You can also enter it manually.")
+                    .font(.footnote)
+            }
+        }
+    }
+
+    private func helperSetupDetails(origin: String) -> some View {
+        Section {
+            DisclosureGroup("Details for helper setup") {
+                LabeledContent("Connection ID", value: declaration.id)
+                if let digest = try? CredentialHandoffScope.declarationDigest(declaration) {
+                    LabeledContent("Declaration SHA-256", value: digest)
+                }
+                LabeledContent("Server", value: origin)
+            }
+            .textSelection(.enabled)
+        }
+    }
+
+    private var credentialLookupID: String? {
+        guard enteringSettings, model.canLookForConnectionCredential(use, owner: owner, server: server),
+              let pairID = model.credentialHelperPairID else { return nil }
+        return [owner, use.screen.revision, use.alias, pairID, server, handoffRetry.uuidString].joined(separator: "\n")
+    }
+
+    private func checkCredentialOffers() async {
+        credentialOffer = nil
+        handoffError = nil
+        guard credentialLookupID != nil else { return }
+        let expectedServer = server
+        do {
+            for _ in 0..<30 {
+                let offer = try await model.connectionCredentialOffer(use, owner: owner, server: expectedServer)
+                try Task.checkCancellation()
+                if let offer, offer.scope.deliveryID != dismissedDelivery {
+                    credentialOffer = offer
+                    return
+                }
+                try await Task.sleep(for: .seconds(3))
+            }
+            handoffError = "No token arrived. Check that your helper is online, or enter the token manually."
+        } catch {
+            if !Task.isCancelled {
+                handoffError = "Couldn’t verify the token offer. Check your connection and helper pairing, or enter the token manually."
+            }
+        }
+    }
+
+    private func useCredentialOffer(_ offer: DeviceModel.ConnectionCredentialOffer) {
+        error = validationMessage(usingCredentialOffer: true)
+        guard error == nil else { return }
+        if pinEnabled || status?.certificatePin != nil {
+            pendingCredentialSave = offer
+            reviewingTrust = true
+        } else {
+            save(offer: offer)
         }
     }
 
@@ -217,8 +325,9 @@ struct DeviceCustomConnectionSettings: View {
         return "Remove the certificate pin and use system trust for \(server)? Changes require new screen approval."
     }
 
-    private var validationMessage: String? {
+    private func validationMessage(usingCredentialOffer: Bool) -> String? {
         for field in declaration.fields {
+            if field.type == "secret" && usingCredentialOffer { continue }
             if field.type == "secret" && secret.isEmpty {
                 if !canReuseCredential { return "Enter \(field.label) for this server before saving." }
                 continue
@@ -237,18 +346,40 @@ struct DeviceCustomConnectionSettings: View {
         return nil
     }
 
-    private func save() {
+    private func save(offer: DeviceModel.ConnectionCredentialOffer?) {
+        defer { pendingCredentialSave = nil }
         do {
-            let pin = pinEnabled ? try ReviewedCertificatePin(origin: fields[declaration.originField] ?? "", fingerprint: fingerprint) : nil
+            let pin = pinEnabled ? try ReviewedCertificatePin(origin: server, fingerprint: fingerprint) : nil
+            if let offer {
+                let reviewedFields = fields
+                savingCredential = Task {
+                    defer { savingCredential = nil }
+                    do {
+                        try await model.saveConnectionCredential(offer, use: use, owner: owner, fields: reviewedFields, certificatePin: pin)
+                        finishSave()
+                    } catch {
+                        if !Task.isCancelled {
+                            self.error = "The token offer expired or the connection changed. Request a new token offer or enter the token manually."
+                            credentialOffer = nil
+                            handoffRetry = UUID()
+                        }
+                    }
+                }
+                return
+            }
             try model.saveCustomConnection(use, owner: owner, fields: fields, secret: secret.isEmpty ? nil : secret,
-                                           allowInsecureHTTP: allowInsecureHTTP && fields[declaration.originField]?.lowercased().hasPrefix("http://") == true,
+                                           allowInsecureHTTP: allowInsecureHTTP && server.lowercased().hasPrefix("http://"),
                                            certificatePin: pin)
-            loadSettings()
-            editing = false
-            error = nil
+            finishSave()
         } catch {
             self.error = "Connection could not be saved. Check the server address and local-network setting, then try again."
         }
+    }
+
+    private func finishSave() {
+        loadSettings()
+        editing = false
+        error = nil
     }
 
     private func approve(_ allowed: Bool) {

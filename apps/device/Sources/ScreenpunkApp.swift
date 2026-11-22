@@ -1114,6 +1114,7 @@ struct CloudListenerSetupView_Previews: PreviewProvider {
 enum DeviceSettingsPage: String, Hashable {
     case overview = "Overview", guidedAccess = "Guided Access", display = "General", account = "Account", screens = "Screens"
     case home = "Home Assistant", television = "Google TV", calendar = "Google Calendar", customConnections = "Custom Connections"
+    case credentialHelper = "Credential Helper"
     var symbol: String {
         switch self {
         case .overview: return "hand.draw"
@@ -1125,6 +1126,7 @@ enum DeviceSettingsPage: String, Hashable {
         case .television: return "tv"
         case .calendar: return "calendar"
         case .customConnections: return "link"
+        case .credentialHelper: return "key"
         }
     }
 }
@@ -1450,6 +1452,7 @@ struct DeviceSettingsView: View {
         if !model.manifests(requiring: ["googleCalendar", "google-calendar"]).isEmpty { pages.append(.calendar) }
         if !model.manifests(requiring: ["googleTV"]).isEmpty { pages.append(.television) }
         if !model.customConnectionUses().isEmpty { pages.append(.customConnections) }
+        if model.canPairCredentialHelper || model.credentialHelperPairID != nil { pages.append(.credentialHelper) }
         return pages
     }
 
@@ -1535,6 +1538,8 @@ struct DeviceSettingsView: View {
             }
         case .customConnections:
             customConnections
+        case .credentialHelper:
+            DeviceCredentialHandoffSettings(model: model)
         case .home, .television, .calendar:
             sharedProvider(selection ?? .home)
         }

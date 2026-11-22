@@ -27,6 +27,7 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
         var fields: [String: String]
         var certificatePin: ReviewedCertificatePin?
         var secret: String?
+        var secretDeclarationDigest: String?
         var origin: String
         var allowInsecureHTTP: Bool
         var generation: UUID
@@ -34,7 +35,9 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
         func matches(_ declaration: CustomHTTPDeclaration) -> Bool {
             definition.id == declaration.id && definition.version == declaration.version &&
                 definition.fields == declaration.fields && definition.originField == declaration.originField &&
-                definition.auth == declaration.auth
+                definition.auth == declaration.auth &&
+                (secretDeclarationDigest == nil ||
+                 secretDeclarationDigest == (try? CredentialHandoffScope.declarationDigest(declaration)))
         }
 
         var status: Status {
@@ -53,6 +56,7 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
         var services: [String: Service] = [:]
         var approvals: [String: [String: Approval]] = [:]
         var denials: [String: [String: String]]?
+        var consumedDeliveries: [String: Int64]?
     }
 
     fileprivate struct Authorized: Sendable {
@@ -84,8 +88,63 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
             .sorted { $0.id < $1.id }
     }
 
+    public func hasHandledCredentialHandoff(owner: String, scope: CredentialHandoffScope, now: Int64) throws -> Bool {
+        Self.lock.lock(); defer { Self.lock.unlock() }
+        let consumed = try load()[owner]?.consumedDeliveries ?? [:]
+        return Self.handoffReplayKeys(scope).contains { (consumed[$0] ?? 0) > now }
+    }
+
+    public func declineCredentialHandoff(owner: String, scope: CredentialHandoffScope, requestDeadline: Int64, now: Int64) throws {
+        Self.lock.lock(); defer { Self.lock.unlock() }
+        var accounts = try load()
+        var account = accounts[owner] ?? Account()
+        try Self.recordCredentialHandoff(scope, requestDeadline: requestDeadline, account: &account, now: now)
+        accounts[owner] = account
+        try persist(accounts)
+    }
+
+    private static func handoffReplayKeys(_ scope: CredentialHandoffScope) -> [String] {
+        // Newline cannot occur in authenticated scope identifiers.
+        [scope.deliveryID, "request\n" + scope.requestID + "\n" + scope.alias]
+    }
+
+    private static func recordCredentialHandoff(_ scope: CredentialHandoffScope, requestDeadline: Int64,
+                                                account: inout Account, now: Int64) throws {
+        let keys = handoffReplayKeys(scope)
+        var consumed = (account.consumedDeliveries ?? [:]).filter { $0.value > now }
+        guard scope.isCurrent(now: now, requestDeadline: requestDeadline),
+              keys.allSatisfy({ consumed[$0] == nil }), consumed.count + keys.count <= 256 else {
+            throw ConnectionFailure.permissionRequired
+        }
+        for key in keys { consumed[key] = requestDeadline }
+        account.consumedDeliveries = consumed
+    }
+
+    public func serviceGeneration(owner: String, serviceID: String) throws -> UUID? {
+        Self.lock.lock(); defer { Self.lock.unlock() }
+        return try load()[owner]?.services[serviceID]?.generation
+    }
+
     public func save(owner: String, declaration: CustomHTTPDeclaration, fields: [String: String],
                      secret: String? = nil, allowInsecureHTTP: Bool, certificatePin: ReviewedCertificatePin? = nil) throws {
+        try save(owner: owner, declaration: declaration, fields: fields, secret: secret,
+                 allowInsecureHTTP: allowInsecureHTTP, certificatePin: certificatePin, delivery: nil)
+    }
+
+    public func acceptCredentialHandoff(owner: String, declaration: CustomHTTPDeclaration, fields: [String: String],
+                                        token: String, certificatePin: ReviewedCertificatePin?, scope: CredentialHandoffScope,
+                                        expectedGeneration: UUID?, requestDeadline: Int64, now: Int64) throws {
+        guard !token.isEmpty, declaration.auth?.mode == "bearer", scope.serviceID == declaration.id,
+              scope.declarationDigest == (try CredentialHandoffScope.declarationDigest(declaration)) else {
+            throw ConnectionFailure.validationFailed
+        }
+        try save(owner: owner, declaration: declaration, fields: fields, secret: token, allowInsecureHTTP: false,
+                 certificatePin: certificatePin, delivery: (scope, expectedGeneration, requestDeadline, now))
+    }
+
+    private func save(owner: String, declaration: CustomHTTPDeclaration, fields: [String: String],
+                      secret: String?, allowInsecureHTTP: Bool, certificatePin: ReviewedCertificatePin?,
+                      delivery: (scope: CredentialHandoffScope, expectedGeneration: UUID?, requestDeadline: Int64, now: Int64)?) throws {
         guard !owner.isEmpty else { throw ConnectionFailure.permissionRequired }
         try declaration.validate(alias: "customConnection")
         let visible = declaration.fields.filter { $0.type != "secret" }
@@ -107,7 +166,15 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
         var accounts = try load()
         var account = accounts[owner] ?? Account()
         let previous = account.services[declaration.id]
+        if let delivery {
+            guard try delivery.scope.origin == CredentialHandoffScope.canonicalHTTPSOrigin(origin),
+                  delivery.expectedGeneration == previous?.generation else {
+                throw ConnectionFailure.permissionRequired
+            }
+            try Self.recordCredentialHandoff(delivery.scope, requestDeadline: delivery.requestDeadline, account: &account, now: delivery.now)
+        }
         var token: String?
+        var tokenDeclarationDigest = delivery?.scope.declarationDigest
         if let auth = declaration.auth {
             guard let field = declaration.fields.first(where: { $0.id == auth.field }) else { throw ConnectionFailure.validationFailed }
             if let secret, !secret.isEmpty {
@@ -115,6 +182,7 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
                 token = secret
             } else if let previous, previous.matches(declaration), previous.origin == origin {
                 token = previous.secret
+                tokenDeclarationDigest = previous.secretDeclarationDigest
             }
             guard token != nil else { throw ConnectionFailure.permissionRequired }
         } else if let secret, !secret.isEmpty {
@@ -122,13 +190,15 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
         }
 
         let allowsHTTP = origin.hasPrefix("http://") && allowInsecureHTTP
-        if let previous, previous.matches(declaration), previous.origin == origin,
-           previous.certificatePin == certificatePin, previous.fields == fields, previous.secret == token, previous.allowInsecureHTTP == allowsHTTP {
+        if delivery == nil, let previous, previous.matches(declaration), previous.origin == origin,
+           previous.certificatePin == certificatePin, previous.fields == fields, previous.secret == token,
+           previous.secretDeclarationDigest == tokenDeclarationDigest, previous.allowInsecureHTTP == allowsHTTP {
             return
         }
         guard previous != nil || account.services.count < 64 else { throw ConnectionFailure.sizeLimit }
         Self.removeApprovals(for: declaration.id, from: &account)
-        account.services[declaration.id] = .init(definition: declaration, fields: fields, certificatePin: certificatePin, secret: token, origin: origin,
+        account.services[declaration.id] = .init(definition: declaration, fields: fields, certificatePin: certificatePin, secret: token,
+                                                 secretDeclarationDigest: tokenDeclarationDigest, origin: origin,
                                                  allowInsecureHTTP: allowsHTTP, generation: UUID())
         accounts[owner] = account
         try persist(accounts)

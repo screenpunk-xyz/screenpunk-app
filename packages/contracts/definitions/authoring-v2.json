@@ -1942,5 +1942,9 @@
   "connectionPrefill": {
     "feature": "custom-http-prefill-v1",
     "rule": "When runtime.features includes custom-http-prefill-v1 and schemaVersion is 2, complete_request may include connectionSetupProposals: [{version:1,alias,declaration,fields}]. Write manifest.json in the same result; declaration must exactly equal that alias’s customHTTP declaration. fields contains only nonsecret declared field IDs and string values validated by their types; include the origin URL. Never include credentials, credential references, tokens, headers, or private-network approvals. These are device-local form suggestions for this request’s device and screen, never saved settings or permission. Existing settings remain unchanged. The user reviews setup and access in native UI before any request."
+  },
+  "credentialHandoff": {
+    "feature": "credential-handoff-v1",
+    "rule": "For a Cloud V2 request advertising credential-handoff-v1, a paired helper can deliver a bearer for an HTTPS custom connection. After complete_request succeeds with the matching connectionSetupProposals entry, call request_credential_handoff with the request ID, connection alias and operator-configured credential name. The name identifies the entry on the helper. Never read the bearer or include it in a tool call, screen, setup proposal, progress message or result. Delivery requires separate review on the requesting device. Manual entry is available."
   }
 }

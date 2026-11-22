@@ -116,7 +116,7 @@ public struct AuthoringResultV2: Codable, Sendable, Equatable {
 public struct AuthoringCapabilitiesV2: Codable, Sendable, Equatable {
     public var contractVersions: [String]
     public var features: [String]
-    public init(contractVersions: [String] = ["1","2"], features: [String] = ["asset-references-v2", "package-assets-v2", AuthoringContract.customHTTPFeature, AuthoringContract.connectionPrefillFeature]) { self.contractVersions = contractVersions; self.features = features }
+    public init(contractVersions: [String] = ["1","2"], features: [String] = ["asset-references-v2", "package-assets-v2", AuthoringContract.customHTTPFeature, AuthoringContract.connectionPrefillFeature, AuthoringContract.credentialHandoffFeature]) { self.contractVersions = contractVersions; self.features = features }
     public var supportsV2: Bool { contractVersions.contains("2") && features.contains("asset-references-v2") }
     public var supportsPackageAssets: Bool { supportsV2 && features.contains("package-assets-v2") }
 }

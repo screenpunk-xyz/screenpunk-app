@@ -9,7 +9,7 @@
   },
   "scripts": {
     "check": "npm run contracts:check && npm run local-setup:check && tsc --noEmit",
-    "test": "vitest run packages/contracts",
+    "test": "vitest run packages/contracts && node --test tools/credential-handoff/helper.test.mjs",
     "contracts:check": "node packages/contracts/scripts/sync-authoring.mjs --check && node packages/contracts/scripts/sync-catalog.mjs --check",
     "contracts:generate": "node packages/contracts/scripts/sync-authoring.mjs && node packages/contracts/scripts/sync-catalog.mjs",
     "local-setup:check": "node tools/local-agent-setup/generate.mjs --check",
