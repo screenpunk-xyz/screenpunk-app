@@ -2,6 +2,26 @@ import Foundation
 import ScreenpunkCore
 
 final class RedirectDenyingDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    let certificatePin: ReviewedCertificatePin?
+    init(certificatePin: ReviewedCertificatePin? = nil) { self.certificatePin = certificatePin }
+
+    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        guard let certificatePin else { return completionHandler(.performDefaultHandling, nil) }
+        let space = challenge.protectionSpace
+        guard space.authenticationMethod == NSURLAuthenticationMethodServerTrust, !space.isProxy(),
+              certificatePin.matches(scheme: space.protocol, host: space.host, port: space.port),
+              let trust = space.serverTrust, certificatePin.accepts(trust, host: space.host) else {
+            return completionHandler(.cancelAuthenticationChallenge, nil)
+        }
+        completionHandler(.useCredential, URLCredential(trust: trust))
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        urlSession(session, didReceive: challenge, completionHandler: completionHandler)
+    }
+
     func urlSession(
         _ session: URLSession,
         task: URLSessionTask,
@@ -19,9 +39,9 @@ public final class URLSessionHTTPTransport: HTTPTransport, @unchecked Sendable {
     private let session: URLSession
     private let delegate: RedirectDenyingDelegate
 
-    public init(bounds: HTTPAdapterBounds = .production, privateRequests: Bool = false) {
+    public init(bounds: HTTPAdapterBounds = .production, privateRequests: Bool = false, certificatePin: ReviewedCertificatePin? = nil) {
         self.bounds = bounds
-        let delegate = RedirectDenyingDelegate()
+        let delegate = RedirectDenyingDelegate(certificatePin: certificatePin)
         self.delegate = delegate
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = bounds.timeoutSeconds
@@ -42,6 +62,10 @@ public final class URLSessionHTTPTransport: HTTPTransport, @unchecked Sendable {
     }
 
     public func send(_ request: AuthorizedHTTPRequest) async throws -> HTTPTransportResponse {
+        if let pin = delegate.certificatePin,
+           !pin.matches(scheme: request.url.scheme, host: request.url.host, port: request.url.port) {
+            throw ConnectionFailure.certificateRejected
+        }
         var urlRequest = URLRequest(url: request.url, timeoutInterval: request.timeout)
         urlRequest.httpMethod = request.method
         urlRequest.httpBody = request.body
@@ -57,7 +81,7 @@ public final class URLSessionHTTPTransport: HTTPTransport, @unchecked Sendable {
         var data = Data()
         let http: HTTPURLResponse
         do {
-            let (bytes, response) = try await session.bytes(for: urlRequest)
+            let (bytes, response) = try await session.bytes(for: urlRequest, delegate: delegate.certificatePin == nil ? nil : delegate)
             guard let response = response as? HTTPURLResponse else { throw ConnectionFailure.deviceOffline }
             http = response
             for try await byte in bytes {
@@ -68,6 +92,11 @@ public final class URLSessionHTTPTransport: HTTPTransport, @unchecked Sendable {
         } catch {
             if let failure = error as? ConnectionFailure { throw failure }
             if (error as? URLError)?.code == .timedOut { throw ConnectionFailure.timeout }
+            if delegate.certificatePin != nil, let failure = error as? URLError,
+               [.cancelled, .userCancelledAuthentication, .secureConnectionFailed, .serverCertificateUntrusted,
+                .serverCertificateHasBadDate, .serverCertificateNotYetValid, .serverCertificateHasUnknownRoot].contains(failure.code) {
+                throw ConnectionFailure.certificateRejected
+            }
             throw ConnectionFailure.deviceOffline
         }
 

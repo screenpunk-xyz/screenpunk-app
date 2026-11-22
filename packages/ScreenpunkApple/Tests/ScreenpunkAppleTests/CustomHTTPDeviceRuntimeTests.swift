@@ -98,6 +98,26 @@ final class CustomHTTPDeviceRuntimeTests: XCTestCase {
         XCTAssertFalse(vault.isApproved(owner: owner, screenID: screenID, manifest: manifest, alias: alias))
     }
 
+    func testCertificateRotationRequiresFreshApprovalAndCannotMoveToAnotherOrigin() throws {
+        guard #available(macOS 15, iOS 18, *) else { throw XCTSkip("Pinning unavailable") }
+        let origin = "https://192.168.1.23"
+        let (vault, manifest, declaration) = try configured(origin: origin)
+        let fields = ["server": origin, "tag": "weekly"]
+        for digit in ["1", "2"] {
+            let pin = try ReviewedCertificatePin(origin: origin, fingerprint: String(repeating: digit, count: 64))
+            try vault.save(owner: owner, declaration: declaration, fields: fields, allowInsecureHTTP: false, certificatePin: pin)
+            XCTAssertFalse(vault.isApproved(owner: owner, screenID: screenID, manifest: manifest, alias: alias))
+            XCTAssertEqual(vault.status(owner: owner, declaration: declaration)?.certificatePin, pin)
+            XCTAssertTrue(vault.status(owner: owner, declaration: declaration)?.hasCredential == true)
+            try vault.approve(owner: owner, screenID: screenID, manifest: manifest, alias: alias)
+            XCTAssertThrowsError(try vault.save(owner: owner, declaration: declaration,
+                fields: ["server": origin + ":444", "tag": "weekly"], secret: "fixture", allowInsecureHTTP: false, certificatePin: pin))
+        }
+        try vault.save(owner: owner, declaration: declaration, fields: fields, allowInsecureHTTP: false)
+        XCTAssertFalse(vault.isApproved(owner: owner, screenID: screenID, manifest: manifest, alias: alias))
+        XCTAssertNil(vault.status(owner: owner, declaration: declaration)?.certificatePin)
+    }
+
     func testFixedGETAddsDeclaredQueryAndNativeBearerOnly() async throws {
         let (vault, manifest, _) = try configured()
         let transport = ProbeTransport(.init(status: 200, body: Data("{\"queue\":3}".utf8)))
