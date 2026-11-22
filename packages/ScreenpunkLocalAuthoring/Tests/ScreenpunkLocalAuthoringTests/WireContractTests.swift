@@ -83,6 +83,11 @@ extension WireContractTests {
         var screen = wire["screen"]!.object; screen["requiredAssets"] = .null; wire["screen"] = .object(screen)
         XCTAssertEqual(try LocalResultWireContract.decode(JSON.object(wire).data(), request: request), result)
         let schema = try LocalResultWireContract.schema(for: request)
+        XCTAssertNil(schema["properties"].object["connectionSetupProposals"])
+        XCTAssertNil(schema["$defs"].object["ConnectionSetupProposal"])
+        var unsupported = wire
+        unsupported["connectionSetupProposals"] = .null
+        XCTAssertThrowsError(try LocalResultWireContract.decode(JSON.object(unsupported).data(), request: request))
         let variants = schema["$defs"]["FileMutation"]["anyOf"].array
         XCTAssertEqual(variants.count, 2)
         XCTAssertEqual(Set(variants[0]["properties"].object.keys), ["kind", "path", "content"])

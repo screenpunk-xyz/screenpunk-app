@@ -1619,6 +1619,45 @@ export default {
             },
             "durablePreferenceAuthorization": {
               "$ref": "#/$defs/Authorization"
+            },
+            "connectionSetupProposals": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 8,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "version": {
+                    "const": 1
+                  },
+                  "alias": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64
+                  },
+                  "declaration": {
+                    "type": "object"
+                  },
+                  "fields": {
+                    "type": "object",
+                    "minProperties": 1,
+                    "maxProperties": 12,
+                    "additionalProperties": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 512,
+                      "maxBytes": 512
+                    }
+                  }
+                },
+                "required": [
+                  "version",
+                  "alias",
+                  "declaration",
+                  "fields"
+                ],
+                "additionalProperties": false
+              }
             }
           },
           "required": [
@@ -1900,5 +1939,9 @@ export default {
         }
       }
     }
+  },
+  "connectionPrefill": {
+    "feature": "custom-http-prefill-v1",
+    "rule": "When runtime.features includes custom-http-prefill-v1 and schemaVersion is 2, complete_request may include connectionSetupProposals: [{version:1,alias,declaration,fields}]. Write manifest.json in the same result; declaration must exactly equal that alias’s customHTTP declaration. fields contains only nonsecret declared field IDs and string values validated by their types; include the origin URL. Never include credentials, credential references, tokens, headers, or private-network approvals. These are device-local form suggestions for this request’s device and screen, never saved settings or permission. Existing settings remain unchanged. The user reviews setup and access in native UI before any request."
   }
 } as const;

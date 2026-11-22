@@ -99,6 +99,7 @@ public enum AuthoringV2Contract {
             let old = try request.legacyRequest(); legacy.inputDigest = old.delivery.snapshotDigest
             _ = try AuthoringContract.validateResult(JSONEncoder().encode(legacy), request: old)
         } else { _ = try AuthoringContract.validateResult(JSONEncoder().encode(legacy)) }
+        try CustomHTTPSetupProposal.validate(result: result, request: request)
         var metadata = result; metadata.screen = nil
         guard try AuthoringContract.encodedCanonical(result).count <= 393216, try AuthoringContract.encodedCanonical(metadata).count <= 131072 else { throw AuthoringContractError("result byte limit") }
         if let screen = result.screen {

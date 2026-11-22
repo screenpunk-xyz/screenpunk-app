@@ -15,7 +15,12 @@ enum LocalResultWireContract {
     static func schema(for request: AuthoringRequestV2) throws -> JSON {
         let canonical = AuthoringV2Contract.resultSchema
         let definitions = canonical["$defs"].object
-        let root = definitions["Result"]?.object ?? canonical.object
+        var root = definitions["Result"]?.object ?? canonical.object
+        // Prefill is negotiated only on Cloud. Its open declaration/field maps
+        // must not enter the local Structured Outputs closed-object projection.
+        var properties = root["properties"]!.object
+        properties.removeValue(forKey: "connectionSetupProposals")
+        root["properties"] = .object(properties)
         return try schema(root: root, definitions: definitions, requestID: request.requestID, inputDigest: request.delivery.snapshotDigest, baseRevision: request.context.baseRevision, preferences: request.preferences, version: 2)
     }
     private static func schema(root original: [String: JSON], definitions: [String: JSON], requestID: String, inputDigest: String, baseRevision: String?, preferences: [PreferenceRecordV1], version: Int) throws -> JSON {

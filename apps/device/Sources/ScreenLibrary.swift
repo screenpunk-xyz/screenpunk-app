@@ -39,7 +39,11 @@ import ScreenpunkCore
         var packagePaths: [String] { catalogAssetPaths ?? artifact.files.map(\.path) }
         var hasNativeAssets: Bool { catalogAssetPaths != nil || catalogPackageSchema == 2 }
     }
-    struct State: Codable { var screens: [Saved] = []; var selectedID: String?; var previous: Saved?; var lastRequest: String?; var pendingID: String?; var pendingScreenID: String?; var consumedID: String?; var cancelledRequests: [String]?; var cancelIntents: [String]?; var lastInstruction: String?; var keyboardDrafts: [String: String]?; var submissionKey: String?; var submissionText: String?; var submissionScreen: ScreenArtifact?; var requestDeadline: Double?; var authoring: AuthoringStoreState?; var linkedProfile: LocalProfileDescriptor?; var localRequestIDs: Set<String>?; var bundledScreenSeeds: Set<String>?; var catalog: CatalogQueue?; var hiddenScreenIDs: Set<String>?; var onboarding: Onboarding?; var publicDataRevocations: Set<String>?; var screenDataGenerations: [String: String]?; var catalogScreenIDs: [String: Set<String>]?; var catalogLinks: [String: LinkedCatalogInstall]?; var catalogUnlinks: [LinkedCatalogInstall]?; var catalogLinkLibraryID: String?; var linkedEdits: [String: LinkedCatalogEdit]?; var linkedRollback: [String: Saved]?; var catalogForks: [String: CatalogForkPublication]?; var linkedConflictPins: [String: [String]]? }
+    struct ConnectionSetupDraft: Codable {
+        var revision: String
+        var proposals: [CustomHTTPSetupProposal]
+    }
+    struct State: Codable { var connectionSetupDrafts: [String: ConnectionSetupDraft]?; var screens: [Saved] = []; var selectedID: String?; var previous: Saved?; var lastRequest: String?; var pendingID: String?; var pendingScreenID: String?; var consumedID: String?; var cancelledRequests: [String]?; var cancelIntents: [String]?; var lastInstruction: String?; var keyboardDrafts: [String: String]?; var submissionKey: String?; var submissionText: String?; var submissionScreen: ScreenArtifact?; var requestDeadline: Double?; var authoring: AuthoringStoreState?; var linkedProfile: LocalProfileDescriptor?; var localRequestIDs: Set<String>?; var bundledScreenSeeds: Set<String>?; var catalog: CatalogQueue?; var hiddenScreenIDs: Set<String>?; var onboarding: Onboarding?; var publicDataRevocations: Set<String>?; var screenDataGenerations: [String: String]?; var catalogScreenIDs: [String: Set<String>]?; var catalogLinks: [String: LinkedCatalogInstall]?; var catalogUnlinks: [LinkedCatalogInstall]?; var catalogLinkLibraryID: String?; var linkedEdits: [String: LinkedCatalogEdit]?; var linkedRollback: [String: Saved]?; var catalogForks: [String: CatalogForkPublication]?; var linkedConflictPins: [String: [String]]? }
     private(set) var state = State()
     var onCatalogRevisionCommitted: (() -> Void)?
     var onCatalogLinksChanged: (() -> Void)?
@@ -1108,6 +1112,9 @@ import ScreenpunkCore
             }
         }
         var next = proposed
+        next.connectionSetupDrafts = next.connectionSetupDrafts?.filter { id, draft in
+            next.screens.contains { $0.id == id && $0.revision == draft.revision }
+        }
         if let stagedDirectory, let index = next.screens.firstIndex(where: { $0.revision == stagedDirectory }),
            let current = state.screens.first(where: { $0.id == next.screens[index].id }) {
             next.screens[index].displayNameOverride = current.displayNameOverride
@@ -1507,6 +1514,12 @@ import ScreenpunkCore
     }
 
     /// The complete next index (screen, CAS mutations, receipt, outbox) is one redo transaction.
+    func connectionSetupProposal(screenID: String, revision: String, alias: String, declaration: CustomHTTPDeclaration) -> CustomHTTPSetupProposal? {
+        guard state.screens.contains(where: { $0.id == screenID && $0.revision == revision }),
+              let draft = state.connectionSetupDrafts?[screenID], draft.revision == revision else { return nil }
+        return draft.proposals.first { $0.alias == alias && $0.declaration == declaration }
+    }
+
     func applyAuthoringResult(_ result: AuthoringResultV1, now: Int64 = Int64(Date().timeIntervalSince1970 * 1000)) throws -> ApplicationReceiptV1 {
         if let old = state.authoring?.receipts[result.operationID] {
             let digest = AuthoringContract.contentDigest(try AuthoringContract.encodedCanonical(result))
@@ -1628,6 +1641,10 @@ import ScreenpunkCore
                     saved = Saved(id: request.context.screenID, revision: revision, artifact: artifact)
                 }
                 stagedRevision = revision
+                if next.connectionSetupDrafts == nil { next.connectionSetupDrafts = [:] }
+                next.connectionSetupDrafts?[saved.id] = result.connectionSetupProposals.map {
+                    ConnectionSetupDraft(revision: revision, proposals: $0)
+                }
                 if let linkedEdit, linkedEdit.scope == .thisDevice, let current, let name = linkedEdit.forkName {
                     replacingLinkedScreen(current, with: saved, name: name, appliedAt: now, in: &next)
                 } else {

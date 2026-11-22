@@ -24,6 +24,53 @@ final class ScreenLibraryAuthoringTests: XCTestCase {
               durablePreferenceAuthorization: .init(requestID: request.requestID, quote: request.context.userRequest))
     }
 
+    @MainActor func testConnectionProposalsRemainLocalRevisionBoundDrafts() throws {
+        let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
+        let library = try ScreenLibrary(accountID: "fixture-account", rootDirectory: root)
+        var input = try request(library)
+        input.runtime = AuthoringContract.runtime(supportsScreenData: false, supportsCustomHTTP: true, supportsConnectionPrefill: true)
+        input.designGuidance = AuthoringContract.designGuidance(supportsScreenData: false, supportsCustomHTTP: true, supportsConnectionPrefill: true)
+        input = try AuthoringContract.seal(input)
+        let snapshot = try library.makeAuthoringRequestV2(from: input)
+        try library.saveAuthoringRequest(snapshot)
+        let declaration = CustomHTTPDeclaration(id: "synthetic", version: 1, label: "Synthetic service",
+            fields: [.init(id: "origin", label: "Server", type: "url"), .init(id: "credential", label: "Token", type: "secret")],
+            originField: "origin", auth: .init(field: "credential"), operations: [.init(name: "status", path: "/status")])
+        let proposal = CustomHTTPSetupProposal(alias: "synthetic", declaration: declaration, fields: ["origin":"https://synthetic.example"])
+        let html = "<html><body>Synthetic</body></html>"
+        let metadata = DashboardManifest(schemaVersion: 1, dashboardId: "fixture-screen", name: "Synthetic", revision: "1", entrypoint: "index.html", sdkVersion: "1",
+            target: .init(profileId: "fixture-profile", width: 1024, height: 768, scale: 1, orientation: "landscape"),
+            connections: [.init(alias: "synthetic", required: true, customHTTP: declaration)],
+            files: [.init(path: "index.html", bytes: html.utf8.count, sha256: AuthoringContract.contentDigest(Data(html.utf8)))])
+        let manifest = String(decoding: try JSONEncoder().encode(metadata), as: UTF8.self)
+        let result = AuthoringResultV2(requestID: snapshot.requestID, inputDigest: snapshot.delivery.snapshotDigest,
+            preferenceRevisions: [:], operationID: "proposal-operation", screen: .init(title: "Synthetic", files: [
+                .write(path: "index.html", content: "<html><body>Synthetic</body></html>"), .write(path: "manifest.json", content: manifest)]),
+            connectionSetupProposals: [proposal])
+        for mutation in ["credential", "unknown", "origin"] {
+            var invalid = result
+            invalid.connectionSetupProposals?[0].fields[mutation] = "invalid-value"
+            XCTAssertThrowsError(try library.applyAuthoringResult(invalid, now: 2000))
+        }
+        let expired = try ScreenLibrary(accountID: "fixture-account", rootDirectory: root.appendingPathComponent("expired"))
+        try expired.saveAuthoringRequest(snapshot)
+        XCTAssertEqual(try expired.applyAuthoringResult(result, now: snapshot.deadlineAt).status, "rejected")
+        XCTAssertNil(expired.state.connectionSetupDrafts?["fixture-screen"])
+        let receipt = try library.applyAuthoringResult(result, now: 2000)
+        XCTAssertEqual(receipt.status, "applied", String(describing: receipt))
+        let saved = try XCTUnwrap(library.state.screens.first { $0.id == "fixture-screen" })
+        let reopened = try ScreenLibrary(accountID: "fixture-account", rootDirectory: root)
+        XCTAssertEqual(reopened.connectionSetupProposal(screenID: saved.id, revision: saved.revision, alias: "synthetic", declaration: declaration), proposal)
+        XCTAssertFalse(saved.artifact.files.contains { $0.content.contains("https://synthetic.example") })
+        XCTAssertNil(reopened.connectionSetupProposal(screenID: "other", revision: saved.revision, alias: "synthetic", declaration: declaration))
+        XCTAssertNil(reopened.connectionSetupProposal(screenID: saved.id, revision: "stale", alias: "synthetic", declaration: declaration))
+        var changed = declaration; changed.operations[0].path = "/other"
+        XCTAssertNil(reopened.connectionSetupProposal(screenID: saved.id, revision: saved.revision, alias: "synthetic", declaration: changed))
+        XCTAssertEqual(try reopened.applyAuthoringResult(result, now: 2000).status, "applied")
+        try reopened.install(artifact("Replacement"), requestID: "replacement", replacing: saved.id)
+        XCTAssertNil(reopened.connectionSetupProposal(screenID: saved.id, revision: saved.revision, alias: "synthetic", declaration: declaration))
+    }
+
     @MainActor func testKeyboardDraftSurvivesReopenAndNewScreenPreservesExistingPackages() throws {
         let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
         let library = try ScreenLibrary(accountID: "fixture-account", rootDirectory: root)
@@ -123,7 +170,7 @@ final class ScreenLibraryAuthoringTests: XCTestCase {
         let input = try request(library); try library.saveAuthoringRequest(input)
         let output = result(input)
         let receipt = try library.applyAuthoringResult(output, now: 60_000_000)
-        XCTAssertEqual(receipt.status, "applied")
+        XCTAssertEqual(receipt.status, "applied", String(describing: receipt))
         XCTAssertEqual(library.selected?.id, "fixture-screen")
         XCTAssertEqual(library.selected?.artifact.title, "Updated fixture")
         XCTAssertEqual(library.state.previous?.artifact.title, "Original fixture")

@@ -212,6 +212,21 @@ struct DeviceRootView: View {
                     .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { weatherDestination = nil } } }
             }
         }
+        .sheet(isPresented: Binding(
+            get: { model.customConnectionPrompt != nil && scenePhase == .active && !model.settingsOpen &&
+                model.screenDataPrompt == nil && galleryIntro == nil && weatherDestination == nil &&
+                !onboardingHelpInFlight && !settingsCoverPresented && !speech.recording },
+            set: { if !$0 { model.dismissCustomConnectionPrompt() } }
+        )) {
+            if let prompt = model.customConnectionPrompt {
+                NavigationStack {
+                    DeviceCustomConnectionSettings(model: model, use: prompt.use, owner: prompt.owner, allowsApproval: true)
+                        .toolbar { ToolbarItem(placement: .confirmationAction) {
+                            Button(model.customConnectionApproved(prompt.use) ? "Done" : "Don’t Allow") { model.dismissCustomConnectionPrompt() }
+                        } }
+                }
+            }
+        }
         .modifier(ScreenDataConsentAlert(model: model, isHost: scenePhase == .active && !model.settingsOpen &&
             galleryIntro == nil && weatherDestination == nil && !onboardingHelpInFlight && !settingsCoverPresented && !speech.recording))
         .alert("Weather location", isPresented: Binding(
