@@ -98,6 +98,15 @@ final class CustomHTTPDeviceRuntimeTests: XCTestCase {
         XCTAssertFalse(vault.isApproved(owner: owner, screenID: screenID, manifest: manifest, alias: alias))
     }
 
+    func testSettingsOnlyShowsSavedBearerForItsCanonicalOrigin() throws {
+        let (vault, _, declaration) = try configured(origin: "https://192.168.1.23")
+        let status = try XCTUnwrap(vault.status(owner: owner, declaration: declaration))
+        XCTAssertTrue(status.canReuseCredential(for: "https://192.168.1.23/", allowInsecureHTTP: false))
+        for server in ["http://192.168.1.23", "https://192.168.1.23:444", "https://192.168.1.24", ""] {
+            XCTAssertFalse(status.canReuseCredential(for: server, allowInsecureHTTP: true))
+        }
+    }
+
     func testCertificateRotationRequiresFreshApprovalAndCannotMoveToAnotherOrigin() throws {
         guard #available(macOS 15, iOS 18, *) else { throw XCTSkip("Pinning unavailable") }
         let origin = "https://192.168.1.23"

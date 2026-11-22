@@ -24,6 +24,10 @@ struct DeviceCustomConnectionSettings: View {
     private var credentialLabel: String? {
         declaration.fields.first(where: { $0.type == "secret" })?.label
     }
+    private var server: String { fields[declaration.originField] ?? "" }
+    private var canReuseCredential: Bool {
+        status?.canReuseCredential(for: server, allowInsecureHTTP: allowInsecureHTTP) == true
+    }
     private var savedService: CustomHTTPDeviceVault.SavedService? {
         model.savedCustomConnections.first { $0.id == declaration.id }
     }
@@ -66,7 +70,7 @@ struct DeviceCustomConnectionSettings: View {
                 }
                 if allowsApproval { screenApproval }
             }
-            if let error {
+            if !enteringSettings, let error {
                 Section { Text(error).foregroundStyle(.red).accessibilityIdentifier("connection.error") }
             }
         }
@@ -118,7 +122,12 @@ struct DeviceCustomConnectionSettings: View {
                         .font(.footnote)
                 }
             }
+            if let error {
+                Text(error).foregroundStyle(.red).accessibilityIdentifier("connection.error")
+            }
             Button("Save connection") {
+                error = validationMessage
+                guard error == nil else { return }
                 if pinEnabled || status?.certificatePin != nil { reviewingTrust = true } else { save() }
             }.accessibilityIdentifier("custom-connection.save")
             if editing && status != nil {
@@ -162,8 +171,12 @@ struct DeviceCustomConnectionSettings: View {
     @ViewBuilder private func fieldEditor(_ field: CustomHTTPField) -> some View {
         switch field.type {
         case "secret":
-            SecureField(status?.hasCredential == true ? field.label + " (saved)" : field.label, text: $secret)
+            SecureField(canReuseCredential ? field.label + " (saved)" : field.label + " (required)", text: $secret)
                 .textInputAutocapitalization(.never).autocorrectionDisabled()
+            if !canReuseCredential {
+                Text("Enter the bearer token for this server on this device.")
+                    .font(.footnote)
+            }
         case "toggle":
             Toggle(field.label, isOn: Binding(get: { fields[field.id] == "true" },
                                              set: { fields[field.id] = $0 ? "true" : "false" }))
@@ -204,6 +217,26 @@ struct DeviceCustomConnectionSettings: View {
         return "Remove the certificate pin and use system trust for \(server)? Changes require new screen approval."
     }
 
+    private var validationMessage: String? {
+        for field in declaration.fields {
+            if field.type == "secret" && secret.isEmpty {
+                if !canReuseCredential { return "Enter \(field.label) for this server before saving." }
+                continue
+            }
+            let value = field.type == "secret" ? secret : fields[field.id] ?? ""
+            do { try field.validate(value) } catch {
+                if field.id == declaration.originField {
+                    return "Enter the server address with its scheme and without an operation path."
+                }
+                return "Check the value for \(field.label) before saving."
+            }
+        }
+        if pinEnabled && (try? ReviewedCertificatePin(origin: server, fingerprint: fingerprint)) == nil {
+            return "Check the HTTPS server address and enter its 64-digit SHA-256 fingerprint."
+        }
+        return nil
+    }
+
     private func save() {
         do {
             let pin = pinEnabled ? try ReviewedCertificatePin(origin: fields[declaration.originField] ?? "", fingerprint: fingerprint) : nil
@@ -214,7 +247,7 @@ struct DeviceCustomConnectionSettings: View {
             editing = false
             error = nil
         } catch {
-            self.error = "Check the server address, required fields and any certificate fingerprint (64 hexadecimal digits)."
+            self.error = "Connection could not be saved. Check the server address and local-network setting, then try again."
         }
     }
 

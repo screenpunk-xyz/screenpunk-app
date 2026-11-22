@@ -10,6 +10,10 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
         public let hasCredential: Bool
         public let allowInsecureHTTP: Bool
         public let origin: String
+
+        public func canReuseCredential(for server: String, allowInsecureHTTP: Bool) -> Bool {
+            hasCredential && (try? CustomHTTPDestination.origin(server, allowInsecureHTTP: allowInsecureHTTP)) == origin
+        }
     }
 
     public struct SavedService: Identifiable, Sendable, Equatable {
