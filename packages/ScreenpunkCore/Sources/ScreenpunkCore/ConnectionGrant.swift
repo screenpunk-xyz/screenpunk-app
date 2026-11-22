@@ -110,6 +110,7 @@ public enum ConnectionFailure: String, Error, Sendable, Equatable {
     case deniedEgress = "denied_egress"
     case sizeLimit = "size_limit"
     case timeout
+    case certificateRejected = "certificate_rejected"
     case deviceOffline = "device_offline"
 }
 

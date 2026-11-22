@@ -1715,10 +1715,10 @@ import ScreenpunkLocalTransport
     }
 
     func saveCustomConnection(_ use: CustomConnectionUse, owner: String, fields: [String: String],
-                              secret: String?, allowInsecureHTTP: Bool) throws {
+                              secret: String?, allowInsecureHTTP: Bool, certificatePin: ReviewedCertificatePin?) throws {
         try requireCurrentCustomConnection(use, owner: owner)
         try customHTTPVault.save(owner: owner, declaration: use.declaration, fields: fields, secret: secret,
-                                 allowInsecureHTTP: allowInsecureHTTP)
+                                 allowInsecureHTTP: allowInsecureHTTP, certificatePin: certificatePin)
         refreshCustomConnections()
     }
 

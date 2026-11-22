@@ -246,7 +246,7 @@ public enum ConnectionPolicy {
             case .permissionRequired: return .permissionRequired
             case .deniedEgress: return .deniedEgress
             case .sizeLimit: return .sizeLimit
-            case .timeout, .deviceOffline: return .deniedEgress
+            case .timeout, .deviceOffline, .certificateRejected: return .deniedEgress
             }
         } catch {
             return .validationFailed

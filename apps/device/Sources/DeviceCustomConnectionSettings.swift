@@ -8,6 +8,9 @@ struct DeviceCustomConnectionSettings: View {
     let owner: String
     let allowsApproval: Bool
     @State private var fields: [String: String] = [:]
+    @State private var pinEnabled = false
+    @State private var fingerprint = ""
+    @State private var reviewingTrust = false
     @State private var secret = ""
     @State private var allowInsecureHTTP = false
     @State private var editing = false
@@ -20,6 +23,10 @@ struct DeviceCustomConnectionSettings: View {
     private var declaration: CustomHTTPDeclaration { use.declaration }
     private var credentialLabel: String? {
         declaration.fields.first(where: { $0.type == "secret" })?.label
+    }
+    private var server: String { fields[declaration.originField] ?? "" }
+    private var canReuseCredential: Bool {
+        status?.canReuseCredential(for: server, allowInsecureHTTP: allowInsecureHTTP) == true
     }
     private var savedService: CustomHTTPDeviceVault.SavedService? {
         model.savedCustomConnections.first { $0.id == declaration.id }
@@ -55,11 +62,15 @@ struct DeviceCustomConnectionSettings: View {
                     LabeledContent("Server", value: status.origin)
                     if status.hasCredential, let credentialLabel { LabeledContent(credentialLabel, value: "Saved") }
                     if status.allowInsecureHTTP { LabeledContent("Local HTTP", value: "Allowed") }
+                    if let pin = status.certificatePin {
+                        LabeledContent("Pinned certificate SHA-256", value: pin.fingerprint)
+                            .textSelection(.enabled)
+                    }
                     Button("Edit connection") { editing = true }
                 }
                 if allowsApproval { screenApproval }
             }
-            if let error {
+            if !enteringSettings, let error {
                 Section { Text(error).foregroundStyle(.red).accessibilityIdentifier("connection.error") }
             }
         }
@@ -71,12 +82,26 @@ struct DeviceCustomConnectionSettings: View {
             do {
                 try await model.testCustomConnection(use, owner: owner)
                 if !Task.isCancelled { testResult = "Connection succeeded." }
+            } catch ConnectionFailure.certificateRejected {
+                testResult = "Certificate verification failed. Confirm the server address, certificate expiry and SHA-256 fingerprint with the server administrator before replacing the pin."
             } catch {
                 if !Task.isCancelled { testResult = "Connection failed. Check the server address, credentials, and network." }
             }
             testInProgress = false
         }
         .onChange(of: model.customHTTPRendererKey) { _ in if !editing { loadSettings() } }
+        .alert("Review certificate trust", isPresented: $reviewingTrust) {
+            Button("Cancel", role: .cancel) {}
+            Button("Save connection", action: save)
+        } message: {
+            Text(trustReview)
+        }
+        .onChange(of: fields[declaration.originField]) { newOrigin in
+            if newOrigin != status?.fields[declaration.originField] {
+                pinEnabled = false
+                fingerprint = ""
+            }
+        }
         .onDisappear { secret = "" }
     }
 
@@ -88,7 +113,23 @@ struct DeviceCustomConnectionSettings: View {
             if fields[declaration.originField]?.lowercased().hasPrefix("http://") == true {
                 Toggle("Allow unencrypted access on this local network", isOn: $allowInsecureHTTP)
             }
-            Button("Save connection", action: save).accessibilityIdentifier("custom-connection.save")
+            if #available(iOS 18, *), fields[declaration.originField]?.lowercased().hasPrefix("https://") == true {
+                Toggle("Pin server certificate", isOn: $pinEnabled)
+                if pinEnabled {
+                    TextField("Leaf certificate SHA-256 fingerprint", text: $fingerprint)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled()
+                    Text("Get the fingerprint independently from the server administrator. When the certificate changes, verify its replacement here.")
+                        .font(.footnote)
+                }
+            }
+            if let error {
+                Text(error).foregroundStyle(.red).accessibilityIdentifier("connection.error")
+            }
+            Button("Save connection") {
+                error = validationMessage
+                guard error == nil else { return }
+                if pinEnabled || status?.certificatePin != nil { reviewingTrust = true } else { save() }
+            }.accessibilityIdentifier("custom-connection.save")
             if editing && status != nil {
                 Button("Cancel") { loadSettings(); editing = false; error = nil }
             }
@@ -130,8 +171,12 @@ struct DeviceCustomConnectionSettings: View {
     @ViewBuilder private func fieldEditor(_ field: CustomHTTPField) -> some View {
         switch field.type {
         case "secret":
-            SecureField(status?.hasCredential == true ? field.label + " (saved)" : field.label, text: $secret)
+            SecureField(canReuseCredential ? field.label + " (saved)" : field.label + " (required)", text: $secret)
                 .textInputAutocapitalization(.never).autocorrectionDisabled()
+            if !canReuseCredential {
+                Text("Enter the bearer token for this server on this device.")
+                    .font(.footnote)
+            }
         case "toggle":
             Toggle(field.label, isOn: Binding(get: { fields[field.id] == "true" },
                                              set: { fields[field.id] = $0 ? "true" : "false" }))
@@ -160,19 +205,49 @@ struct DeviceCustomConnectionSettings: View {
             if field.type == "toggle" { fields[field.id] = "false" }
             if field.type == "choice" { fields[field.id] = field.options?.first }
         }
+        pinEnabled = existing?.certificatePin != nil
+        fingerprint = existing?.certificatePin?.fingerprint ?? ""
         secret = ""
         allowInsecureHTTP = existing?.allowInsecureHTTP ?? false
     }
 
+    private var trustReview: String {
+        let server = fields[declaration.originField] ?? ""
+        if pinEnabled { return "Trust the certificate with SHA-256 fingerprint \(fingerprint) for \(server)? Changes require new screen approval." }
+        return "Remove the certificate pin and use system trust for \(server)? Changes require new screen approval."
+    }
+
+    private var validationMessage: String? {
+        for field in declaration.fields {
+            if field.type == "secret" && secret.isEmpty {
+                if !canReuseCredential { return "Enter \(field.label) for this server before saving." }
+                continue
+            }
+            let value = field.type == "secret" ? secret : fields[field.id] ?? ""
+            do { try field.validate(value) } catch {
+                if field.id == declaration.originField {
+                    return "Enter the server address with its scheme and without an operation path."
+                }
+                return "Check the value for \(field.label) before saving."
+            }
+        }
+        if pinEnabled && (try? ReviewedCertificatePin(origin: server, fingerprint: fingerprint)) == nil {
+            return "Check the HTTPS server address and enter its 64-digit SHA-256 fingerprint."
+        }
+        return nil
+    }
+
     private func save() {
         do {
+            let pin = pinEnabled ? try ReviewedCertificatePin(origin: fields[declaration.originField] ?? "", fingerprint: fingerprint) : nil
             try model.saveCustomConnection(use, owner: owner, fields: fields, secret: secret.isEmpty ? nil : secret,
-                                           allowInsecureHTTP: allowInsecureHTTP && fields[declaration.originField]?.lowercased().hasPrefix("http://") == true)
+                                           allowInsecureHTTP: allowInsecureHTTP && fields[declaration.originField]?.lowercased().hasPrefix("http://") == true,
+                                           certificatePin: pin)
             loadSettings()
             editing = false
             error = nil
         } catch {
-            self.error = "Check the server address and required connection fields, then try again."
+            self.error = "Connection could not be saved. Check the server address and local-network setting, then try again."
         }
     }
 

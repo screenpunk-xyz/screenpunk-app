@@ -6,9 +6,14 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
     public struct Status: Sendable, Equatable {
         public let fields: [String: String]
         public let generation: UUID
+        public let certificatePin: ReviewedCertificatePin?
         public let hasCredential: Bool
         public let allowInsecureHTTP: Bool
         public let origin: String
+
+        public func canReuseCredential(for server: String, allowInsecureHTTP: Bool) -> Bool {
+            hasCredential && (try? CustomHTTPDestination.origin(server, allowInsecureHTTP: allowInsecureHTTP)) == origin
+        }
     }
 
     public struct SavedService: Identifiable, Sendable, Equatable {
@@ -20,6 +25,7 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
     private struct Service: Codable, Equatable {
         var definition: CustomHTTPDeclaration
         var fields: [String: String]
+        var certificatePin: ReviewedCertificatePin?
         var secret: String?
         var origin: String
         var allowInsecureHTTP: Bool
@@ -32,7 +38,7 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
         }
 
         var status: Status {
-            .init(fields: fields, generation: generation, hasCredential: secret != nil, allowInsecureHTTP: allowInsecureHTTP, origin: origin)
+            .init(fields: fields, generation: generation, certificatePin: certificatePin, hasCredential: secret != nil, allowInsecureHTTP: allowInsecureHTTP, origin: origin)
         }
     }
 
@@ -51,6 +57,7 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
 
     fileprivate struct Authorized: Sendable {
         var origin: String
+        var certificatePin: ReviewedCertificatePin?
         var secret: String?
         var fields: [String: String]
         var generation: UUID
@@ -78,7 +85,7 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
     }
 
     public func save(owner: String, declaration: CustomHTTPDeclaration, fields: [String: String],
-                     secret: String? = nil, allowInsecureHTTP: Bool) throws {
+                     secret: String? = nil, allowInsecureHTTP: Bool, certificatePin: ReviewedCertificatePin? = nil) throws {
         guard !owner.isEmpty else { throw ConnectionFailure.permissionRequired }
         try declaration.validate(alias: "customConnection")
         let visible = declaration.fields.filter { $0.type != "secret" }
@@ -89,6 +96,12 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
             try field.validate(value)
         }
         let origin = try CustomHTTPDestination.origin(originValue, allowInsecureHTTP: allowInsecureHTTP)
+
+        if let certificatePin {
+            guard #available(iOS 18, macOS 15, *), certificatePin.origin == origin else {
+                throw ConnectionFailure.validationFailed
+            }
+        }
 
         Self.lock.lock(); defer { Self.lock.unlock() }
         var accounts = try load()
@@ -110,12 +123,12 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
 
         let allowsHTTP = origin.hasPrefix("http://") && allowInsecureHTTP
         if let previous, previous.matches(declaration), previous.origin == origin,
-           previous.fields == fields, previous.secret == token, previous.allowInsecureHTTP == allowsHTTP {
+           previous.certificatePin == certificatePin, previous.fields == fields, previous.secret == token, previous.allowInsecureHTTP == allowsHTTP {
             return
         }
         guard previous != nil || account.services.count < 64 else { throw ConnectionFailure.sizeLimit }
         Self.removeApprovals(for: declaration.id, from: &account)
-        account.services[declaration.id] = .init(definition: declaration, fields: fields, secret: token, origin: origin,
+        account.services[declaration.id] = .init(definition: declaration, fields: fields, certificatePin: certificatePin, secret: token, origin: origin,
                                                  allowInsecureHTTP: allowsHTTP, generation: UUID())
         accounts[owner] = account
         try persist(accounts)
@@ -211,7 +224,7 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
         guard let account = try load()[owner], let service = account.services[declaration.id], service.matches(declaration),
               let approval = account.approvals[screenID]?[alias], approval.declarationDigest == declarationDigest,
               approval.serviceGeneration == service.generation else { throw ConnectionFailure.permissionRequired }
-        return .init(origin: service.origin, secret: service.secret, fields: service.fields, generation: approval.generation)
+        return .init(origin: service.origin, certificatePin: service.certificatePin, secret: service.secret, fields: service.fields, generation: approval.generation)
     }
 
     private func load() throws -> [String: Account] {
@@ -236,7 +249,7 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
     }
 }
 
-private enum CustomHTTPDestination {
+enum CustomHTTPDestination {
     static func origin(_ value: String, allowInsecureHTTP: Bool) throws -> String {
         guard var parts = URLComponents(string: value), let scheme = parts.scheme?.lowercased(),
               let host = parts.host, !host.isEmpty, parts.user == nil, parts.password == nil,
@@ -323,7 +336,11 @@ public struct CustomHTTPDeviceRuntime: Sendable {
         try checkApproval(alias: alias, declaration: declaration, generation: approval.generation)
         var headers = ["Accept": "application/json"]
         if let token = approval.secret { headers["Authorization"] = "Bearer \(token)" }
-        let result = try await transport.send(.init(url: url, method: "GET", headers: headers, body: nil,
+        // A fresh session binds every TLS challenge and pooled connection to this one pin.
+        let requestTransport: any HTTPTransport = approval.certificatePin.map {
+            URLSessionHTTPTransport(privateRequests: true, certificatePin: $0)
+        } ?? transport
+        let result = try await requestTransport.send(.init(url: url, method: "GET", headers: headers, body: nil,
                                                     timeout: TimeInterval(ConnectionBounds.httpTimeoutSeconds),
                                                     maxBytes: ConnectionBounds.httpResponseBytes))
         try Task.checkCancellation()
