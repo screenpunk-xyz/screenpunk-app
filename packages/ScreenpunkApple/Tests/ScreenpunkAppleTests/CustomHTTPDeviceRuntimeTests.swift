@@ -88,6 +88,16 @@ final class CustomHTTPDeviceRuntimeTests: XCTestCase {
         XCTAssertTrue(vault.isApproved(owner: owner, screenID: screenID, manifest: manifest, alias: alias))
     }
 
+    func testApprovalFromOldPromptCannotGrantAccessToReplacementServer() throws {
+        let (vault, manifest, declaration) = try configured()
+        let old = try XCTUnwrap(vault.status(owner: owner, declaration: declaration))
+        try vault.save(owner: owner, declaration: declaration, fields: ["server": "https://replacement.test", "tag": "weekly"],
+                       secret: "fixture-token", allowInsecureHTTP: false)
+        XCTAssertThrowsError(try vault.approve(owner: owner, screenID: screenID, manifest: manifest,
+                                               alias: alias, expectedGeneration: old.generation))
+        XCTAssertFalse(vault.isApproved(owner: owner, screenID: screenID, manifest: manifest, alias: alias))
+    }
+
     func testFixedGETAddsDeclaredQueryAndNativeBearerOnly() async throws {
         let (vault, manifest, _) = try configured()
         let transport = ProbeTransport(.init(status: 200, body: Data("{\"queue\":3}".utf8)))

@@ -5,6 +5,7 @@ import ScreenpunkCore
 public final class CustomHTTPDeviceVault: @unchecked Sendable {
     public struct Status: Sendable, Equatable {
         public let fields: [String: String]
+        public let generation: UUID
         public let hasCredential: Bool
         public let allowInsecureHTTP: Bool
         public let origin: String
@@ -31,7 +32,7 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
         }
 
         var status: Status {
-            .init(fields: fields, hasCredential: secret != nil, allowInsecureHTTP: allowInsecureHTTP, origin: origin)
+            .init(fields: fields, generation: generation, hasCredential: secret != nil, allowInsecureHTTP: allowInsecureHTTP, origin: origin)
         }
     }
 
@@ -125,7 +126,7 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
         return (try? authorized(owner: owner, screenID: screenID, alias: alias, declaration: declaration)) != nil
     }
 
-    public func approve(owner: String, screenID: String, manifest: DashboardManifest, alias: String) throws {
+    public func approve(owner: String, screenID: String, manifest: DashboardManifest, alias: String, expectedGeneration: UUID? = nil) throws {
         guard !screenID.isEmpty, let declaration = manifest.connections.first(where: { $0.alias == alias })?.customHTTP else {
             throw ConnectionFailure.permissionRequired
         }
@@ -136,6 +137,7 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
         guard var account = accounts[owner], let service = account.services[declaration.id], service.matches(declaration) else {
             throw ConnectionFailure.permissionRequired
         }
+        guard expectedGeneration == nil || service.generation == expectedGeneration else { throw ConnectionFailure.permissionRequired }
         let existing = account.approvals[screenID]?[alias]
         if let existing, existing.declarationDigest == declarationDigest, existing.serviceGeneration == service.generation { return }
         guard account.approvals[screenID] != nil || account.approvals.count < 256 else {

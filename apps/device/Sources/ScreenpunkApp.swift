@@ -212,21 +212,9 @@ struct DeviceRootView: View {
                     .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { weatherDestination = nil } } }
             }
         }
-        .sheet(isPresented: Binding(
-            get: { model.customConnectionPrompt != nil && scenePhase == .active && !model.settingsOpen &&
-                model.screenDataPrompt == nil && galleryIntro == nil && weatherDestination == nil &&
-                !onboardingHelpInFlight && !settingsCoverPresented && !speech.recording },
-            set: { if !$0 { model.dismissCustomConnectionPrompt() } }
-        )) {
-            if let prompt = model.customConnectionPrompt {
-                NavigationStack {
-                    DeviceCustomConnectionSettings(model: model, use: prompt.use, owner: prompt.owner, allowsApproval: true)
-                        .toolbar { ToolbarItem(placement: .confirmationAction) {
-                            Button(model.customConnectionApproved(prompt.use) ? "Done" : "Don’t Allow") { model.dismissCustomConnectionPrompt() }
-                        } }
-                }
-            }
-        }
+        .modifier(CustomConnectionAccessModal(model: model, isHost: scenePhase == .active && !model.settingsOpen &&
+            model.screenDataPrompt == nil && galleryIntro == nil && weatherDestination == nil &&
+            !onboardingHelpInFlight && !settingsCoverPresented && !speech.recording))
         .modifier(ScreenDataConsentAlert(model: model, isHost: scenePhase == .active && !model.settingsOpen &&
             galleryIntro == nil && weatherDestination == nil && !onboardingHelpInFlight && !settingsCoverPresented && !speech.recording))
         .alert("Weather location", isPresented: Binding(
@@ -1140,6 +1128,59 @@ enum DeviceSettingsPage: String, Hashable {
         }
     }
 }
+private struct CustomConnectionAccessModal: ViewModifier {
+    @ObservedObject var model: DeviceModel
+    let isHost: Bool
+    @State private var detailsID: UUID?
+
+    private var prompt: DeviceModel.CustomConnectionPrompt? { isHost ? model.customConnectionPrompt : nil }
+
+    func body(content: Content) -> some View {
+        content
+            .accessibilityHidden(prompt != nil)
+            .allowsHitTesting(prompt == nil)
+            .overlay {
+                if let prompt {
+                    ZStack {
+                        Color.black.opacity(0.5).ignoresSafeArea()
+                            .onTapGesture { model.customConnectionPrompt = nil }
+                            .accessibilityHidden(true)
+                        VStack(spacing: 16) {
+                            Text("Connection access").font(.headline)
+                            Text("“\(prompt.use.screen.displayName)” needs your approval to use “\(prompt.use.declaration.label)”.")
+                            if let origin = prompt.status?.origin ?? model.customConnectionProposal(prompt.use)?.fields[prompt.use.declaration.originField] {
+                                Text(verbatim: origin).font(.body.monospaced()).fixedSize(horizontal: false, vertical: true)
+                            }
+                            ForEach(prompt.use.declaration.operations, id: \.name) { operation in
+                                Text(verbatim: operation.method + " " + operation.path)
+                            }
+                            if prompt.status != nil {
+                                Button("Approve") { model.approveCustomConnectionPrompt(prompt) }.buttonStyle(.borderedProminent)
+                            }
+                            Button("Show Details") { detailsID = prompt.id }.buttonStyle(.bordered)
+                        }
+                        .multilineTextAlignment(.center).padding(24)
+                        .frame(maxWidth: 420).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
+                        .padding().accessibilityAddTraits(.isModal)
+                        .accessibilityAction(.escape) { model.customConnectionPrompt = nil }
+                    }
+                }
+            }
+            .sheet(isPresented: Binding(get: { prompt != nil && detailsID == prompt?.id }, set: { presented in
+                if !presented { detailsID = nil }
+            })) {
+                if let prompt {
+                    NavigationStack {
+                        DeviceCustomConnectionSettings(model: model, use: prompt.use, owner: prompt.owner, allowsApproval: true)
+                            .toolbar { ToolbarItem(placement: .confirmationAction) {
+                                Button("Done") { detailsID = nil; model.customConnectionPrompt = nil }
+                            } }
+                    }
+                }
+            }
+    }
+}
+
 private struct ScreenDataConsentAlert: ViewModifier {
     @ObservedObject var model: DeviceModel
     let isHost: Bool

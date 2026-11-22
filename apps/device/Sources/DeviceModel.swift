@@ -1653,6 +1653,7 @@ import ScreenpunkLocalTransport
         let id = UUID()
         let owner: String
         let use: CustomConnectionUse
+        let status: CustomHTTPDeviceVault.Status?
     }
     @Published var customConnectionPrompt: CustomConnectionPrompt?
 
@@ -1662,17 +1663,20 @@ import ScreenpunkLocalTransport
               let use = customConnectionUses().first(where: { $0.alias == alias && $0.screen.revision == revision }),
               !customConnectionApproved(use),
               customHTTPVault.shouldOfferAccess(owner: owner, screenID: use.screen.id, alias: alias, declaration: use.declaration) else { return }
-        customConnectionPrompt = .init(owner: owner, use: use)
+        customConnectionPrompt = .init(owner: owner, use: use, status: customConnectionStatus(use.declaration))
     }
 
-    func dismissCustomConnectionPrompt() {
-        guard let prompt = customConnectionPrompt else { return }
-        if (try? requireCurrentCustomConnection(prompt.use, owner: prompt.owner)) != nil,
-           !customConnectionApproved(prompt.use) {
-            try? customHTTPVault.deny(owner: prompt.owner, screenID: prompt.use.screen.id,
-                                     alias: prompt.use.alias, declaration: prompt.use.declaration)
-        }
-        customConnectionPrompt = nil
+    func approveCustomConnectionPrompt(_ prompt: CustomConnectionPrompt) {
+        guard customConnectionPrompt?.id == prompt.id, screen?.id == prompt.use.screen.id,
+              screen?.revision == prompt.use.screen.revision, let status = prompt.status else { return }
+        defer { customConnectionPrompt = nil }
+        do {
+            try requireCurrentCustomConnection(prompt.use, owner: prompt.owner)
+            try customHTTPVault.approve(owner: prompt.owner, screenID: prompt.use.screen.id,
+                                        manifest: prompt.use.manifest, alias: prompt.use.alias,
+                                        expectedGeneration: status.generation)
+            refreshCustomConnections()
+        } catch { message = "Connection access could not be approved. Review the current connection in Settings." }
     }
 
     private let customHTTPVault = CustomHTTPDeviceVault()
