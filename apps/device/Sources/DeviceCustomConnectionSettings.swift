@@ -28,6 +28,14 @@ struct DeviceCustomConnectionSettings: View {
 
     var body: some View {
         Form {
+            if allowsApproval && enteringSettings && model.customConnectionProposal(use) == nil {
+                Section("Requested screen access") {
+                    Text(use.screen.displayName)
+                    ForEach(declaration.operations, id: \.name) { operation in
+                        LabeledContent(operation.name, value: operation.method + " " + operation.path)
+                    }
+                }
+            }
             if let proposal = model.customConnectionProposal(use) {
                 Section("Suggested by your screen request") {
                     Text(use.screen.displayName)
