@@ -39,6 +39,55 @@ final class CustomHTTPDeviceRuntimeTests: XCTestCase {
         XCTAssertTrue(vault.savedServices(owner: owner).isEmpty)
     }
 
+    func testUnconfiguredReviewDoesNotSaveResolveOrSend() async throws {
+        let (_, manifest, declaration) = try configured()
+        let vault = CustomHTTPDeviceVault(store: MemoryCredentialStore())
+        struct NoResolution: DestinationResolver {
+            func addresses(for host: String) throws -> [String] {
+                XCTFail("DNS must not run before approval")
+                return []
+            }
+        }
+        actor Prompts { var count = 0; func add() { count += 1 } }
+        let prompts = Prompts()
+        let transport = ProbeTransport(.init(status: 200, body: Data("{}".utf8)))
+        let runtime = CustomHTTPDeviceRuntime(owner: owner, screenID: screenID, manifest: manifest,
+            vault: vault, transport: transport, resolver: NoResolution(), accessRequired: { _ in await prompts.add() })
+        do { _ = try await runtime.request(alias: alias, operation: "queue", parameters: ["limit":"3"]); XCTFail() }
+        catch { XCTAssertEqual(error as? ConnectionFailure, .permissionRequired) }
+        XCTAssertNil(vault.status(owner: owner, declaration: declaration))
+        XCTAssertTrue(vault.savedServices(owner: owner).isEmpty)
+        let sends = await transport.sends; let count = await prompts.count
+        XCTAssertEqual(sends, 0); XCTAssertEqual(count, 1)
+        try vault.deny(owner: owner, screenID: screenID, alias: alias, declaration: declaration)
+        XCTAssertNil(vault.status(owner: owner, declaration: declaration))
+        XCTAssertFalse(vault.shouldOfferAccess(owner: owner, screenID: screenID, alias: alias, declaration: declaration))
+    }
+
+    func testNativeReviewPrecedesAnyNetworkAndDenialSurvivesRuntimeRecreation() async throws {
+        let (vault, manifest, declaration) = try configured()
+        try vault.revoke(owner: owner, screenID: screenID, alias: alias)
+        actor Prompts { var count = 0; func add() { count += 1 } }
+        let prompts = Prompts()
+        let transport = ProbeTransport(.init(status: 200, body: Data("{}".utf8)))
+        let runtime = CustomHTTPDeviceRuntime(owner: owner, screenID: screenID, manifest: manifest,
+            vault: vault, transport: transport, accessRequired: { _ in await prompts.add() })
+        do { _ = try await runtime.request(alias: alias, operation: "queue", parameters: ["limit":"3"]); XCTFail() }
+        catch { XCTAssertEqual(error as? ConnectionFailure, .permissionRequired) }
+        let firstCount = await prompts.count
+        let sends = await transport.sends
+        XCTAssertEqual(firstCount, 1); XCTAssertEqual(sends, 0)
+        try vault.deny(owner: owner, screenID: screenID, alias: alias, declaration: declaration)
+        XCTAssertFalse(vault.shouldOfferAccess(owner: owner, screenID: screenID, alias: alias, declaration: declaration))
+        XCTAssertTrue(vault.shouldOfferAccess(owner: "other", screenID: screenID, alias: alias, declaration: declaration))
+        do { _ = try await runtime.request(alias: alias, operation: "queue", parameters: ["limit":"3"]); XCTFail() } catch {}
+        let deniedCount = await prompts.count
+        XCTAssertEqual(deniedCount, 1)
+        XCTAssertEqual(vault.status(owner: owner, declaration: declaration)?.origin, "https://example.test")
+        try vault.approve(owner: owner, screenID: screenID, manifest: manifest, alias: alias)
+        XCTAssertTrue(vault.isApproved(owner: owner, screenID: screenID, manifest: manifest, alias: alias))
+    }
+
     func testFixedGETAddsDeclaredQueryAndNativeBearerOnly() async throws {
         let (vault, manifest, _) = try configured()
         let transport = ProbeTransport(.init(status: 200, body: Data("{\"queue\":3}".utf8)))

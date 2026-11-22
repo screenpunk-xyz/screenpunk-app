@@ -94,17 +94,19 @@ public struct AuthoringResultV2: Codable, Sendable, Equatable {
     public var baseRevision: String?
     public var preferenceRevisions: [String: Int]
     public var operationID: String
+    public var connectionSetupProposals: [CustomHTTPSetupProposal]?
     public var screen: AuthoringScreenMutationV2?
     public var answer: String?
     public var preferenceMutations: [PreferenceMutationV1]?
     public var durablePreferenceAuthorization: DurablePreferenceAuthorizationV1?
-    public init(schemaVersion: Int = 2, requestID: String, inputDigest: String, baseRevision: String? = nil, preferenceRevisions: [String: Int], operationID: String, screen: AuthoringScreenMutationV2? = nil, answer: String? = nil, preferenceMutations: [PreferenceMutationV1]? = nil, durablePreferenceAuthorization: DurablePreferenceAuthorizationV1? = nil) {
-        self.schemaVersion = schemaVersion; self.requestID = requestID; self.inputDigest = inputDigest; self.baseRevision = baseRevision; self.preferenceRevisions = preferenceRevisions; self.operationID = operationID; self.screen = screen; self.answer = answer; self.preferenceMutations = preferenceMutations; self.durablePreferenceAuthorization = durablePreferenceAuthorization
+    public init(schemaVersion: Int = 2, requestID: String, inputDigest: String, baseRevision: String? = nil, preferenceRevisions: [String: Int], operationID: String, screen: AuthoringScreenMutationV2? = nil, connectionSetupProposals: [CustomHTTPSetupProposal]? = nil, answer: String? = nil, preferenceMutations: [PreferenceMutationV1]? = nil, durablePreferenceAuthorization: DurablePreferenceAuthorizationV1? = nil) {
+        self.schemaVersion = schemaVersion; self.requestID = requestID; self.inputDigest = inputDigest; self.baseRevision = baseRevision; self.preferenceRevisions = preferenceRevisions; self.operationID = operationID; self.screen = screen; self.connectionSetupProposals = connectionSetupProposals; self.answer = answer; self.preferenceMutations = preferenceMutations; self.durablePreferenceAuthorization = durablePreferenceAuthorization
     }
-    private enum CodingKeys: String, CodingKey { case schemaVersion,requestID,inputDigest,baseRevision,preferenceRevisions,operationID,screen,answer,preferenceMutations,durablePreferenceAuthorization }
+    private enum CodingKeys: String, CodingKey { case schemaVersion,requestID,inputDigest,baseRevision,preferenceRevisions,operationID,screen,connectionSetupProposals,answer,preferenceMutations,durablePreferenceAuthorization }
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(schemaVersion, forKey: .schemaVersion); try c.encode(requestID, forKey: .requestID); try c.encode(inputDigest, forKey: .inputDigest); try c.encode(baseRevision, forKey: .baseRevision); try c.encode(preferenceRevisions, forKey: .preferenceRevisions); try c.encode(operationID, forKey: .operationID)
+        try c.encodeIfPresent(connectionSetupProposals, forKey: .connectionSetupProposals)
         try c.encodeIfPresent(screen, forKey: .screen); try c.encodeIfPresent(answer, forKey: .answer); try c.encodeIfPresent(preferenceMutations, forKey: .preferenceMutations); try c.encodeIfPresent(durablePreferenceAuthorization, forKey: .durablePreferenceAuthorization)
     }
     public func legacyResult(screen: AuthoringScreen? = nil) -> AuthoringResultV1 {
@@ -114,7 +116,7 @@ public struct AuthoringResultV2: Codable, Sendable, Equatable {
 public struct AuthoringCapabilitiesV2: Codable, Sendable, Equatable {
     public var contractVersions: [String]
     public var features: [String]
-    public init(contractVersions: [String] = ["1","2"], features: [String] = ["asset-references-v2", "package-assets-v2", AuthoringContract.customHTTPFeature]) { self.contractVersions = contractVersions; self.features = features }
+    public init(contractVersions: [String] = ["1","2"], features: [String] = ["asset-references-v2", "package-assets-v2", AuthoringContract.customHTTPFeature, AuthoringContract.connectionPrefillFeature]) { self.contractVersions = contractVersions; self.features = features }
     public var supportsV2: Bool { contractVersions.contains("2") && features.contains("asset-references-v2") }
     public var supportsPackageAssets: Bool { supportsV2 && features.contains("package-assets-v2") }
 }

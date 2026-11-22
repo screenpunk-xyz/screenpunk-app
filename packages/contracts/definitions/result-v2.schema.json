@@ -664,6 +664,45 @@
         },
         "durablePreferenceAuthorization": {
           "$ref": "#/$defs/Authorization"
+        },
+        "connectionSetupProposals": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": {
+            "type": "object",
+            "properties": {
+              "version": {
+                "const": 1
+              },
+              "alias": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              },
+              "declaration": {
+                "type": "object"
+              },
+              "fields": {
+                "type": "object",
+                "minProperties": 1,
+                "maxProperties": 12,
+                "additionalProperties": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 512,
+                  "maxBytes": 512
+                }
+              }
+            },
+            "required": [
+              "version",
+              "alias",
+              "declaration",
+              "fields"
+            ],
+            "additionalProperties": false
+          }
         }
       },
       "required": [

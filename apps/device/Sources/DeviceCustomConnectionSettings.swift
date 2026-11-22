@@ -21,10 +21,25 @@ struct DeviceCustomConnectionSettings: View {
     private var credentialLabel: String? {
         declaration.fields.first(where: { $0.type == "secret" })?.label
     }
+    private var savedService: CustomHTTPDeviceVault.SavedService? {
+        model.savedCustomConnections.first { $0.id == declaration.id }
+    }
     private var enteringSettings: Bool { editing || status == nil }
 
     var body: some View {
         Form {
+            if let proposal = model.customConnectionProposal(use) {
+                Section("Suggested by your screen request") {
+                    Text(use.screen.displayName)
+                    LabeledContent("Proposed server", value: proposal.fields[declaration.originField] ?? "")
+                    ForEach(declaration.operations, id: \.name) { operation in
+                        LabeledContent(operation.name, value: operation.method + " " + operation.path)
+                    }
+                    if let savedService { LabeledContent("Currently saved server", value: savedService.origin) }
+                    Text(savedService == nil ? "Review these suggested settings. Nothing is saved or connected until you choose Save connection and allow screen access." : "Your saved settings are unchanged. Review the proposed server before editing. A different server requires credentials and new screen approval.")
+                        .font(.footnote)
+                }
+            }
             if enteringSettings {
                 setup
             } else if let status {
@@ -41,7 +56,7 @@ struct DeviceCustomConnectionSettings: View {
             }
         }
         .navigationTitle(declaration.label)
-        .disabled(owner != model.permissionOwner || model.accountOperationInProgress)
+        .disabled((try? model.requireCurrentCustomConnection(use, owner: owner)) == nil)
         .task(id: use.screen.revision) { loadSettings() }
         .task(id: testInProgress) {
             guard testInProgress else { return }
@@ -132,7 +147,7 @@ struct DeviceCustomConnectionSettings: View {
         let existing = model.customConnectionStatus(declaration)
         status = existing
         approved = model.customConnectionApproved(use)
-        fields = existing?.fields ?? [:]
+        fields = existing?.fields ?? model.customConnectionProposal(use)?.fields ?? [:]
         for field in declaration.fields where fields[field.id] == nil {
             if field.type == "toggle" { fields[field.id] = "false" }
             if field.type == "choice" { fields[field.id] = field.options?.first }

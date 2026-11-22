@@ -266,6 +266,7 @@ import ScreenpunkLocalTransport
 
     @Published private(set) var resolvedAgentName: String?
     private var cloudSupportsV2 = false
+    private var cloudSupportsConnectionPrefill = false
     private var cloudSupportsCustomHTTP = false
     @Published private(set) var localAgent: LocalAgentConfiguration?
     @Published private(set) var localSettings: LocalAgentSettingsModel?
@@ -1103,6 +1104,7 @@ import ScreenpunkLocalTransport
         let status: AgentStatus = try await cloud.call("api/device/status", authoringVersion: 2)
         guard status.profileID == activeProfile?.cloudBinding?.profileID else { throw DeviceError.message("The Cloud connection changed. Review your account connection.") }
         cloudAgentReady = status.agentReady; cloudSupportsV2 = status.authoringCapabilities?.supportsV2 == true
+        cloudSupportsConnectionPrefill = status.authoringCapabilities?.features.contains(AuthoringContract.connectionPrefillFeature) == true
         cloudSupportsCustomHTTP = status.authoringCapabilities?.features.contains("custom-http-v1") == true
         if cloudAgentReady { agentReady = true }
         let supportsSelectedPackage = cloudSupportsV2 && (!requiresPackageAssets || status.authoringCapabilities?.supportsPackageAssets == true)
@@ -1364,7 +1366,8 @@ import ScreenpunkLocalTransport
         let source = preparingV2 ? nil : screen.map { AuthoringScreen(title: $0.artifact.title, entry: $0.artifact.entry, files: $0.artifact.files.map { .init(path: $0.path, content: $0.content) }) }
         let supportsScreenData = route == .local || screenDataSocketID != nil
         let supportsCustomHTTP = preparingV2 && (route == .local || cloudSupportsCustomHTTP)
-        let request = AuthoringRequestV1(requestID: UUID().uuidString, createdAt: now, deadlineAt: now + 10 * 60 * 1000, designGuidance: AuthoringContract.designGuidance(supportsScreenData: supportsScreenData, supportsCustomHTTP: supportsCustomHTTP), runtime: AuthoringContract.runtime(supportsScreenData: supportsScreenData, supportsCustomHTTP: supportsCustomHTTP), services: services, preferences: library.preferences(profileID: profileID, deviceID: deviceID, screenID: screenID), context: .init(profileID: profileID, deviceID: deviceID, screenID: screenID, baseRevision: screen?.revision, userRequest: text, currentScreen: source, viewport: .init(width: size.width, height: size.height, scale: scale, orientation: size.width > size.height ? "landscape" : "portrait")), delivery: .init(route: route.rawValue))
+        let supportsConnectionPrefill = supportsCustomHTTP && route == .cloud && cloudSupportsConnectionPrefill
+        let request = AuthoringRequestV1(requestID: UUID().uuidString, createdAt: now, deadlineAt: now + 10 * 60 * 1000, designGuidance: AuthoringContract.designGuidance(supportsScreenData: supportsScreenData, supportsCustomHTTP: supportsCustomHTTP, supportsConnectionPrefill: supportsConnectionPrefill), runtime: AuthoringContract.runtime(supportsScreenData: supportsScreenData, supportsCustomHTTP: supportsCustomHTTP, supportsConnectionPrefill: supportsConnectionPrefill), services: services, preferences: library.preferences(profileID: profileID, deviceID: deviceID, screenID: screenID), context: .init(profileID: profileID, deviceID: deviceID, screenID: screenID, baseRevision: screen?.revision, userRequest: text, currentScreen: source, viewport: .init(width: size.width, height: size.height, scale: scale, orientation: size.width > size.height ? "landscape" : "portrait")), delivery: .init(route: route.rawValue))
         return preparingV2 ? request : try AuthoringContract.seal(request)
     }
     private func measureRequestApply(_ requestID: String, _ apply: () throws -> ApplicationReceiptV1) rethrows -> ApplicationReceiptV1 {
@@ -1646,6 +1649,32 @@ import ScreenpunkLocalTransport
         let alias: String
         let declaration: CustomHTTPDeclaration
     }
+    struct CustomConnectionPrompt: Identifiable {
+        let id = UUID()
+        let owner: String
+        let use: CustomConnectionUse
+    }
+    @Published var customConnectionPrompt: CustomConnectionPrompt?
+
+    private func offerCustomConnectionAccess(alias: String, owner: String, revision: String) {
+        guard !settingsOpen, !accountOperationInProgress, permissionOwner == owner, screen?.revision == revision,
+              customConnectionPrompt == nil,
+              let use = customConnectionUses().first(where: { $0.alias == alias && $0.screen.revision == revision }),
+              !customConnectionApproved(use),
+              customHTTPVault.shouldOfferAccess(owner: owner, screenID: use.screen.id, alias: alias, declaration: use.declaration) else { return }
+        customConnectionPrompt = .init(owner: owner, use: use)
+    }
+
+    func dismissCustomConnectionPrompt() {
+        guard let prompt = customConnectionPrompt else { return }
+        if (try? requireCurrentCustomConnection(prompt.use, owner: prompt.owner)) != nil,
+           !customConnectionApproved(prompt.use) {
+            try? customHTTPVault.deny(owner: prompt.owner, screenID: prompt.use.screen.id,
+                                     alias: prompt.use.alias, declaration: prompt.use.declaration)
+        }
+        customConnectionPrompt = nil
+    }
+
     private let customHTTPVault = CustomHTTPDeviceVault()
     private(set) var customHTTP: CustomHTTPDeviceRuntime?
     @Published private(set) var customHTTPRendererKey = ""
@@ -1664,6 +1693,11 @@ import ScreenpunkLocalTransport
     var savedCustomConnections: [CustomHTTPDeviceVault.SavedService] {
         guard !permissionOwner.isEmpty else { return [] }
         return customHTTPVault.savedServices(owner: permissionOwner)
+    }
+
+    func customConnectionProposal(_ use: CustomConnectionUse) -> CustomHTTPSetupProposal? {
+        library?.connectionSetupProposal(screenID: use.screen.id, revision: use.screen.revision,
+                                         alias: use.alias, declaration: use.declaration)
     }
 
     func customConnectionStatus(_ declaration: CustomHTTPDeclaration) -> CustomHTTPDeviceVault.Status? {
@@ -1689,7 +1723,7 @@ import ScreenpunkLocalTransport
         if approved {
             try customHTTPVault.approve(owner: owner, screenID: use.screen.id, manifest: use.manifest, alias: use.alias)
         } else {
-            try customHTTPVault.revoke(owner: owner, screenID: use.screen.id, alias: use.alias)
+            try customHTTPVault.deny(owner: owner, screenID: use.screen.id, alias: use.alias, declaration: use.declaration)
         }
         refreshCustomConnections()
     }
@@ -1712,7 +1746,7 @@ import ScreenpunkLocalTransport
         refreshCustomConnections()
     }
 
-    private func requireCurrentCustomConnection(_ use: CustomConnectionUse, owner: String) throws {
+    func requireCurrentCustomConnection(_ use: CustomConnectionUse, owner: String) throws {
         guard !accountOperationInProgress, !owner.isEmpty, owner == permissionOwner,
               customConnectionUses(serviceID: use.declaration.id).contains(where: {
                   $0.screen.id == use.screen.id && $0.screen.revision == use.screen.revision && $0.alias == use.alias
@@ -2385,6 +2419,7 @@ import ScreenpunkLocalTransport
         publicReads?.cancel(); publicReads = nil; publicReadSessionKey = ""
         if let previous = homeAssistant { Task { await previous.cancelPending() } }
         homeAssistant = nil; customHTTP = nil; customHTTPRendererKey = ""; manifest = nil; assets = nil; screen = nil; activeProfile = nil
+        cloudSupportsConnectionPrefill = false
         cloudSupportsCustomHTTP = false
         library = nil; cloudAuthoring = nil; localAuthoring = nil; localTransport = nil; cloudAuthoringV2 = nil; localAuthoringV2 = nil; localTransportV2 = nil; localTransportAuthoringProfileID = nil; cloudAgentReady = false; cloudSupportsV2 = false; pendingID = nil; pendingScreenID = nil; consumedID = nil
         cancelledLocally = []; inventorySignature = nil
@@ -2397,6 +2432,10 @@ import ScreenpunkLocalTransport
     func refreshConnections() { refreshScreen() }
     private func refreshScreen() {
         defer {
+            if let prompt = customConnectionPrompt,
+               prompt.owner != permissionOwner || prompt.use.screen.revision != screen?.revision {
+                customConnectionPrompt = nil
+            }
             updateTemporaryHomeAssistant()
             refreshPublicReads()
             refreshScreenDataPermissions()
@@ -2449,7 +2488,10 @@ import ScreenpunkLocalTransport
                 let scope = HomeAssistantDeviceRuntime.Scope(owner: owner, revision: screen.revision, dashboardId: parsed.dashboardId)
                 homeAssistant = HomeAssistantDeviceRuntime(vault: HomeAssistantDeviceVault(), scope: { scope })
                 if parsed.connections.contains(where: { $0.customHTTP != nil }) {
-                    customHTTP = CustomHTTPDeviceRuntime(owner: owner, screenID: screen.id, manifest: parsed, vault: customHTTPVault)
+                    customHTTP = CustomHTTPDeviceRuntime(owner: owner, screenID: screen.id, manifest: parsed, vault: customHTTPVault,
+                        accessRequired: { [weak self] alias in
+                            await self?.offerCustomConnectionAccess(alias: alias, owner: owner, revision: screen.revision)
+                        })
                 }
             }
         } catch { assets = nil; message = "Could not load this screen. Use Settings to restore its previous version." }

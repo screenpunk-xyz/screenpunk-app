@@ -45,6 +45,7 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
     private struct Account: Codable {
         var services: [String: Service] = [:]
         var approvals: [String: [String: Approval]] = [:]
+        var denials: [String: [String: String]]?
     }
 
     fileprivate struct Authorized: Sendable {
@@ -144,6 +145,7 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
         guard existing != nil || dashboard.count < 32 else { throw ConnectionFailure.sizeLimit }
         dashboard[alias] = .init(serviceID: declaration.id, declarationDigest: declarationDigest, serviceGeneration: service.generation, generation: UUID())
         account.approvals[screenID] = dashboard
+        account.denials?[screenID]?[alias] = nil
         accounts[owner] = account
         try persist(accounts)
     }
@@ -154,6 +156,33 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
         guard var account = accounts[owner], var dashboard = account.approvals[screenID],
               dashboard.removeValue(forKey: alias) != nil else { return }
         account.approvals[screenID] = dashboard.isEmpty ? nil : dashboard
+        accounts[owner] = account
+        try persist(accounts)
+    }
+
+    public func shouldOfferAccess(owner: String, screenID: String, alias: String, declaration: CustomHTTPDeclaration) -> Bool {
+        guard !owner.isEmpty, let digest = try? Self.digest(declaration) else { return false }
+        Self.lock.lock(); defer { Self.lock.unlock() }
+        guard let accounts = try? load() else { return false }
+        let account = accounts[owner]
+        let scope = digest + "/" + (account?.services[declaration.id]?.generation.uuidString ?? "unconfigured")
+        return account?.denials?[screenID]?[alias] != scope
+    }
+
+    public func deny(owner: String, screenID: String, alias: String, declaration: CustomHTTPDeclaration) throws {
+        guard !owner.isEmpty, !screenID.isEmpty else { throw ConnectionFailure.permissionRequired }
+        try declaration.validate(alias: alias)
+        let digest = try Self.digest(declaration)
+        Self.lock.lock(); defer { Self.lock.unlock() }
+        var accounts = try load()
+        var account = accounts[owner] ?? Account()
+        guard (account.denials?.count ?? 0) < 256 || account.denials?[screenID] != nil else { throw ConnectionFailure.sizeLimit }
+        var denials = account.denials ?? [:]
+        var screen = denials[screenID] ?? [:]
+        guard screen.count < 32 || screen[alias] != nil else { throw ConnectionFailure.sizeLimit }
+        screen[alias] = digest + "/" + (account.services[declaration.id]?.generation.uuidString ?? "unconfigured")
+        denials[screenID] = screen; account.denials = denials
+        account.approvals[screenID]?[alias] = nil
         accounts[owner] = account
         try persist(accounts)
     }
@@ -254,16 +283,19 @@ public struct CustomHTTPDeviceRuntime: Sendable {
     private let vault: CustomHTTPDeviceVault
     private let transport: any HTTPTransport
     private let resolver: any DestinationResolver
+    private let accessRequired: (@Sendable (String) async -> Void)?
 
     public init(owner: String, screenID: String, manifest: DashboardManifest, vault: CustomHTTPDeviceVault = .init(),
                 transport: any HTTPTransport = URLSessionHTTPTransport(privateRequests: true),
-                resolver: any DestinationResolver = LiteralOrResolvedDestinationResolver()) {
+                resolver: any DestinationResolver = LiteralOrResolvedDestinationResolver(),
+                accessRequired: (@Sendable (String) async -> Void)? = nil) {
         self.owner = owner
         self.screenID = screenID
         self.manifest = manifest
         self.vault = vault
         self.transport = transport
         self.resolver = resolver
+        self.accessRequired = accessRequired
     }
 
     func declares(alias: String) -> Bool {
@@ -276,6 +308,12 @@ public struct CustomHTTPDeviceRuntime: Sendable {
             throw ConnectionFailure.permissionRequired
         }
         try declaration.validate(alias: alias)
+        guard vault.isApproved(owner: owner, screenID: screenID, manifest: manifest, alias: alias) else {
+            if vault.shouldOfferAccess(owner: owner, screenID: screenID, alias: alias, declaration: declaration) {
+                await accessRequired?(alias)
+            }
+            throw ConnectionFailure.permissionRequired
+        }
         let approval = try vault.authorized(owner: owner, screenID: screenID, alias: alias, declaration: declaration)
         let query = try Self.query(operation: operation, fields: approval.fields, parameters: parameters)
         let url = try CustomHTTPDestination.url(origin: approval.origin, path: operation.path, query: query, resolver: resolver)

@@ -35,19 +35,23 @@ public enum AuthoringContract {
     public static let resultMetadataBytes = 131072
     public static let resultBytes = 393216
 
+    public static let connectionPrefillFeature = "custom-http-prefill-v1"
+    public static let connectionPrefillRule = "When runtime.features includes custom-http-prefill-v1 and schemaVersion is 2, complete_request may include connectionSetupProposals: [{version:1,alias,declaration,fields}]. Write manifest.json in the same result; declaration must exactly equal that alias’s customHTTP declaration. fields contains only nonsecret declared field IDs and string values validated by their types; include the origin URL. Never include credentials, credential references, tokens, headers, or private-network approvals. These are device-local form suggestions for this request’s device and screen, never saved settings or permission. Existing settings remain unchanged. The user reviews setup and access in native UI before any request."
     public static let customHTTPFeature = "custom-http-v1"
 
-    public static func designGuidance(supportsScreenData: Bool, supportsCustomHTTP: Bool = false) -> AuthoringDesignGuidanceV1 {
+    public static func designGuidance(supportsScreenData: Bool, supportsCustomHTTP: Bool = false, supportsConnectionPrefill: Bool = false) -> AuthoringDesignGuidanceV1 {
         var guidance = designGuidance
         if supportsScreenData { guidance.rules += definition.screenData?.rules ?? [] }
         if supportsCustomHTTP { guidance.rules += definition.customHTTP?.rules ?? [] }
+        if supportsConnectionPrefill { guidance.rules.append(connectionPrefillRule) }
         return guidance
     }
 
-    public static func runtime(supportsScreenData: Bool, supportsCustomHTTP: Bool = false) -> AuthoringRuntimeV1 {
+    public static func runtime(supportsScreenData: Bool, supportsCustomHTTP: Bool = false, supportsConnectionPrefill: Bool = false) -> AuthoringRuntimeV1 {
         var runtime = runtime
         if supportsScreenData { runtime.features += definition.screenData?.features ?? [] }
         if supportsCustomHTTP { runtime.features.append(customHTTPFeature) }
+        if supportsConnectionPrefill { runtime.features.append(connectionPrefillFeature) }
         return runtime
     }
 
@@ -83,9 +87,11 @@ public enum AuthoringContract {
         guard request.deadlineAt > request.createdAt else { throw AuthoringContractError("deadline must follow creation") }
         let screenData = definition.screenData?.features.allSatisfy(request.runtime.features.contains) == true
         let customHTTP = request.runtime.features.contains(customHTTPFeature)
+        let prefill = request.runtime.features.contains(connectionPrefillFeature)
+        guard !prefill || customHTTP else { throw AuthoringContractError("prefill requires custom HTTP") }
         let browser = request.runtime == browserRuntime
-        guard request.runtime == (browser ? browserRuntime : runtime(supportsScreenData: screenData, supportsCustomHTTP: customHTTP)),
-              request.designGuidance == (browser ? browserDesignGuidance : designGuidance(supportsScreenData: screenData, supportsCustomHTTP: customHTTP)) else { throw AuthoringContractError("unsupported guidance/runtime definition") }
+        guard request.runtime == (browser ? browserRuntime : runtime(supportsScreenData: screenData, supportsCustomHTTP: customHTTP, supportsConnectionPrefill: prefill)),
+              request.designGuidance == (browser ? browserDesignGuidance : designGuidance(supportsScreenData: screenData, supportsCustomHTTP: customHTTP, supportsConnectionPrefill: prefill)) else { throw AuthoringContractError("unsupported guidance/runtime definition") }
         if browser, !request.services.isEmpty || !request.preferences.isEmpty {
             throw AuthoringContractError("browser runtime requires empty services and preferences")
         }

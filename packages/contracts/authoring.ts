@@ -33,13 +33,13 @@ export function browserAuthoringDesignGuidance(): AuthoringDesignGuidanceV1 {
 function isBrowserRuntime(runtime: AuthoringRuntimeV1): boolean {
   return canonicalJSON(runtime) === canonicalJSON(AUTHORING_DEFINITION.browser.runtime);
 }
-export function authoringRuntime(supportsScreenData: boolean, supportsCustomHTTP = false): AuthoringRuntimeV1 {
+export function authoringRuntime(supportsScreenData: boolean, supportsCustomHTTP = false, supportsConnectionPrefill = false): AuthoringRuntimeV1 {
   const { runtime, screenData } = AUTHORING_DEFINITION;
-  return { ...runtime, features: [...runtime.features, ...(supportsScreenData ? screenData.features : []), ...(supportsCustomHTTP ? [CUSTOM_HTTP_FEATURE] : [])] };
+  return { ...runtime, features: [...runtime.features, ...(supportsScreenData ? screenData.features : []), ...(supportsCustomHTTP ? [CUSTOM_HTTP_FEATURE] : []), ...(supportsConnectionPrefill ? [CONNECTION_PREFILL_FEATURE] : [])] };
 }
-export function authoringDesignGuidance(supportsScreenData: boolean, supportsCustomHTTP = false): AuthoringDesignGuidanceV1 {
+export function authoringDesignGuidance(supportsScreenData: boolean, supportsCustomHTTP = false, supportsConnectionPrefill = false): AuthoringDesignGuidanceV1 {
   const { designGuidance, screenData } = AUTHORING_DEFINITION;
-  return { ...designGuidance, rules: [...designGuidance.rules, ...(supportsScreenData ? screenData.rules : []), ...(supportsCustomHTTP ? AUTHORING_DEFINITION.customHTTP.rules : [])] };
+  return { ...designGuidance, rules: [...designGuidance.rules, ...(supportsScreenData ? screenData.rules : []), ...(supportsCustomHTTP ? AUTHORING_DEFINITION.customHTTP.rules : []), ...(supportsConnectionPrefill ? [CONNECTION_PREFILL_RULE] : [])] };
 }
 function inlineSchema(schema: JSONSchema, defs: JSONSchema = schema.$defs): JSONSchema {
   if (schema.$ref) return inlineSchema(defs[schema.$ref.split("/").pop()!], defs);
@@ -127,6 +127,8 @@ function screenBounds(screen: AuthoringScreen): void {
   const manifest = screen.files.find(f => f.path === "manifest.json");
   if (manifest) checkAuthoringManifestScreenData(manifest.content);
 }
+export const CONNECTION_PREFILL_FEATURE = "custom-http-prefill-v1";
+export const CONNECTION_PREFILL_RULE = "When runtime.features includes custom-http-prefill-v1 and schemaVersion is 2, complete_request may include connectionSetupProposals: [{version:1,alias,declaration,fields}]. Write manifest.json in the same result; declaration must exactly equal that alias’s customHTTP declaration. fields contains only nonsecret declared field IDs and string values validated by their types; include the origin URL. Never include credentials, credential references, tokens, headers, or private-network approvals. These are device-local form suggestions for this request’s device and screen, never saved settings or permission. Existing settings remain unchanged. The user reviews setup and access in native UI before any request.";
 export const CUSTOM_HTTP_FEATURE = "custom-http-v1";
 const customReservedAliases = new Set(["home", "googletv", "googlecalendar", "applemaps"]);
 const customReservedParameters = new Set([
@@ -240,9 +242,11 @@ export function validateAuthoringRequest(value: unknown): AuthoringRequestV1 {
   const runtime = canonicalJSON(request.runtime);
   const screenData = AUTHORING_DEFINITION.screenData.features.every(feature => request.runtime.features.includes(feature));
   const customHTTP = request.runtime.features.includes(CUSTOM_HTTP_FEATURE);
+  const prefill = request.runtime.features.includes(CONNECTION_PREFILL_FEATURE);
+  if (prefill && !customHTTP) fail("prefill requires custom HTTP");
   const browser = isBrowserRuntime(request.runtime);
-  const expectedRuntime = browser ? browserAuthoringRuntime() : authoringRuntime(screenData, customHTTP);
-  const expectedGuidance = browser ? browserAuthoringDesignGuidance() : authoringDesignGuidance(screenData, customHTTP);
+  const expectedRuntime = browser ? browserAuthoringRuntime() : authoringRuntime(screenData, customHTTP, prefill);
+  const expectedGuidance = browser ? browserAuthoringDesignGuidance() : authoringDesignGuidance(screenData, customHTTP, prefill);
   if (runtime !== canonicalJSON(expectedRuntime) || canonicalJSON(request.designGuidance) !== canonicalJSON(expectedGuidance)) fail("unsupported guidance/runtime definition");
   if (browser && (request.services.length || request.preferences.length)) fail("browser runtime requires empty services and preferences");
   const seen = new Set<string>();

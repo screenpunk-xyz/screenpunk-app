@@ -36,3 +36,48 @@ failures in the screen UI.
 - Declare `auth` only if the API uses bearer authentication. The device asks for the associated secret field and attaches its value natively. Keep entered configuration and credentials out of the manifest, package files, and SDK calls.
 - Other field types are `text`, `number`, `toggle`, and `choice`. Only `choice` fields include an `options` array of distinct strings. All declared configuration fields need values.
 - Name the exact read operations the screen needs. This version supports fixed GET paths returning JSON. Put query inputs in `parameters`. Use `text`, `number`, `toggle`, or `choice` descriptors with `type`, plus `options` for choices. An optional `field` binds the parameter to a configuration field of the same type and options. Supply only unbound parameters as strings in the SDK call. Use decimal notation for numbers and `"true"` or `"false"` for toggles.
+
+## Request-bound setup proposals
+
+New native clients negotiate `custom-http-prefill-v1` with Cloud. Only a V2
+request advertising that feature accepts `connectionSetupProposals` in its
+completion result. V1, browser and legacy clients retain manual entry. The
+initial native rollout does not advertise prefill to local authoring hosts.
+
+Each proposal is `{version:1, alias, declaration, fields}`. `declaration` must
+exactly match the alias's `customHTTP` object in a **written** `manifest.json`
+in the same result. `fields` maps declared nonsecret field IDs to validated
+strings (decimal numbers, `true`/`false` toggles and exact choices). Include the
+origin. No credential, secret field, credential reference or network approval
+is accepted. Suggestions live outside the portable screen package.
+
+The result's request ID, immutable input digest, revision and operation identity
+bind proposals to the authenticated request and its device/profile/library/screen.
+Cloud and native validate the same payload; native applies a draft only with a
+successfully installed screen before the request deadline. The draft is valid only for that local revision
+and declaration, is not backed up with the package, and is removed when that
+revision is replaced. Cancellation, stale results and replay with changed bytes
+use the existing delivery rejection gates.
+
+Native Settings prefills an unconfigured form without another permission
+prompt. Saved settings remain authoritative; the proposed and current server
+are displayed separately. Editing an existing connection starts with its saved
+values. Saving remains explicit, and changing settings invalidates prior grants.
+The existing vault may retain a compatible saved bearer credential only during
+an explicit save at the same canonical origin. There is no agent-visible secret
+reference or new secret provisioning/handoff surface. A new origin requires
+manual credential entry. Manual setup remains available at all times.
+
+The first attempted unapproved declared operation opens trusted native review
+over the active screen. It identifies the screen, destination and exact GET
+operations. Setup, local HTTP consent, Save connection and Allow this screen
+remain separate decisions. The failed request is not automatically replayed;
+the screen may retry after approval. No DNS resolution, HTTP request or bearer
+header construction occurs before approval. Dismissing without approval records
+a denial, scoped to the owner, screen, alias, exact declaration and saved service
+generation. Revocation also suppresses repeat prompts; Settings can explicitly
+allow access later. Screen HTML cannot render or accept this native decision.
+
+Qualification uses synthetic origins and credentials. An unsigned build and
+unit/integration tests do not establish physical-device presentation or TestFlight
+acceptance; those remain explicit rollout checks.

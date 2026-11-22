@@ -1,14 +1,14 @@
 import definition from './generated/authoring-v2-definition';
-import { AUTHORING_DEFINITION, CUSTOM_HTTP_FEATURE, AuthoringContractError, canonicalJSON, checkAuthoringManifestScreenData, sealAuthoringRequest, validateAuthoringRequest, validateAuthoringResult, validateAuthoringScreen, type AuthoringRequestV1, type AuthoringResultV1, type AuthoringScreen, type JSONSchema } from './authoring';
+import { AUTHORING_DEFINITION, CUSTOM_HTTP_FEATURE, CONNECTION_PREFILL_FEATURE, AuthoringContractError, canonicalJSON, checkAuthoringManifestScreenData, sealAuthoringRequest, validateAuthoringRequest, validateAuthoringResult, validateAuthoringScreen, type AuthoringRequestV1, type AuthoringResultV1, type AuthoringScreen, type JSONSchema } from './authoring';
 export interface AuthoringSourceFileV2 { path: string; mediaType: string; byteLength: number; digest: string; reference: string; content?: string }
 export interface AuthoringSourceScreenV2 { title: string; entry: 'index.html'; files: AuthoringSourceFileV2[]; packageSchema?: 3 }
 export interface AuthoringContextV2 extends Omit<AuthoringRequestV1['context'],'currentScreen'> { libraryID: string; currentScreen?: AuthoringSourceScreenV2 }
 export interface AuthoringRequestV2 extends Omit<AuthoringRequestV1,'schemaVersion'|'context'|'delivery'> { schemaVersion: 2; context: AuthoringContextV2; delivery: { route: 'cloud'|'local'|'fixture'; contractVersion: '2'; snapshotDigest: string } }
 export type AuthoringFileMutationV2 = {kind:'write';path:string;content:string} | {kind:'retain';path:string;sourcePath:string;reference:string;digest:string};
 export interface AuthoringScreenMutationV2 { title:string;entry:'index.html';files:AuthoringFileMutationV2[];deletedPaths:string[];requiredAssets?:string[] }
-export interface AuthoringResultV2 extends Omit<AuthoringResultV1,'schemaVersion'|'screen'> { schemaVersion:2;screen?:AuthoringScreenMutationV2 }
+export interface AuthoringResultV2 extends Omit<AuthoringResultV1,'schemaVersion'|'screen'> { schemaVersion:2;screen?:AuthoringScreenMutationV2;connectionSetupProposals?:CustomHTTPSetupProposal[] }
 export interface AuthoringCapabilitiesV2 { contractVersions: string[]; features: string[] }
-export const AUTHORING_V2_CAPABILITIES: Readonly<AuthoringCapabilitiesV2> = Object.freeze({contractVersions:Object.freeze(['1','2']) as unknown as string[],features:Object.freeze(['asset-references-v2','package-assets-v2',CUSTOM_HTTP_FEATURE]) as unknown as string[]});
+export const AUTHORING_V2_CAPABILITIES: Readonly<AuthoringCapabilitiesV2> = Object.freeze({contractVersions:Object.freeze(['1','2']) as unknown as string[],features:Object.freeze(['asset-references-v2','package-assets-v2',CUSTOM_HTTP_FEATURE,CONNECTION_PREFILL_FEATURE]) as unknown as string[]});
 export function supportsAuthoringV2(value: unknown): boolean { const v = value as AuthoringCapabilitiesV2 | null; return !!v && Array.isArray(v.contractVersions) && v.contractVersions.includes('2') && Array.isArray(v.features) && v.features.includes('asset-references-v2'); }
 export function supportsAuthoringPackageAssets(value: unknown): boolean {
   return supportsAuthoringV2(value) && (value as AuthoringCapabilitiesV2).features.includes('package-assets-v2');
@@ -123,7 +123,8 @@ export function validateAuthoringResultV2(value:unknown,request?:AuthoringReques
  validateSchema('Result',value);const result=value as AuthoringResultV2;
  if(!result.screen&&!result.answer&&!result.preferenceMutations?.length)fail('empty result');
  const {screen,...metadata}=result;
- const legacy:AuthoringResultV1={...metadata,schemaVersion:1,...(!result.answer&&!result.preferenceMutations?.length?{answer:'v2 screen validation'}:{})};
+ const {connectionSetupProposals,...legacyMetadata}=metadata;
+ const legacy:AuthoringResultV1={...legacyMetadata,schemaVersion:1,...(!result.answer&&!result.preferenceMutations?.length?{answer:'v2 screen validation'}:{})};
  if(request){validateAuthoringRequestV2(request);if(result.requestID!==request.requestID||result.inputDigest!==request.delivery.snapshotDigest||result.baseRevision!==request.context.baseRevision)fail('result is not bound to request snapshot');}
  validateAuthoringResult(legacy,request?legacyRequest(request):undefined);
  if(utf8(canonicalJSON(result)).length>393216||utf8(canonicalJSON(metadata)).length>131072)fail('result byte limit');
@@ -152,6 +153,7 @@ export function validateAuthoringResultV2(value:unknown,request?:AuthoringReques
   const required=new Set<string>();for(const path of screen.requiredAssets??[]){if(required.has(path.toLowerCase())||!screen.files.some(f=>f.path===path))fail('missing/duplicate declared asset');required.add(path.toLowerCase());}
   if(request){for(const path of screen.deletedPaths)if(!base.some(f=>f.path===path))fail('delete outside base snapshot');for(const file of base)if(!screen.files.some(f=>f.path===file.path)&&!screen.deletedPaths.includes(file.path))fail('unaccounted base file');}
  }
+ validateConnectionSetupProposals(result, request);
  return result;
 }
 type AuthoringSourceResolverV2 = (file: AuthoringSourceFileV2) => Promise<Uint8Array> | Uint8Array;
@@ -192,4 +194,43 @@ export async function materializeAuthoringResultV2(result: AuthoringResultV2, re
   if (!bytes || !result.screen) return undefined;
   const files = [...bytes].map(([path, content]) => ({path,content:decodeUTF8(content)}));
   return validateAuthoringScreen({title:result.screen.title,entry:result.screen.entry,files});
+}
+
+/** Suggestions travel in the bound result, never in a portable screen package. */
+export interface CustomHTTPSetupProposal {
+ version: 1; alias: string; declaration: Record<string, any>; fields: Record<string, string>;
+}
+function validateConnectionSetupProposals(result: AuthoringResultV2, request?: AuthoringRequestV2): void {
+ const proposals = result.connectionSetupProposals;
+ if (proposals === undefined) return;
+ if (!request?.runtime.features.includes(CONNECTION_PREFILL_FEATURE) || !request.runtime.features.includes(CUSTOM_HTTP_FEATURE)) fail('unsupported connection setup proposal');
+ const manifest = result.screen?.files.find(file => file.path === 'manifest.json');
+ if (manifest?.kind !== 'write') return fail('setup proposals require a written manifest');
+ checkAuthoringManifestScreenData(manifest.content);
+ const connections = JSON.parse(manifest.content).connections;
+ const aliases = new Set<string>();
+ for (const proposal of proposals) {
+  if (aliases.has(proposal.alias)) fail('duplicate setup proposal');
+  aliases.add(proposal.alias);
+  const declaration = connections?.find((value: any) => value.alias === proposal.alias)?.customHTTP;
+  if (!declaration || canonicalJSON(declaration) !== canonicalJSON(proposal.declaration) || !Object.hasOwn(proposal.fields, declaration.originField)) fail('setup declaration mismatch');
+  for (const [key, value] of Object.entries(proposal.fields)) {
+   const field = declaration.fields.find((field: any) => field.id === key);
+   if (!field || field.type === 'secret' || /^(authorization|x-api-key|token|password|access_token|api_key|apikey|secret)$/iu.test(key)) fail('setup must contain only nonsecret fields');
+   if (!value.trim() || new TextEncoder().encode(value).length > 512 || /[\p{Cc}\p{Cf}]/u.test(value)) fail('invalid setup value');
+   switch (field.type) {
+    case 'text': break;
+    case 'number': if (!/^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/u.test(value) || value.length > 32 || !Number.isFinite(Number(value)) || Math.abs(Number(value)) > Number.MAX_SAFE_INTEGER) fail('invalid setup number'); break;
+    case 'toggle': if (!['true','false'].includes(value)) fail('invalid setup toggle'); break;
+    case 'choice': if (!field.options.includes(value)) fail('invalid setup choice'); break;
+    case 'url': {
+     if (!/^https?:\/\/[^/?#\s]+\/?$/u.test(value) || /[%\\]/u.test(value)) fail('invalid setup origin');
+     let url: URL; try { url = new URL(value); } catch { return fail('invalid setup origin'); }
+     if (!url.hostname || url.username || url.password || url.search || url.hash || !['','/'].includes(url.pathname) || url.port === '0') fail('invalid setup origin');
+     break;
+    }
+    default: fail('invalid setup type');
+   }
+  }
+ }
 }
