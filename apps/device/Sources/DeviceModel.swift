@@ -1791,7 +1791,8 @@ import ScreenpunkLocalTransport
     func canLookForConnectionCredential(_ use: CustomConnectionUse, owner: String, server: String) -> Bool {
         guard (try? requireCurrentCustomConnection(use, owner: owner)) != nil, canPairCredentialHelper, isCredentialHelperPaired,
               use.declaration.auth?.mode == "bearer",
-              connectionCredentialSource(use)?.deviceID == credentialHelperDeviceID,
+              let source = connectionCredentialSource(use), source.deviceID == credentialHelperDeviceID,
+              let deadlineAt = source.deadlineAt, deadlineAt > Self.credentialHandoffNow,
               customConnectionStatus(use.declaration)?.canReuseCredential(for: server, allowInsecureHTTP: false) != true,
               let expected = customConnectionProposal(use)?.fields[use.declaration.originField],
               let origin = try? CredentialHandoffScope.canonicalHTTPSOrigin(expected),
@@ -1818,6 +1819,9 @@ import ScreenpunkLocalTransport
                 throw CancellationError()
             }
             try requireCurrentCredentialScope(scope, use: use, owner: owner, origin: origin)
+            guard try !customHTTPVault.hasHandledCredentialHandoff(owner: owner, scope: scope, now: Self.credentialHandoffNow) else {
+                throw CancellationError()
+            }
         }
         switch reply.status {
         case "prepared":
@@ -1829,9 +1833,6 @@ import ScreenpunkLocalTransport
         case "offered":
             try checkCurrentScope()
             guard let envelope = reply.envelope else { throw ConnectionFailure.validationFailed }
-            guard try !customHTTPVault.hasHandledCredentialHandoff(owner: owner, scope: scope, now: Self.credentialHandoffNow) else {
-                return nil
-            }
             _ = try binding.pair.open(envelope, for: scope) // Authenticate the display name before review.
             return .init(scope: scope, envelope: envelope, revision: use.screen.revision, generation: generation)
         default: return nil
@@ -1851,17 +1852,17 @@ import ScreenpunkLocalTransport
         try await finishConnectionCredential(offer, status: "accepted", token: session.accessToken)
         try Task.checkCancellation()
         guard cloud.session?.accessToken == session.accessToken else { throw ConnectionFailure.permissionRequired }
-        try requireCurrentCredentialScope(offer.scope, use: use, owner: owner, origin: origin)
+        let requestDeadline = try requireCurrentCredentialScope(offer.scope, use: use, owner: owner, origin: origin)
         let token = try pair.open(offer.envelope, for: offer.scope)
         try customHTTPVault.acceptCredentialHandoff(owner: owner, declaration: use.declaration, fields: fields, token: token,
-            certificatePin: certificatePin, scope: offer.scope, expectedGeneration: offer.generation, now: Self.credentialHandoffNow)
+            certificatePin: certificatePin, scope: offer.scope, expectedGeneration: offer.generation, requestDeadline: requestDeadline, now: Self.credentialHandoffNow)
         refreshCustomConnections()
     }
 
     func declineConnectionCredential(_ offer: ConnectionCredentialOffer, use: CustomConnectionUse, owner: String) async throws {
         guard offer.revision == use.screen.revision, let session = cloud.session else { throw ConnectionFailure.permissionRequired }
-        try requireCurrentCredentialScope(offer.scope, use: use, owner: owner, origin: offer.scope.origin)
-        try customHTTPVault.declineCredentialHandoff(owner: owner, scope: offer.scope, now: Self.credentialHandoffNow)
+        let deadline = try requireCurrentCredentialScope(offer.scope, use: use, owner: owner, origin: offer.scope.origin)
+        try customHTTPVault.declineCredentialHandoff(owner: owner, scope: offer.scope, requestDeadline: deadline, now: Self.credentialHandoffNow)
         try? await finishConnectionCredential(offer, status: "declined", token: session.accessToken)
     }
 
@@ -1877,19 +1878,21 @@ import ScreenpunkLocalTransport
         library?.connectionCredentialHandoffSource(screenID: use.screen.id, revision: use.screen.revision)
     }
 
+    @discardableResult
     private func requireCurrentCredentialScope(_ scope: CredentialHandoffScope, use: CustomConnectionUse,
-                                               owner: String, origin: String) throws {
+                                               owner: String, origin: String) throws -> Int64 {
         try requireCurrentCustomConnection(use, owner: owner)
-        guard let source = connectionCredentialSource(use), let binding = credentialHelperBinding,
+        guard let source = connectionCredentialSource(use), let deadlineAt = source.deadlineAt, let binding = credentialHelperBinding,
               canLookForConnectionCredential(use, owner: owner, server: origin),
               scope.pairID == binding.pair.pairID, scope.accountRoute == binding.registration.accountRoute,
               scope.relayOrigin == CloudClient.originScope.canonicalOrigin, scope.deviceID == credentialHelperDeviceID,
               scope.requestID == source.requestID, scope.inputDigest == source.inputDigest,
               scope.operationID == source.operationID, scope.screenID == use.screen.id, scope.alias == use.alias,
               scope.serviceID == use.declaration.id, scope.declarationDigest == (try CredentialHandoffScope.declarationDigest(use.declaration)),
-              scope.origin == origin, scope.expiresAt > Self.credentialHandoffNow else {
+              scope.origin == origin, scope.isCurrent(now: Self.credentialHandoffNow, requestDeadline: deadlineAt) else {
             throw ConnectionFailure.permissionRequired
         }
+        return deadlineAt
     }
 
     private static var credentialHandoffNow: Int64 { Int64(Date().timeIntervalSince1970 * 1000) }

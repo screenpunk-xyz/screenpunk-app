@@ -114,7 +114,7 @@ final class CustomHTTPDeviceRuntimeTests: XCTestCase {
         let scope = try credentialScope(declaration: declaration, origin: old.origin)
         func accept(fields: [String: String], generation: UUID?, now: Int64 = 1) throws {
             try vault.acceptCredentialHandoff(owner: owner, declaration: declaration, fields: fields, token: "fixture-handoff",
-                certificatePin: nil, scope: scope, expectedGeneration: generation, now: now)
+                certificatePin: nil, scope: scope, expectedGeneration: generation, requestDeadline: 20_000, now: now)
         }
         XCTAssertThrowsError(try accept(fields: fields, generation: nil))
         XCTAssertThrowsError(try accept(fields: fields, generation: old.generation, now: scope.expiresAt))
@@ -140,20 +140,42 @@ final class CustomHTTPDeviceRuntimeTests: XCTestCase {
         let (vault, _, declaration) = try configured()
         let saved = try XCTUnwrap(vault.status(owner: owner, declaration: declaration))
         let scope = try credentialScope(declaration: declaration, origin: saved.origin)
-        try vault.declineCredentialHandoff(owner: owner, scope: scope, now: 1)
+        try vault.declineCredentialHandoff(owner: owner, scope: scope, requestDeadline: 20_000, now: 1)
         XCTAssertThrowsError(try vault.acceptCredentialHandoff(owner: owner, declaration: declaration, fields: saved.fields,
-            token: "fixture-handoff", certificatePin: nil, scope: scope, expectedGeneration: saved.generation, now: 2))
+            token: "fixture-handoff", certificatePin: nil, scope: scope, expectedGeneration: saved.generation, requestDeadline: 20_000, now: 2))
         XCTAssertEqual(vault.status(owner: owner, declaration: declaration), saved)
     }
 
-    private func credentialScope(declaration: CustomHTTPDeclaration, origin: String) throws -> CredentialHandoffScope {
+    func testCredentialHandoffDeadlineAndReissueWithDifferentDelivery() throws {
+        let (vault, _, declaration) = try configured()
+        let saved = try XCTUnwrap(vault.status(owner: owner, declaration: declaration))
+        let initial = try credentialScope(declaration: declaration, origin: saved.origin)
+        let reissued = try credentialScope(declaration: declaration, origin: saved.origin,
+            deliveryID: "ae719d8a-103a-46b7-bd4c-12d9d9abf9bb", expiresAt: 15_000)
+        XCTAssertTrue(initial.isCurrent(now: 1, requestDeadline: initial.expiresAt))
+        XCTAssertFalse(initial.isCurrent(now: initial.expiresAt, requestDeadline: initial.expiresAt))
+        XCTAssertFalse(initial.isCurrent(now: 1, requestDeadline: initial.expiresAt - 1))
+        let extended = try credentialScope(declaration: declaration, origin: saved.origin, expiresAt: 901_002)
+        XCTAssertFalse(extended.isCurrent(now: 1, requestDeadline: extended.expiresAt))
+        XCTAssertThrowsError(try vault.declineCredentialHandoff(owner: owner, scope: initial,
+            requestDeadline: 2_000, now: 1))
+        try vault.declineCredentialHandoff(owner: owner, scope: initial, requestDeadline: 20_000, now: 1)
+        let afterInitialExpiry = initial.expiresAt + 1
+        XCTAssertTrue(try vault.hasHandledCredentialHandoff(owner: owner, scope: reissued, now: afterInitialExpiry))
+        XCTAssertThrowsError(try vault.acceptCredentialHandoff(owner: owner, declaration: declaration,
+            fields: saved.fields, token: "fixture-handoff", certificatePin: nil, scope: reissued,
+            expectedGeneration: saved.generation, requestDeadline: 20_000, now: afterInitialExpiry))
+    }
+
+    private func credentialScope(declaration: CustomHTTPDeclaration, origin: String,
+                                 deliveryID: String = "b7719d8a-103a-46b7-bd4c-12d9d9abf9bb", expiresAt: Int64 = 10_000) throws -> CredentialHandoffScope {
         let scope: [String: Any] = [
             "version": 1, "accountRoute": String(repeating: "1", count: 64), "relayOrigin": "https://relay.test",
-            "deliveryID": "b7719d8a-103a-46b7-bd4c-12d9d9abf9bb", "pairID": "AAAAAAAAAAAAAAAAAAAAAA",
+            "deliveryID": deliveryID, "pairID": "AAAAAAAAAAAAAAAAAAAAAA",
             "requestID": "fixture-request", "inputDigest": String(repeating: "2", count: 64), "deviceID": "fixture-device",
             "screenID": screenID, "operationID": "fixture-operation", "alias": alias, "name": "Read only fixture",
             "origin": origin, "serviceID": declaration.id, "declarationDigest": try CredentialHandoffScope.declarationDigest(declaration),
-            "expiresAt": 10_000,
+            "expiresAt": expiresAt,
         ]
         return try JSONDecoder().decode(CredentialHandoffScope.self, from: JSONSerialization.data(withJSONObject: scope))
     }

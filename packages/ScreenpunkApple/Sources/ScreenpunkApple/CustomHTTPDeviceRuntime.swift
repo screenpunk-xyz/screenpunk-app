@@ -90,24 +90,33 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
 
     public func hasHandledCredentialHandoff(owner: String, scope: CredentialHandoffScope, now: Int64) throws -> Bool {
         Self.lock.lock(); defer { Self.lock.unlock() }
-        return (try load()[owner]?.consumedDeliveries?[scope.deliveryID] ?? 0) > now
+        let consumed = try load()[owner]?.consumedDeliveries ?? [:]
+        return Self.handoffReplayKeys(scope).contains { (consumed[$0] ?? 0) > now }
     }
 
-    public func declineCredentialHandoff(owner: String, scope: CredentialHandoffScope, now: Int64) throws {
+    public func declineCredentialHandoff(owner: String, scope: CredentialHandoffScope, requestDeadline: Int64, now: Int64) throws {
         Self.lock.lock(); defer { Self.lock.unlock() }
         var accounts = try load()
         var account = accounts[owner] ?? Account()
-        try Self.recordCredentialHandoff(scope, account: &account, now: now)
+        try Self.recordCredentialHandoff(scope, requestDeadline: requestDeadline, account: &account, now: now)
         accounts[owner] = account
         try persist(accounts)
     }
 
-    private static func recordCredentialHandoff(_ scope: CredentialHandoffScope, account: inout Account, now: Int64) throws {
+    private static func handoffReplayKeys(_ scope: CredentialHandoffScope) -> [String] {
+        // Newline cannot occur in authenticated scope identifiers.
+        [scope.deliveryID, "request\n" + scope.requestID + "\n" + scope.alias]
+    }
+
+    private static func recordCredentialHandoff(_ scope: CredentialHandoffScope, requestDeadline: Int64,
+                                                account: inout Account, now: Int64) throws {
+        let keys = handoffReplayKeys(scope)
         var consumed = (account.consumedDeliveries ?? [:]).filter { $0.value > now }
-        guard scope.expiresAt > now, consumed[scope.deliveryID] == nil, consumed.count < 256 else {
+        guard scope.isCurrent(now: now, requestDeadline: requestDeadline),
+              keys.allSatisfy({ consumed[$0] == nil }), consumed.count + keys.count <= 256 else {
             throw ConnectionFailure.permissionRequired
         }
-        consumed[scope.deliveryID] = scope.expiresAt
+        for key in keys { consumed[key] = requestDeadline }
         account.consumedDeliveries = consumed
     }
 
@@ -124,18 +133,18 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
 
     public func acceptCredentialHandoff(owner: String, declaration: CustomHTTPDeclaration, fields: [String: String],
                                         token: String, certificatePin: ReviewedCertificatePin?, scope: CredentialHandoffScope,
-                                        expectedGeneration: UUID?, now: Int64) throws {
+                                        expectedGeneration: UUID?, requestDeadline: Int64, now: Int64) throws {
         guard !token.isEmpty, declaration.auth?.mode == "bearer", scope.serviceID == declaration.id,
               scope.declarationDigest == (try CredentialHandoffScope.declarationDigest(declaration)) else {
             throw ConnectionFailure.validationFailed
         }
         try save(owner: owner, declaration: declaration, fields: fields, secret: token, allowInsecureHTTP: false,
-                 certificatePin: certificatePin, delivery: (scope, expectedGeneration, now))
+                 certificatePin: certificatePin, delivery: (scope, expectedGeneration, requestDeadline, now))
     }
 
     private func save(owner: String, declaration: CustomHTTPDeclaration, fields: [String: String],
                       secret: String?, allowInsecureHTTP: Bool, certificatePin: ReviewedCertificatePin?,
-                      delivery: (scope: CredentialHandoffScope, expectedGeneration: UUID?, now: Int64)?) throws {
+                      delivery: (scope: CredentialHandoffScope, expectedGeneration: UUID?, requestDeadline: Int64, now: Int64)?) throws {
         guard !owner.isEmpty else { throw ConnectionFailure.permissionRequired }
         try declaration.validate(alias: "customConnection")
         let visible = declaration.fields.filter { $0.type != "secret" }
@@ -159,10 +168,10 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
         let previous = account.services[declaration.id]
         if let delivery {
             guard try delivery.scope.origin == CredentialHandoffScope.canonicalHTTPSOrigin(origin),
-                  delivery.scope.expiresAt > delivery.now, delivery.expectedGeneration == previous?.generation else {
+                  delivery.expectedGeneration == previous?.generation else {
                 throw ConnectionFailure.permissionRequired
             }
-            try Self.recordCredentialHandoff(delivery.scope, account: &account, now: delivery.now)
+            try Self.recordCredentialHandoff(delivery.scope, requestDeadline: delivery.requestDeadline, account: &account, now: delivery.now)
         }
         var token: String?
         var tokenDeclarationDigest = delivery?.scope.declarationDigest

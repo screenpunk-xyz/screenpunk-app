@@ -44,6 +44,7 @@ import ScreenpunkCore
         var inputDigest: String
         var operationID: String
         var deviceID: String
+        var deadlineAt: Int64?
     }
     struct ConnectionSetupDraft: Codable {
         var revision: String
@@ -1658,7 +1659,7 @@ import ScreenpunkCore
                 next.connectionSetupDrafts?[saved.id] = result.connectionSetupProposals.map {
                     ConnectionSetupDraft(revision: revision, credentialHandoff: request.delivery.route == "cloud" && request.runtime.features.contains(AuthoringContract.credentialHandoffFeature) ? .init(
                         requestID: request.requestID, inputDigest: request.delivery.snapshotDigest, operationID: result.operationID,
-                        deviceID: request.context.deviceID
+                        deviceID: request.context.deviceID, deadlineAt: request.deadlineAt
                     ) : nil, proposals: $0)
                 }
                 if let linkedEdit, linkedEdit.scope == .thisDevice, let current, let name = linkedEdit.forkName {

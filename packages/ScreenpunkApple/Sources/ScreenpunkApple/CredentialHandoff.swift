@@ -102,6 +102,10 @@ public struct CredentialHandoffScope: Codable, Equatable, Sendable {
         AuthoringContract.contentDigest(try AuthoringContract.encodedCanonical(declaration))
     }
 
+    public func isCurrent(now: Int64, requestDeadline: Int64) -> Bool {
+        now >= 0 && now < expiresAt && expiresAt <= requestDeadline && expiresAt - now <= 15 * 60 * 1000
+    }
+
     func authenticatedBytes() throws -> Data {
         let strings = [accountRoute, relayOrigin, deliveryID, pairID, requestID, inputDigest, deviceID,
                        screenID, operationID, alias, name, origin, serviceID, declarationDigest]
