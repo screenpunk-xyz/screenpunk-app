@@ -1778,8 +1778,9 @@ import ScreenpunkLocalTransport
                 return publicDataAllowed(manifest) ? nil : .init(name: connection.alias, kind: .publicData)
             }
             if let declaration = connection.customHTTP {
-                return customHTTPVault.isApproved(owner: permissionOwner, screenID: screen.id, manifest: manifest, alias: connection.alias)
-                    ? nil : .init(name: declaration.label, kind: .custom, customAlias: connection.alias)
+                // A configured connection asks for this screen’s permission on first use.
+                return customConnectionStatus(declaration) == nil
+                    ? .init(name: declaration.label, kind: .custom, customAlias: connection.alias) : nil
             }
             switch connection.alias {
             case "home":
