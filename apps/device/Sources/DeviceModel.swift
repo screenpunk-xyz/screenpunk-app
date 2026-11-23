@@ -54,6 +54,10 @@ import ScreenpunkLocalTransport
         guard let intent = accountDeletionIntent else { return true }
         return !intent.serverConfirmed && intent.appleRevocationConsent != "REVOKE"
     }
+    var accountDeletionRequiresExternalCredentialConfirmation: Bool {
+        guard let intent = accountDeletionIntent, !intent.serverConfirmed else { return false }
+        return intent.externalCredentialCleanupRequired == true && intent.externalCredentialCleanupConsent != "CONTINUE"
+    }
     var accountDeletionRetryTitle: String {
         accountDeletionIntent?.serverConfirmed == true ? "Finish Removing Local Data" : "Retry Account Deletion"
     }
@@ -642,7 +646,8 @@ import ScreenpunkLocalTransport
         message = notices.joined(separator: "\n")
         settingsOpen = false
     }
-    func deleteAccount(accountID: String, approvedAppleRevocation: Bool = false) async {
+    func deleteAccount(accountID: String, approvedAppleRevocation: Bool = false,
+                       approvedExternalCredentialCleanup: Bool = false) async {
         guard !accountDeletionInProgress, !accountOperationInProgress || accountDeletionIntent != nil else { return }
         guard accountDeletionIntent != nil || !routeChangeBlocked else {
             accountDeletionError = "Finish or cancel the current screen request before deleting your account."
@@ -688,6 +693,11 @@ import ScreenpunkLocalTransport
                 try cloud.saveAccountDeletion(intent)
                 accountDeletionIntent = intent
             }
+            if approvedExternalCredentialCleanup && intent.externalCredentialCleanupRequired == true {
+                intent.externalCredentialCleanupConsent = "CONTINUE"
+                try cloud.saveAccountDeletion(intent)
+                accountDeletionIntent = intent
+            }
             accountDeletionInProgress = true
             accountOperationInProgress = true
             accountStatusCaption = intent.serverConfirmed ? "Removing deleted account data…" : "Deleting your account…"
@@ -708,7 +718,9 @@ import ScreenpunkLocalTransport
             }
             accountDeletionIntent = nil
             accountDeletionStatus = nil
-            message = "Your Screenpunk account has been deleted."
+            message = confirmed.externalCredentialCleanupRequired == true
+                ? "Your Screenpunk account was deleted. Remove any outstanding credentials directly at your connection providers."
+                : "Your Screenpunk account has been deleted."
             settingsOpen = false
         } catch {
             // Reload the durable prepare/completion receipt after an interrupted request.
@@ -1778,7 +1790,8 @@ import ScreenpunkLocalTransport
         guard let source = connectionCredentialRegistrationSource(use), let session = cloud.session,
               let pending = try customHTTPVault.pendingCredentialRegistration(owner: owner, requestID: source.requestID, alias: use.alias),
               pending.registrationID == status.registrationID, !pending.removalRequested, status.state == "ready",
-              let receipt = status.receipt, receipt.isCurrent(for: pending, now: Self.credentialRegistrationNow),
+              let receipt = status.receipt, receipt.relayOrigin == CloudClient.originScope.canonicalOrigin,
+              receipt.isCurrent(for: pending, now: Self.credentialRegistrationNow),
               let fingerprint = status.certificateFingerprint, fingerprint == certificatePin.fingerprint,
               try CredentialRegistrationContext.canonicalHTTPSOrigin(certificatePin.origin) == pending.context.origin else {
             throw ConnectionFailure.certificateRejected
@@ -1810,7 +1823,8 @@ import ScreenpunkLocalTransport
     }
 
     private func registrationStatus(_ reply: CloudCredentialRegistration, pending: PendingCredentialRegistration) throws -> ProvisioningStatus {
-        guard let receipt = reply.scope, receipt.matches(pending) else { throw ConnectionFailure.permissionRequired }
+        guard let receipt = reply.scope, receipt.relayOrigin == CloudClient.originScope.canonicalOrigin,
+              receipt.matches(pending) else { throw ConnectionFailure.permissionRequired }
         let state: String
         var fingerprint: String?
         switch reply.status {
@@ -1890,10 +1904,13 @@ import ScreenpunkLocalTransport
                 guard !Task.isCancelled, cloud.session?.accessToken == session.accessToken, permissionOwner == owner else { return }
                 let path = Self.credentialRegistrationPath(record.registrationID)
                 do {
-                    let reply: CloudCredentialRegistration = try await cloud.call(path, method: "DELETE", authorizationToken: session.accessToken)
-                    guard permissionOwner == owner, cloud.session?.accessToken == session.accessToken,
-                          reply.scope?.matches(record) == true else { return }
-                    if reply.status == "removed" {
+                    let context = record.context
+                    let binding: [String: Any] = ["requestID": context.requestID, "alias": context.alias,
+                                                  "screenRevision": context.revision, "deadlineAt": context.deadlineAt]
+                    let reply: CredentialRegistrationRemovalAcknowledgement = try await cloud.call(path, method: "DELETE",
+                        body: binding, authorizationToken: session.accessToken)
+                    guard permissionOwner == owner, cloud.session?.accessToken == session.accessToken else { return }
+                    if reply.confirmsRemoval(of: record, relayOrigin: CloudClient.originScope.canonicalOrigin) {
                         try customHTTPVault.confirmCredentialRegistrationRemoval(owner: owner, registrationID: record.registrationID)
                     }
                 } catch { continue } // Network uncertainty preserves the local removal obligation.

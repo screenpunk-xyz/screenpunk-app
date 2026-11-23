@@ -647,9 +647,12 @@ struct AgentStatus: Decodable {
             return try await self.call("api/device/account/delete/prepare", method: "POST", body: ["operationID": captured.operationID], requiredStatus: 200)
         }, execute: { intent, retrying in
             guard let token = intent.deletionToken else { throw DeviceError.message("Account deletion could not be prepared.") }
+            var body = ["operationID": intent.operationID, "deletionToken": token, "confirmation": "DELETE",
+                        "appleRevocationConsent": intent.appleRevocationConsent ?? ""]
+            if let consent = intent.externalCredentialCleanupConsent { body["externalCredentialCleanupConsent"] = consent }
             return try await self.call(
                 retrying ? "auth/account/delete/retry" : "api/device/account/delete", method: "POST",
-                body: ["operationID": intent.operationID, "deletionToken": token, "confirmation": "DELETE", "appleRevocationConsent": intent.appleRevocationConsent ?? ""], authenticated: !retrying, requiredStatus: 200)
+                body: body, authenticated: !retrying, requiredStatus: 200)
         }, persist: saveAccountDeletion)
     }
 

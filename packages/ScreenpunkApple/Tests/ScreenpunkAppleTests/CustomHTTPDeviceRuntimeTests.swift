@@ -190,6 +190,31 @@ final class CustomHTTPDeviceRuntimeTests: XCTestCase {
         XCTAssertThrowsError(try vault.prepareCredentialRegistration(owner: owner, context: context, now: 51))
     }
 
+    func testCancellationBeforeFirstPostRequiresExactLocalBinding() throws {
+        let (vault, _, declaration) = try configured()
+        let saved = try XCTUnwrap(vault.status(owner: owner, declaration: declaration))
+        let context = try registrationContext(declaration: declaration, origin: saved.origin, expectedGeneration: saved.generation)
+        let prepared = try vault.prepareCredentialRegistration(owner: owner, context: context, now: 100)
+        try vault.requestCredentialRegistrationRemoval(owner: owner, registrationID: prepared.registrationID)
+        let removal = try XCTUnwrap(vault.credentialRegistrationRemovals(owner: owner, deviceID: context.deviceID).first)
+        var wire: [String: Any] = [
+            "status": "removed", "cancelledBeforeStart": true, "registrationID": removal.registrationID,
+            "requestID": context.requestID, "deviceID": context.deviceID, "alias": context.alias,
+            "screenRevision": context.revision, "deadlineAt": context.deadlineAt
+        ]
+        let origin = "https://cloud.test"
+        func decode() throws -> CredentialRegistrationRemovalAcknowledgement {
+            try JSONDecoder().decode(CredentialRegistrationRemovalAcknowledgement.self, from: JSONSerialization.data(withJSONObject: wire))
+        }
+        XCTAssertTrue(try decode().confirmsRemoval(of: removal, relayOrigin: origin))
+        XCTAssertFalse(try decode().confirmsRemoval(of: prepared, relayOrigin: origin))
+        for key in ["registrationID", "requestID", "deviceID", "alias", "screenRevision", "deadlineAt"] {
+            let value = wire.removeValue(forKey: key)
+            XCTAssertFalse(try decode().confirmsRemoval(of: removal, relayOrigin: origin))
+            wire[key] = value
+        }
+    }
+
     func testLocalConnectionNameIsOwnerScoped() throws {
         let store = MemoryCredentialStore()
         let vault = CustomHTTPDeviceVault(store: store)

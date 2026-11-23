@@ -78,6 +78,7 @@ public struct CredentialRegistrationReceipt: Decodable, Equatable, Sendable {
     public let version: Int
     public let registrationID: String
     public let screenRevision: String
+    public let relayOrigin: String?
     public let requestID: String
     public let inputDigest: String
     public let operationID: String
@@ -100,5 +101,29 @@ public struct CredentialRegistrationReceipt: Decodable, Equatable, Sendable {
 
     public func isCurrent(for registration: PendingCredentialRegistration, now: Int64) -> Bool {
         matches(registration) && registration.context.isCurrent(now) && now < expiresAt
+    }
+}
+
+/// A never-submitted registration has no installed-source receipt. Cloud must echo its exact local binding.
+public struct CredentialRegistrationRemovalAcknowledgement: Decodable, Sendable {
+    let status: String
+    let scope: CredentialRegistrationReceipt?
+    let cancelledBeforeStart: Bool?
+    let registrationID: String?
+    let requestID: String?
+    let deviceID: String?
+    let alias: String?
+    let screenRevision: String?
+    let deadlineAt: Int64?
+
+    public func confirmsRemoval(of pending: PendingCredentialRegistration, relayOrigin: String) -> Bool {
+        guard status == "removed", pending.removalRequested else { return false }
+        if cancelledBeforeStart == true {
+            let context = pending.context
+            return scope == nil && registrationID == pending.registrationID && requestID == context.requestID &&
+                deviceID == context.deviceID && alias == context.alias && screenRevision == context.revision &&
+                deadlineAt == context.deadlineAt
+        }
+        return scope?.matches(pending) == true && scope?.relayOrigin == relayOrigin
     }
 }
