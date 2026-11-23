@@ -335,8 +335,10 @@ final class HomeAssistantWebBridge: NSObject, WKScriptMessageHandler {
                 self.reply(id: id, value: value)
             } catch {
                 guard self.active, self.current(document) else { return }
-                self.onHealth(false)
-                self.reply(id: id, error: (error as? ConnectionFailure)?.rawValue ?? "device_offline")
+                let failure = error as? ConnectionFailure ?? .deviceOffline
+                // Local access review does not tell us whether the source is reachable.
+                if failure != .permissionRequired { self.onHealth(false) }
+                self.reply(id: id, error: failure.rawValue)
             }
         })
     }
