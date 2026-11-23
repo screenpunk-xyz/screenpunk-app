@@ -107,77 +107,132 @@ final class CustomHTTPDeviceRuntimeTests: XCTestCase {
         }
     }
 
-    func testCredentialHandoffOneUseAndDeclarationAndOriginBinding() throws {
+    func testDeviceBearerGenerationHashesExactWireBytes() throws {
+        let one = try DeviceBearerCredential.generate()
+        let two = try DeviceBearerCredential.generate()
+        XCTAssertNotEqual(one.bearer, two.bearer)
+        XCTAssertEqual(one.bearer.utf8.count, 43)
+        XCTAssertEqual(one.verifier, AuthoringContract.contentDigest(Data(one.bearer.utf8)))
+        XCTAssertEqual(one.verifier.utf8.count, 64)
+        XCTAssertFalse(one.bearer.contains("="))
+        XCTAssertNotEqual(one.verifier, DeviceBearerCredential.verifier(for: one.bearer + "\n"))
+    }
+
+    func testVerifierRegistrationStagesWithoutReplacingAndRequiresExactReview() throws {
+        guard #available(iOS 18, macOS 15, *) else { throw XCTSkip("Certificate pin reviews unavailable") }
         let (vault, manifest, declaration) = try configured()
-        let old = try XCTUnwrap(vault.status(owner: owner, declaration: declaration))
-        let fields = ["server": old.origin + ":443", "tag": "weekly"]
-        let scope = try credentialScope(declaration: declaration, origin: old.origin)
-        func accept(fields: [String: String], generation: UUID?, now: Int64 = 1) throws {
-            try vault.acceptCredentialHandoff(owner: owner, declaration: declaration, fields: fields, token: "fixture-handoff",
-                certificatePin: nil, scope: scope, expectedGeneration: generation, requestDeadline: 20_000, now: now)
-        }
-        XCTAssertThrowsError(try accept(fields: fields, generation: nil))
-        XCTAssertThrowsError(try accept(fields: fields, generation: old.generation, now: scope.expiresAt))
-        XCTAssertThrowsError(try accept(fields: ["server": "https://replacement.test", "tag": "weekly"], generation: old.generation))
-        try accept(fields: fields, generation: old.generation)
-        XCTAssertTrue(try vault.hasHandledCredentialHandoff(owner: owner, scope: scope, now: 1))
-        XCTAssertFalse(vault.isApproved(owner: owner, screenID: screenID, manifest: manifest, alias: alias))
         let saved = try XCTUnwrap(vault.status(owner: owner, declaration: declaration))
-        XCTAssertThrowsError(try accept(fields: fields, generation: saved.generation))
+        let context = try registrationContext(declaration: declaration, origin: "https://new.test",
+                                              expectedGeneration: saved.generation)
+        let fields = ["server": context.origin + ":443", "tag": "weekly"]
+        let pending = try vault.prepareCredentialRegistration(owner: owner, context: context, now: 100)
+        let same = try vault.prepareCredentialRegistration(owner: owner, context: context, now: 101)
+        XCTAssertEqual(same, pending)
+        XCTAssertEqual(vault.status(owner: owner, declaration: declaration), saved)
+        XCTAssertTrue(vault.isApproved(owner: owner, screenID: screenID, manifest: manifest, alias: alias))
+        let fingerprint = String(repeating: "a", count: 64)
+        let pin = try ReviewedCertificatePin(origin: fields["server"]!, fingerprint: fingerprint)
+        let wrongPin = try ReviewedCertificatePin(origin: fields["server"]!, fingerprint: String(repeating: "b", count: 64))
+        func accept(_ reviewed: ReviewedCertificatePin, owner: String, values: [String: String], now: Int64 = 100) throws {
+            try vault.acceptCredentialRegistration(owner: owner, declaration: declaration, fields: values,
+                 registrationID: pending.registrationID, fingerprint: fingerprint, certificatePin: reviewed, now: now)
+        }
+        XCTAssertThrowsError(try accept(wrongPin, owner: owner, values: fields))
+        XCTAssertThrowsError(try accept(pin, owner: "another", values: fields))
+        XCTAssertThrowsError(try accept(pin, owner: owner, values: ["server": "https://wrong.test", "tag": "weekly"]))
+        XCTAssertThrowsError(try accept(pin, owner: owner, values: fields, now: context.deadlineAt))
+        try accept(pin, owner: owner, values: fields)
+        XCTAssertEqual(vault.status(owner: owner, declaration: declaration)?.certificatePin, pin)
+        XCTAssertFalse(vault.isApproved(owner: owner, screenID: screenID, manifest: manifest, alias: alias))
+        XCTAssertThrowsError(try accept(pin, owner: owner, values: fields))
+        XCTAssertThrowsError(try vault.save(owner: owner, declaration: declaration, fields: fields, allowInsecureHTTP: false))
         try vault.approve(owner: owner, screenID: screenID, manifest: manifest, alias: alias)
         var altered = manifest
         altered.connections[0].customHTTP?.operations[0].path = "/api/changed"
-        let alteredDeclaration = try XCTUnwrap(altered.connections[0].customHTTP)
         XCTAssertThrowsError(try vault.approve(owner: owner, screenID: screenID, manifest: altered, alias: alias))
-        try vault.save(owner: owner, declaration: declaration, fields: fields, allowInsecureHTTP: false)
-        XCTAssertThrowsError(try vault.save(owner: owner, declaration: alteredDeclaration, fields: fields, allowInsecureHTTP: false))
-        try vault.save(owner: owner, declaration: alteredDeclaration, fields: fields, secret: "fixture-manual", allowInsecureHTTP: false)
-        try vault.approve(owner: owner, screenID: screenID, manifest: manifest, alias: alias)
-        XCTAssertTrue(vault.isApproved(owner: owner, screenID: screenID, manifest: manifest, alias: alias))
+        try vault.remove(owner: owner, serviceID: declaration.id)
+        XCTAssertFalse(vault.isApproved(owner: owner, screenID: screenID, manifest: manifest, alias: alias))
+        XCTAssertEqual(try vault.credentialRegistrationRemovals(owner: owner, deviceID: context.deviceID).map(\.registrationID), [pending.registrationID])
+        XCTAssertTrue(try vault.credentialRegistrationRemovals(owner: owner, deviceID: "different").isEmpty)
+        try vault.confirmCredentialRegistrationRemoval(owner: owner, registrationID: pending.registrationID)
+        XCTAssertTrue(try vault.credentialRegistrationRemovals(owner: owner, deviceID: context.deviceID).isEmpty)
     }
 
-    func testDeclinedCredentialHandoffCannotBeReplayed() throws {
+    func testRegistrationReceiptBindsSourceReadAndInstalledRevision() throws {
         let (vault, _, declaration) = try configured()
         let saved = try XCTUnwrap(vault.status(owner: owner, declaration: declaration))
-        let scope = try credentialScope(declaration: declaration, origin: saved.origin)
-        try vault.declineCredentialHandoff(owner: owner, scope: scope, requestDeadline: 20_000, now: 1)
-        XCTAssertThrowsError(try vault.acceptCredentialHandoff(owner: owner, declaration: declaration, fields: saved.fields,
-            token: "fixture-handoff", certificatePin: nil, scope: scope, expectedGeneration: saved.generation, requestDeadline: 20_000, now: 2))
-        XCTAssertEqual(vault.status(owner: owner, declaration: declaration), saved)
-    }
-
-    func testCredentialHandoffDeadlineAndReissueWithDifferentDelivery() throws {
-        let (vault, _, declaration) = try configured()
-        let saved = try XCTUnwrap(vault.status(owner: owner, declaration: declaration))
-        let initial = try credentialScope(declaration: declaration, origin: saved.origin)
-        let reissued = try credentialScope(declaration: declaration, origin: saved.origin,
-            deliveryID: "ae719d8a-103a-46b7-bd4c-12d9d9abf9bb", expiresAt: 15_000)
-        XCTAssertTrue(initial.isCurrent(now: 1, requestDeadline: initial.expiresAt))
-        XCTAssertFalse(initial.isCurrent(now: initial.expiresAt, requestDeadline: initial.expiresAt))
-        XCTAssertFalse(initial.isCurrent(now: 1, requestDeadline: initial.expiresAt - 1))
-        let extended = try credentialScope(declaration: declaration, origin: saved.origin, expiresAt: 901_002)
-        XCTAssertFalse(extended.isCurrent(now: 1, requestDeadline: extended.expiresAt))
-        XCTAssertThrowsError(try vault.declineCredentialHandoff(owner: owner, scope: initial,
-            requestDeadline: 2_000, now: 1))
-        try vault.declineCredentialHandoff(owner: owner, scope: initial, requestDeadline: 20_000, now: 1)
-        let afterInitialExpiry = initial.expiresAt + 1
-        XCTAssertTrue(try vault.hasHandledCredentialHandoff(owner: owner, scope: reissued, now: afterInitialExpiry))
-        XCTAssertThrowsError(try vault.acceptCredentialHandoff(owner: owner, declaration: declaration,
-            fields: saved.fields, token: "fixture-handoff", certificatePin: nil, scope: reissued,
-            expectedGeneration: saved.generation, requestDeadline: 20_000, now: afterInitialExpiry))
-    }
-
-    private func credentialScope(declaration: CustomHTTPDeclaration, origin: String,
-                                 deliveryID: String = "b7719d8a-103a-46b7-bd4c-12d9d9abf9bb", expiresAt: Int64 = 10_000) throws -> CredentialHandoffScope {
-        let scope: [String: Any] = [
-            "version": 1, "accountRoute": String(repeating: "1", count: 64), "relayOrigin": "https://relay.test",
-            "deliveryID": deliveryID, "pairID": "AAAAAAAAAAAAAAAAAAAAAA",
-            "requestID": "fixture-request", "inputDigest": String(repeating: "2", count: 64), "deviceID": "fixture-device",
-            "screenID": screenID, "operationID": "fixture-operation", "alias": alias, "name": "Read only fixture",
-            "origin": origin, "serviceID": declaration.id, "declarationDigest": try CredentialHandoffScope.declarationDigest(declaration),
-            "expiresAt": expiresAt,
+        let context = try registrationContext(declaration: declaration, origin: saved.origin, expectedGeneration: saved.generation)
+        let pending = try vault.prepareCredentialRegistration(owner: owner, context: context, now: 50)
+        var wire: [String: Any] = [
+            "version": 1, "registrationID": pending.registrationID, "requestID": context.requestID,
+            "inputDigest": context.inputDigest, "operationID": context.operationID, "deviceID": context.deviceID,
+            "screenID": context.screenID, "screenRevision": context.revision, "alias": context.alias,
+            "serviceID": context.serviceID, "origin": context.origin, "readPath": context.readPath,
+            "declarationDigest": context.declarationDigest, "expiresAt": context.deadlineAt
         ]
-        return try JSONDecoder().decode(CredentialHandoffScope.self, from: JSONSerialization.data(withJSONObject: scope))
+        func decode() throws -> CredentialRegistrationReceipt {
+            try JSONDecoder().decode(CredentialRegistrationReceipt.self, from: JSONSerialization.data(withJSONObject: wire))
+        }
+        XCTAssertTrue(try decode().isCurrent(for: pending, now: 50))
+        XCTAssertFalse(try decode().isCurrent(for: pending, now: context.deadlineAt))
+        wire["expiresAt"] = context.deadlineAt + 1
+        XCTAssertFalse(try decode().matches(pending))
+        wire["expiresAt"] = context.deadlineAt
+        for key in ["registrationID", "screenRevision", "readPath", "deviceID", "declarationDigest"] {
+            let valid = wire[key]
+            wire[key] = "different"
+            XCTAssertFalse(try decode().matches(pending))
+            wire[key] = valid
+        }
+        try vault.requestCredentialRegistrationRemoval(owner: owner, registrationID: pending.registrationID)
+        XCTAssertEqual(vault.status(owner: owner, declaration: declaration), saved)
+        XCTAssertEqual(try vault.credentialRegistrationRemovals(owner: owner, deviceID: context.deviceID).first?.registrationID, pending.registrationID)
+        XCTAssertThrowsError(try vault.prepareCredentialRegistration(owner: owner, context: context, now: 51))
+    }
+
+    func testCancellationBeforeFirstPostRequiresExactLocalBinding() throws {
+        let (vault, _, declaration) = try configured()
+        let saved = try XCTUnwrap(vault.status(owner: owner, declaration: declaration))
+        let context = try registrationContext(declaration: declaration, origin: saved.origin, expectedGeneration: saved.generation)
+        let prepared = try vault.prepareCredentialRegistration(owner: owner, context: context, now: 100)
+        try vault.requestCredentialRegistrationRemoval(owner: owner, registrationID: prepared.registrationID)
+        let removal = try XCTUnwrap(vault.credentialRegistrationRemovals(owner: owner, deviceID: context.deviceID).first)
+        var wire: [String: Any] = [
+            "status": "removed", "cancelledBeforeStart": true, "registrationID": removal.registrationID,
+            "requestID": context.requestID, "deviceID": context.deviceID, "alias": context.alias,
+            "screenRevision": context.revision, "deadlineAt": context.deadlineAt
+        ]
+        let origin = "https://cloud.test"
+        func decode() throws -> CredentialRegistrationRemovalAcknowledgement {
+            try JSONDecoder().decode(CredentialRegistrationRemovalAcknowledgement.self, from: JSONSerialization.data(withJSONObject: wire))
+        }
+        XCTAssertTrue(try decode().confirmsRemoval(of: removal, relayOrigin: origin))
+        XCTAssertFalse(try decode().confirmsRemoval(of: prepared, relayOrigin: origin))
+        for key in ["registrationID", "requestID", "deviceID", "alias", "screenRevision", "deadlineAt"] {
+            let value = wire.removeValue(forKey: key)
+            XCTAssertFalse(try decode().confirmsRemoval(of: removal, relayOrigin: origin))
+            wire[key] = value
+        }
+    }
+
+    func testLocalConnectionNameIsOwnerScoped() throws {
+        let store = MemoryCredentialStore()
+        let vault = CustomHTTPDeviceVault(store: store)
+        try vault.renameConnection(owner: owner, serviceID: "fixture", name: "  Friendly name  ")
+        XCTAssertEqual(vault.connectionName(owner: owner, serviceID: "fixture"), "Friendly name")
+        XCTAssertNil(vault.connectionName(owner: "other", serviceID: "fixture"))
+        XCTAssertThrowsError(try vault.renameConnection(owner: owner, serviceID: "fixture", name: "invalid\nname"))
+        try vault.removeOwner(owner)
+        XCTAssertNil(vault.connectionName(owner: owner, serviceID: "fixture"))
+    }
+
+    private func registrationContext(declaration: CustomHTTPDeclaration, origin: String,
+                                     expectedGeneration: UUID?) throws -> CredentialRegistrationContext {
+        try .init(requestID: "fixture-request", inputDigest: String(repeating: "2", count: 64),
+            operationID: "fixture-operation", deviceID: "fixture-device", screenID: screenID, alias: alias,
+            serviceID: declaration.id, origin: origin, readPath: "/api/queue",
+            declarationDigest: CredentialRegistrationContext.declarationDigest(declaration),
+            deadlineAt: 900_000, revision: "fixture-revision", expectedGeneration: expectedGeneration)
     }
 
     func testCertificateRotationRequiresFreshApprovalAndCannotMoveToAnotherOrigin() throws {

@@ -37,12 +37,13 @@ function authenticate(s) {
     s.origin, s.serviceID, s.declarationDigest, s.expiresAt]);
   const derive = (purpose) => hkdfSync('sha256', pairKey, Buffer.from(s.deliveryID),
     Buffer.from('screenpunk-credential-handoff-v1:' + purpose), 32);
-  const challenge = createHmac('sha256', derive('challenge')).update(plaintext).digest('base64url');
+  const sign = (purpose) => createHmac('sha256', derive(purpose)).update(plaintext).digest('base64url');
   return {
-    challenge,
-    decrypt(envelope) {
+    challenge: sign('challenge'),
+    pinChallenge: sign('challenge:leaf-sha256'),
+    decrypt(envelope, purpose = 'envelope') {
       const body = Buffer.from(envelope, 'base64url');
-      const decipher = createDecipheriv('aes-256-gcm', derive('envelope'), body.subarray(0, 12));
+      const decipher = createDecipheriv('aes-256-gcm', derive(purpose), body.subarray(0, 12));
       decipher.setAAD(Buffer.from(plaintext));
       decipher.setAuthTag(body.subarray(-16));
       return Buffer.concat([decipher.update(body.subarray(12, -16)), decipher.final()]).toString();
@@ -152,4 +153,58 @@ test('generates a private import file and a separate helper capability', async (
   assert.equal(pair.capability, undefined);
   assert.notEqual(config.capability, config.pairKey);
   assert.equal(output.includes(config.capability) || output.includes(config.pairKey), false);
+});
+
+test('configured certificate pin requires a second scope-bound proof and cannot deliver a bearer alone', async (t) => {
+  const { config } = await fixture(t);
+  const fingerprint = '8b'.repeat(32);
+  config.credentials[0].leafCertificateSHA256 = fingerprint.toUpperCase().match(/../g).join(':');
+  const auth = authenticate(scope);
+  const mismatched = authenticate({ ...scope, origin: 'https://other.example' });
+  const r = relay([
+    { scope, challenge: auth.challenge },
+    { scope, challenge: auth.challenge, pinChallenge: auth.challenge },
+    { scope, challenge: auth.challenge, pinChallenge: mismatched.pinChallenge },
+    { scope, challenge: auth.pinChallenge, pinChallenge: auth.pinChallenge },
+    { scope, challenge: auth.challenge, pinChallenge: auth.pinChallenge },
+  ]);
+  assert.deepEqual(await processOffers(config, r.fetch, () => expiresAt - 1), { delivered: 1, failed: 0 });
+  assert.equal(r.calls.length, 2);
+  const body = r.calls[1][1].body;
+  assert.equal(body.includes(token), false);
+  assert.equal(body.includes(fingerprint), false);
+  const { envelope } = JSON.parse(body);
+  assert.throws(() => auth.decrypt(envelope));
+  assert.deepEqual(JSON.parse(auth.decrypt(envelope, 'envelope:leaf-sha256')), {
+    bearer: token,
+    leafCertificateSHA256: fingerprint,
+  });
+});
+
+test('rejects invalid fingerprints and bounds full-length bearer and pin payloads', async (t) => {
+  const { config, file } = await fixture(t);
+  const auth = authenticate(scope);
+  config.credentials[0].leafCertificateSHA256 = 'bad';
+  const r = relay([{ scope, challenge: auth.challenge, pinChallenge: auth.pinChallenge }]);
+  await assert.rejects(processOffers(config, r.fetch, () => expiresAt - 1));
+  assert.equal(r.calls.length, 0);
+  config.credentials[0].leafCertificateSHA256 = 'a'.repeat(64);
+  const longestBearer = 'b'.repeat(4096);
+  await writeFile(file, longestBearer);
+  assert.deepEqual(await processOffers(config, r.fetch, () => expiresAt - 1), { delivered: 1, failed: 0 });
+  const { envelope } = JSON.parse(r.calls[1][1].body);
+  assert.ok(Buffer.from(envelope, 'base64url').length <= 4300);
+  assert.equal(JSON.parse(auth.decrypt(envelope, 'envelope:leaf-sha256')).bearer, longestBearer);
+  await writeFile(file, longestBearer + 'b');
+  assert.deepEqual(await processOffers(config, r.fetch, () => expiresAt - 1), { delivered: 0, failed: 1 });
+  assert.equal(r.calls.length, 3);
+});
+
+test('bearer-only configuration keeps using the legacy envelope even with the second proof present', async (t) => {
+  const { config } = await fixture(t);
+  const auth = authenticate(scope);
+  const r = relay([{ scope, challenge: auth.challenge, pinChallenge: auth.pinChallenge }]);
+  assert.deepEqual(await processOffers(config, r.fetch, () => expiresAt - 1), { delivered: 1, failed: 0 });
+  const { envelope } = JSON.parse(r.calls[1][1].body);
+  assert.equal(auth.decrypt(envelope), token);
 });

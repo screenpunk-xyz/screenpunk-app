@@ -20,6 +20,7 @@ struct AgentStatus: Decodable {
     let pluginConnected: Bool?
     let profileID: String?
     let authoringCapabilities: CloudAuthoringCapabilities?
+    let credentialRegistrationVersion: Int?
     let latestRequest: Summary?
     let awaitingApplicationRequestIDs: [String]?
     let command: Command?
@@ -646,9 +647,12 @@ struct AgentStatus: Decodable {
             return try await self.call("api/device/account/delete/prepare", method: "POST", body: ["operationID": captured.operationID], requiredStatus: 200)
         }, execute: { intent, retrying in
             guard let token = intent.deletionToken else { throw DeviceError.message("Account deletion could not be prepared.") }
+            var body = ["operationID": intent.operationID, "deletionToken": token, "confirmation": "DELETE",
+                        "appleRevocationConsent": intent.appleRevocationConsent ?? ""]
+            if let consent = intent.externalCredentialCleanupConsent { body["externalCredentialCleanupConsent"] = consent }
             return try await self.call(
                 retrying ? "auth/account/delete/retry" : "api/device/account/delete", method: "POST",
-                body: ["operationID": intent.operationID, "deletionToken": token, "confirmation": "DELETE", "appleRevocationConsent": intent.appleRevocationConsent ?? ""], authenticated: !retrying, requiredStatus: 200)
+                body: body, authenticated: !retrying, requiredStatus: 200)
         }, persist: saveAccountDeletion)
     }
 
@@ -765,7 +769,11 @@ struct PreferenceSyncResponse: Decodable {
 /// V2 uses logical asset mutations throughout delivery; only native application resolves bytes.
 @MainActor final class CloudAuthoringTransportV2: AuthoringTransportV2 {
     private let cloud: CloudClient
-    init(cloud: CloudClient) { self.cloud = cloud }
+    private let credentialRegistrationRevision: (ApplicationReceiptV1) -> String?
+    init(cloud: CloudClient, credentialRegistrationRevision: @escaping (ApplicationReceiptV1) -> String? = { _ in nil }) {
+        self.cloud = cloud
+        self.credentialRegistrationRevision = credentialRegistrationRevision
+    }
     func capabilities() async throws -> CloudAuthoringCapabilities {
         let status: AgentStatus = try await cloud.call("api/device/status", authoringVersion: 2)
         return status.authoringCapabilities ?? .unavailable
@@ -800,7 +808,9 @@ struct PreferenceSyncResponse: Decodable {
         catch DeviceError.http(let status, _) where status == 409 { }
     }
     func acknowledge(_ receipt: ApplicationReceiptV1) async throws {
-        let _: EmptyResponse = try await cloud.call("api/device/requests/\(receipt.requestID)/application-receipt", method: "POST", body: CloudAuthoringTransport.object(receipt), authoringVersion: 2)
+        guard var body = try CloudAuthoringTransport.object(receipt) as? [String: Any] else { throw ConnectionFailure.validationFailed }
+        if let revision = credentialRegistrationRevision(receipt) { body["credentialRegistrationScreenRevision"] = revision }
+        let _: EmptyResponse = try await cloud.call("api/device/requests/\(receipt.requestID)/application-receipt", method: "POST", body: body, authoringVersion: 2)
     }
     private static func progress(_ response: AgentRequestV2) -> AuthoringProgress {
         AuthoringProgress(status: response.status, caption: response.progress?.caption, updatedAt: response.progress?.updatedAt ?? response.createdAt, deadlineAt: response.deadlineAt)

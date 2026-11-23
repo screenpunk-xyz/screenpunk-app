@@ -547,6 +547,8 @@ struct DeviceAccountDeletionIntent: Codable, Equatable {
     let billingJournalOwner: String?
     var deletionToken: String?
     var appleRevocationConsent: String?
+    var externalCredentialCleanupRequired: Bool?
+    var externalCredentialCleanupConsent: String?
     var lastFailure: DeviceAccountDeletionDiagnostic?
     var serverConfirmed = false
     var manualAppleRevocationRequired = false
@@ -587,6 +589,7 @@ enum DeviceAccountDeletionFailure: LocalizedError, Equatable {
     enum Pending: String, Decodable, CaseIterable {
         case billingUnavailable = "billing_deletion_unavailable"
         case appleConsent = "apple_revocation_consent_required"
+        case externalCredentialConsent = "external_credential_cleanup_consent_required"
         case auth = "auth_deletion_pending"
         case apple = "apple_revocation_pending"
         case billing = "billing_deletion_pending"
@@ -601,6 +604,7 @@ enum DeviceAccountDeletionFailure: LocalizedError, Equatable {
         switch self {
         case .pending(.billingUnavailable, _): return "Account deletion is waiting for the billing service. Your recovery information is saved on this iPad."
         case .pending(.appleConsent, _): return "Apple authorization still needs confirmation. Your recovery information is saved on this iPad."
+        case .pending(.externalCredentialConsent, _): return "Review credential cleanup at your connection providers before continuing."
         case .pending(.auth, _): return "Screenpunk has not finished removing account sign-in access. Your recovery information is saved on this iPad."
         case .pending(.apple, _): return "Screenpunk has not finished disconnecting Apple sign-in. Your recovery information is saved on this iPad."
         case .pending(.billing, _): return "Screenpunk has not finished removing account billing data. Your recovery information is saved on this iPad."
@@ -614,11 +618,14 @@ enum DeviceAccountDeletionFailure: LocalizedError, Equatable {
 /// Persistence must complete before the destructive request. A failed/lost response keeps the same retry capability.
 enum DeviceAccountDeletionTransaction {
     static let appleAuthorizationWarning = "If you use Sign in with Apple, deletion also disconnects it for Screenpunk. You may need to sign in again in other Screenpunk environments; their data will not be deleted."
+    static let externalCredentialCleanupWarning = "Removal of some credentials at your connection providers is unconfirmed. You can delete your Screenpunk account now. To revoke those credentials, remove them at the providers directly."
     struct Preparation: Decodable {
         let operationID: String
         let deletionToken: String
         var appleRevocationConsentRequired = false
         var appleAuthorizationWarning: String?
+        var externalCredentialCleanupRequired: Bool?
+        var externalCredentialCleanupWarning: String?
     }
     struct Result: Decodable {
         let deleted: Bool
@@ -630,6 +637,13 @@ enum DeviceAccountDeletionTransaction {
     /// A partial response describes a pending operation, never successful deletion.
     static func validateHTTPResponse(_ data: Data, status: Int, operationID: String) throws {
         if status == 200 { return }
+        if status == 409,
+           let problem = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           problem["operationID"] as? String == operationID, problem["deleted"] as? Bool == false,
+           problem["retryable"] as? Bool == true, problem["externalCredentialCleanupRequired"] as? Bool == true,
+           problem["error"] as? String == DeviceAccountDeletionFailure.Pending.externalCredentialConsent.rawValue {
+            throw DeviceAccountDeletionFailure.pending(.externalCredentialConsent)
+        }
         if status == 503 {
             struct Partial: Decodable {
                 let deleted: Bool
@@ -669,12 +683,20 @@ enum DeviceAccountDeletionTransaction {
                 throw DeviceError.message("The Apple authorization warning changed. Update Screenpunk before deleting this account.")
             }
             intent.deletionToken = preparation.deletionToken
+            intent.externalCredentialCleanupRequired = preparation.externalCredentialCleanupRequired
             try persist(intent)
+        }
+        if intent.externalCredentialCleanupRequired == true && intent.externalCredentialCleanupConsent != "CONTINUE" {
+            throw DeviceAccountDeletionFailure.pending(.externalCredentialConsent)
         }
         let response: Result
         do { response = try await execute(intent, retrying) }
         catch let failure as DeviceAccountDeletionFailure {
-            if case .pending(_, let diagnostic) = failure {
+            if case .pending(let kind, let diagnostic) = failure {
+                if kind == .externalCredentialConsent {
+                    intent.externalCredentialCleanupRequired = true
+                    intent.externalCredentialCleanupConsent = nil
+                }
                 intent.lastFailure = diagnostic
                 try persist(intent)
             }

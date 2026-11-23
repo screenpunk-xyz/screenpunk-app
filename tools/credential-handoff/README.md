@@ -1,5 +1,7 @@
 # Screenpunk credential handoff helper
 
+**Legacy qualification fixture.** The current agent-assisted setup flow uses [source-side credential registration](../credential-registration/README.md). It does not require running this helper or pairing an iPad. This guide applies only to earlier development builds that implemented the helper protocol.
+
 Run the helper on a trusted Mac or Linux host where its service user can read the dedicated bearer token. The helper accepts work for one paired iPad and only for credential mappings the operator installs locally. Screenpunk Cloud and the authoring agent receive requests, public scope, delivery state, and an encrypted envelope. The bearer remains in the helper and the accepting iPad.
 
 ## Set up one iPad
@@ -33,6 +35,8 @@ Run the helper on a trusted Mac or Linux host where its service user can read th
 
    In the iPad’s custom connection editor, enter the exact HTTPS server and expand **Details for helper setup**. Copy **Connection ID**, **Declaration SHA-256**, and **Server** into `serviceID`, `declarationDigest`, and `origin`. The iPad derives the digest from the installed declaration. The operator chooses a name for the source, and uses that exact name when asking the agent to request the handoff. The server value is a canonical origin, without an endpoint path or trailing slash. Each name is unique within the pair, starts with a lowercase letter, and is 2 to 48 characters using lowercase letters, digits and hyphens. A changed server or declaration requires an explicit mapping update. The local path must be absolute and point to a regular non-symlink file owned by the helper user, with no group or other access. The file contains only the bearer, optionally followed by one line ending. Maintain configuration permissions when editing.
 
+   For a private HTTPS server that requires certificate pinning, the operator can add `"leafCertificateSHA256": "<64 hex digits>"` to the same mapping. Obtain the leaf SHA-256 fingerprint through an authenticated administrative channel. The helper does not discover the fingerprint from the queried endpoint or accept one from the agent. A configured fingerprint is delivered with the bearer only to a device that proves support for the combined offer. Review the exact server and fingerprint on the iPad before saving. When the leaf certificate changes, verify the replacement independently and update the mapping.
+
 4. Start the helper:
 
    ```sh
@@ -43,7 +47,7 @@ Run the helper on a trusted Mac or Linux host where its service user can read th
 
 ## Author and accept a handoff
 
-In an agent request, identify the configured credential by its name and ask the agent to deliver it for the named connection. After an authorized screen request has established an exact connection setup proposal, the assigned agent can call `request_credential_handoff` with that request ID, the declared alias and the configured credential name. The iPad authorizes a challenge for that scope, the helper encrypts the matching token, and the user can accept it in native Settings. Certificate trust and screen approval remain separate. Disconnect a helper from the iPad's native Settings to revoke its relay capability.
+In an agent request, identify the configured credential by its name and ask the agent to deliver it for the named connection. After an authorized screen request has established an exact connection setup proposal, the assigned agent can call `request_credential_handoff` with that request ID, the declared alias and the configured credential name. The iPad authorizes a challenge for that scope and the helper encrypts the matching token and the operator-configured leaf fingerprint, if present. The user reviews the server, credential and any proposed fingerprint in native Settings. Screen approval remains separate. Disconnect a helper from the iPad's native Settings to revoke its relay capability.
 
 ## Protocol v1
 
@@ -59,6 +63,8 @@ The authenticated bytes are UTF-8 JSON serialization of the following array with
 
 Derive two 32-byte keys with HKDF-SHA256, using the raw pair key as IKM, UTF-8 delivery ID as salt, and UTF-8 `screenpunk-credential-handoff-v1:challenge` or `screenpunk-credential-handoff-v1:envelope` as info. The challenge is HMAC-SHA256 of the authenticated bytes with the challenge key. The envelope uses AES-256-GCM with a fresh 12-byte random nonce, the authenticated bytes as AAD, and the bearer bytes as plaintext. Encode `nonce || ciphertext || 16-byte tag` as canonical unpadded base64url. A different account route, relay, device, proposal, field scope, or delivery expiration invalidates the corresponding message authentication.
 
-The helper polls `GET /api/credential-handoff/{accountRoute}/{pairID}` for `{offers:[{scope,challenge}]}` and posts `{envelope}` to the same path with `/{deliveryID}` appended. It checks the challenge, fixed configuration scope and expiration before opening a local token file. An offer is usable for at most 15 minutes, subject to the original request deadline. The relay accepts one immutable envelope for a delivery. The app handles one-time acceptance and stores the accepted bearer in device-local Keychain.
+For a combined offer, the iPad also sends `pinChallenge`, computed the same way as `challenge` with the HKDF info `screenpunk-credential-handoff-v1:challenge:leaf-sha256`. A helper configured with a fingerprint requires both proofs before reading the bearer. It encrypts compact UTF-8 JSON with the exact fields `bearer` and `leafCertificateSHA256` under the separate HKDF info `screenpunk-credential-handoff-v1:envelope:leaf-sha256`. The fingerprint is 64 lowercase hexadecimal digits inside the envelope. Both proofs and the ciphertext bind the existing authenticated scope including the exact HTTPS origin. The combined envelope has a 4,300-byte decoded cap. Bearer-only envelopes keep their original format with a 4,124-byte cap. Pairing files and existing pairings remain usable.
+
+The helper polls `GET /api/credential-handoff/{accountRoute}/{pairID}` for `{offers:[{scope,challenge,pinChallenge?}]}` and posts `{envelope}` to the same path with `/{deliveryID}` appended. It checks the challenge, fixed configuration scope and expiration before opening a local token file. An offer is usable for at most 15 minutes, subject to the original request deadline. The relay accepts one immutable envelope for a delivery. The app handles one-time acceptance and stores the accepted bearer in device-local Keychain.
 
 Run the offline, synthetic helper tests with `node --test tools/credential-handoff/helper.test.mjs`.

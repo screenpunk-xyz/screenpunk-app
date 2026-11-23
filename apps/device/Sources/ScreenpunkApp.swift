@@ -1114,7 +1114,6 @@ struct CloudListenerSetupView_Previews: PreviewProvider {
 enum DeviceSettingsPage: String, Hashable {
     case overview = "Overview", guidedAccess = "Guided Access", display = "General", account = "Account", screens = "Screens"
     case home = "Home Assistant", television = "Google TV", calendar = "Google Calendar", customConnections = "Custom Connections"
-    case credentialHelper = "Credential Helper"
     var symbol: String {
         switch self {
         case .overview: return "hand.draw"
@@ -1126,7 +1125,6 @@ enum DeviceSettingsPage: String, Hashable {
         case .television: return "tv"
         case .calendar: return "calendar"
         case .customConnections: return "link"
-        case .credentialHelper: return "key"
         }
     }
 }
@@ -1173,7 +1171,7 @@ private struct CustomConnectionAccessModal: ViewModifier {
             })) {
                 if let prompt {
                     NavigationStack {
-                        DeviceCustomConnectionSettings(model: model, use: prompt.use, owner: prompt.owner, allowsApproval: true)
+                        DeviceCustomConnectionSettings(model: model, use: prompt.use, owner: prompt.owner, focusScreen: prompt.use.id)
                             .toolbar { ToolbarItem(placement: .confirmationAction) {
                                 Button("Done") { detailsID = nil; model.customConnectionPrompt = nil }
                             } }
@@ -1439,7 +1437,7 @@ struct DeviceSettingsView: View {
         case let .custom(id, alias, owner):
             if owner == model.permissionOwner,
                let use = model.customConnectionUses().first(where: { $0.screen.id == id && $0.alias == alias }) {
-                DeviceCustomConnectionSettings(model: model, use: use, owner: owner, allowsApproval: true)
+                sharedCustomConnection(use.declaration.id, owner: owner, focus: use)
             } else { Text("Connection unavailable") }
         case let .sharedCustom(id, owner):
             if owner == model.permissionOwner { sharedCustomConnection(id, owner: owner) }
@@ -1451,8 +1449,7 @@ struct DeviceSettingsView: View {
         if !model.manifests(requiring: ["home"]).isEmpty { pages.append(.home) }
         if !model.manifests(requiring: ["googleCalendar", "google-calendar"]).isEmpty { pages.append(.calendar) }
         if !model.manifests(requiring: ["googleTV"]).isEmpty { pages.append(.television) }
-        if !model.customConnectionUses().isEmpty { pages.append(.customConnections) }
-        if model.canPairCredentialHelper || model.credentialHelperPairID != nil { pages.append(.credentialHelper) }
+        if !model.customConnectionUses().isEmpty || !model.savedCustomConnections.isEmpty { pages.append(.customConnections) }
         return pages
     }
 
@@ -1538,8 +1535,6 @@ struct DeviceSettingsView: View {
             }
         case .customConnections:
             customConnections
-        case .credentialHelper:
-            DeviceCredentialHandoffSettings(model: model)
         case .home, .television, .calendar:
             sharedProvider(selection ?? .home)
         }
@@ -1603,51 +1598,35 @@ struct DeviceSettingsView: View {
     private var customConnections: some View {
         let uses = model.customConnectionUses()
         let saved = model.savedCustomConnections
-        let serviceIDs = Set(uses.map { $0.declaration.id })
+        let serviceIDs = Set(uses.map { $0.declaration.id }).union(saved.map(\.id))
         return Form {
             if serviceIDs.isEmpty { Text("No custom connections on this device.").foregroundStyle(.secondary) }
             ForEach(serviceIDs.sorted(), id: \.self) { id in
                 let label = uses.first(where: { $0.declaration.id == id })?.declaration.label
                     ?? saved.first(where: { $0.id == id })?.label ?? id
-                NavigationLink(label, value: ScreenSettingsRoute.sharedCustom(id, owner: model.permissionOwner))
+                NavigationLink(model.connectionName(serviceID: id, fallback: label), value: ScreenSettingsRoute.sharedCustom(id, owner: model.permissionOwner))
             }
         }
     }
 
-    private func sharedCustomConnection(_ serviceID: String, owner: String) -> some View {
+    @ViewBuilder private func sharedCustomConnection(_ serviceID: String, owner: String,
+                                                     focus: DeviceModel.CustomConnectionUse? = nil) -> some View {
         let uses = model.customConnectionUses(serviceID: serviceID)
-        let saved = model.savedCustomConnections.first { $0.id == serviceID }
-        return Form {
-            if let saved {
-                Section("Saved connection") {
-                    LabeledContent("Server", value: saved.origin)
-                    Button("Delete saved connection", role: .destructive) {
-                        customConnectionToRemove = .sharedCustom(serviceID, owner: owner)
-                    }
-                }
+        if let use = focus ?? uses.first(where: { model.customConnectionStatus($0.declaration) != nil }) ?? uses.first {
+            DeviceCustomConnectionSettings(model: model, use: use, owner: owner, focusScreen: focus?.id,
+                                           deletionError: customConnectionError) {
+                customConnectionError = nil
+                customConnectionToRemove = .sharedCustom(serviceID, owner: owner)
             }
-            if !uses.isEmpty {
-                Section("Screens") {
-                    ForEach(uses) { use in
-                        NavigationLink(value: ScreenSettingsRoute.custom(use.screen.id, alias: use.alias, owner: owner)) {
-                            LabeledContent(use.screen.displayName, value: model.customConnectionApproved(use) ? "Allowed" : "Approval required")
-                        }
-                    }
-                }
+        } else if let saved = model.savedCustomConnections.first(where: { $0.id == serviceID }) {
+            OrphanedCustomConnectionSettings(label: model.connectionName(serviceID: serviceID, fallback: saved.label),
+                                             origin: saved.origin, error: customConnectionError) {
+                customConnectionError = nil
+                customConnectionToRemove = .sharedCustom(serviceID, owner: owner)
             }
-            if let use = uses.first {
-                Section {
-                    NavigationLink {
-                        DeviceCustomConnectionSettings(model: model, use: use, owner: owner, allowsApproval: false)
-                    } label: { Text(saved == nil ? "Set up connection" : "Edit connection settings") }
-                }
-            }
-            if let customConnectionError {
-                Section { Text(customConnectionError).foregroundStyle(.red) }
-            }
+        } else {
+            Text("Connection unavailable")
         }
-        .navigationTitle(uses.first?.declaration.label ?? saved?.label ?? serviceID)
-        .disabled(owner != model.permissionOwner || model.accountOperationInProgress)
     }
 
     private func screenDetails(_ saved: ScreenLibrary.Saved, owner: String) -> some View {
@@ -1697,7 +1676,8 @@ struct DeviceSettingsView: View {
                 Section("Custom Connections") {
                     ForEach(customUses, id: \.alias) { use in
                         NavigationLink(value: ScreenSettingsRoute.custom(saved.id, alias: use.alias, owner: owner)) {
-                            LabeledContent(use.declaration.label, value: model.customConnectionApproved(use) ? "Allowed" : "Set up")
+                            let label = model.connectionName(serviceID: use.declaration.id, fallback: use.declaration.label)
+                            LabeledContent(label, value: model.customConnectionApproved(use) ? "Allowed" : "Approval required")
                         }
                     }
                 }

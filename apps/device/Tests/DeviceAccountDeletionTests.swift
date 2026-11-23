@@ -110,6 +110,45 @@ final class DeviceAccountDeletionTests: XCTestCase {
         }
     }
 
+    @MainActor func testUnconfirmedSourceCleanupRequiresSeparateInformedConfirmation() async throws {
+        var saved: DeviceAccountDeletionIntent?
+        do {
+            _ = try await DeviceAccountDeletionTransaction.perform(intent(), prepare: {
+                .init(operationID: "operation", deletionToken: "fixture-deletion", externalCredentialCleanupRequired: true)
+            }, execute: { _, _ in
+                XCTFail("External cleanup must be acknowledged before Cloud erasure")
+                throw Failure.interrupted
+            }, persist: { saved = $0 })
+            XCTFail("Expected separate confirmation")
+        } catch let failure as DeviceAccountDeletionFailure {
+            XCTAssertEqual(failure, .pending(.externalCredentialConsent))
+        }
+        var restored = try JSONDecoder().decode(DeviceAccountDeletionIntent.self, from: JSONEncoder().encode(try XCTUnwrap(saved)))
+        XCTAssertEqual(restored.externalCredentialCleanupRequired, true)
+        XCTAssertNil(restored.externalCredentialCleanupConsent)
+        restored.externalCredentialCleanupConsent = "CONTINUE"
+        let completed = try await DeviceAccountDeletionTransaction.perform(restored, prepare: {
+            XCTFail("The prepared deletion must be reused")
+            throw Failure.interrupted
+        }, execute: { value, retrying in
+            XCTAssertTrue(retrying)
+            XCTAssertEqual(value.externalCredentialCleanupConsent, "CONTINUE")
+            return .init(deleted: true, operationID: "operation", manualAppleRevocationRequired: nil, appleRevocationHelpURL: nil)
+        }, persist: { saved = $0 })
+        XCTAssertTrue(completed.serverConfirmed)
+        XCTAssertEqual(completed.externalCredentialCleanupRequired, true)
+    }
+
+    func testExternalCredentialCleanupConflictRequiresMatchingOperation() throws {
+        let body: [String: Any] = ["deleted": false, "retryable": true, "operationID": "operation",
+            "externalCredentialCleanupRequired": true, "error": "external_credential_cleanup_consent_required"]
+        let data = try JSONSerialization.data(withJSONObject: body)
+        XCTAssertThrowsError(try DeviceAccountDeletionTransaction.validateHTTPResponse(data, status: 409,
+            operationID: "operation")) { XCTAssertEqual($0 as? DeviceAccountDeletionFailure, .pending(.externalCredentialConsent)) }
+        XCTAssertThrowsError(try DeviceAccountDeletionTransaction.validateHTTPResponse(data, status: 409,
+            operationID: "different")) { XCTAssertEqual($0 as? DeviceAccountDeletionFailure, .http(409)) }
+    }
+
     func testPartialHTTPResponseMustMatchOperationAndCannotClaimCompletion() throws {
         for changes in [["operationID": "different"], ["deleted": true], ["retryable": false], ["error": "untrusted-private-detail"]] as [[String: Any]] {
             var body: [String: Any] = ["deleted": false, "retryable": true, "operationID": "operation", "error": "deletion_incomplete"]

@@ -35,27 +35,35 @@ public enum AuthoringContract {
     public static let resultMetadataBytes = 131072
     public static let resultBytes = 393216
 
+    public static let credentialRegistrationFeature = "credential-registration-v1"
+    public static let credentialRegistrationRule: String = {
+        guard case .object(let config) = AuthoringV2Contract.definition["credentialRegistration"],
+              case .string(let rule) = config["rule"] else { preconditionFailure("Bundled credential registration rule missing") }
+        return rule
+    }()
     public static let credentialHandoffFeature = "credential-handoff-v1"
     public static let credentialHandoffRule = "For a Cloud V2 request advertising credential-handoff-v1, a paired helper can deliver a bearer for an HTTPS custom connection. After complete_request succeeds with the matching connectionSetupProposals entry, call request_credential_handoff with the request ID, connection alias and operator-configured credential name. The name identifies the entry on the helper. Never read the bearer or include it in a tool call, screen, setup proposal, progress message or result. Delivery requires separate review on the requesting device. Manual entry is available."
     public static let connectionPrefillFeature = "custom-http-prefill-v1"
     public static let connectionPrefillRule = "When runtime.features includes custom-http-prefill-v1 and schemaVersion is 2, complete_request may include connectionSetupProposals: [{version:1,alias,declaration,fields}]. Write manifest.json in the same result; declaration must exactly equal that alias’s customHTTP declaration. fields contains only nonsecret declared field IDs and string values validated by their types; include the origin URL. Never include credentials, credential references, tokens, headers, or private-network approvals. These are device-local form suggestions for this request’s device and screen, never saved settings or permission. Existing settings remain unchanged. The user reviews setup and access in native UI before any request."
     public static let customHTTPFeature = "custom-http-v1"
 
-    public static func designGuidance(supportsScreenData: Bool, supportsCustomHTTP: Bool = false, supportsConnectionPrefill: Bool = false, supportsCredentialHandoff: Bool = false) -> AuthoringDesignGuidanceV1 {
+    public static func designGuidance(supportsScreenData: Bool, supportsCustomHTTP: Bool = false, supportsConnectionPrefill: Bool = false, supportsCredentialHandoff: Bool = false, supportsCredentialRegistration: Bool = false) -> AuthoringDesignGuidanceV1 {
         var guidance = designGuidance
         if supportsScreenData { guidance.rules += definition.screenData?.rules ?? [] }
         if supportsCustomHTTP { guidance.rules += definition.customHTTP?.rules ?? [] }
         if supportsConnectionPrefill { guidance.rules.append(connectionPrefillRule) }
         if supportsCredentialHandoff { guidance.rules.append(credentialHandoffRule) }
+        if supportsCredentialRegistration { guidance.rules.append(credentialRegistrationRule) }
         return guidance
     }
 
-    public static func runtime(supportsScreenData: Bool, supportsCustomHTTP: Bool = false, supportsConnectionPrefill: Bool = false, supportsCredentialHandoff: Bool = false) -> AuthoringRuntimeV1 {
+    public static func runtime(supportsScreenData: Bool, supportsCustomHTTP: Bool = false, supportsConnectionPrefill: Bool = false, supportsCredentialHandoff: Bool = false, supportsCredentialRegistration: Bool = false) -> AuthoringRuntimeV1 {
         var runtime = runtime
         if supportsScreenData { runtime.features += definition.screenData?.features ?? [] }
         if supportsCustomHTTP { runtime.features.append(customHTTPFeature) }
         if supportsConnectionPrefill { runtime.features.append(connectionPrefillFeature) }
         if supportsCredentialHandoff { runtime.features.append(credentialHandoffFeature) }
+        if supportsCredentialRegistration { runtime.features.append(credentialRegistrationFeature) }
         return runtime
     }
 
@@ -93,13 +101,14 @@ public enum AuthoringContract {
         let customHTTP = request.runtime.features.contains(customHTTPFeature)
         let prefill = request.runtime.features.contains(connectionPrefillFeature)
         let handoff = request.runtime.features.contains(credentialHandoffFeature)
-        guard !handoff || (prefill && request.delivery.route == "cloud") else {
+        let registration = request.runtime.features.contains(credentialRegistrationFeature)
+        guard !(handoff || registration) || (prefill && request.delivery.route == "cloud") else {
             throw AuthoringContractError("credential handoff requires Cloud connection prefill")
         }
         guard !prefill || customHTTP else { throw AuthoringContractError("prefill requires custom HTTP") }
         let browser = request.runtime == browserRuntime
-        guard request.runtime == (browser ? browserRuntime : runtime(supportsScreenData: screenData, supportsCustomHTTP: customHTTP, supportsConnectionPrefill: prefill, supportsCredentialHandoff: handoff)),
-              request.designGuidance == (browser ? browserDesignGuidance : designGuidance(supportsScreenData: screenData, supportsCustomHTTP: customHTTP, supportsConnectionPrefill: prefill, supportsCredentialHandoff: handoff)) else { throw AuthoringContractError("unsupported guidance/runtime definition") }
+        guard request.runtime == (browser ? browserRuntime : runtime(supportsScreenData: screenData, supportsCustomHTTP: customHTTP, supportsConnectionPrefill: prefill, supportsCredentialHandoff: handoff, supportsCredentialRegistration: registration)),
+              request.designGuidance == (browser ? browserDesignGuidance : designGuidance(supportsScreenData: screenData, supportsCustomHTTP: customHTTP, supportsConnectionPrefill: prefill, supportsCredentialHandoff: handoff, supportsCredentialRegistration: registration)) else { throw AuthoringContractError("unsupported guidance/runtime definition") }
         if browser, !request.services.isEmpty || !request.preferences.isEmpty {
             throw AuthoringContractError("browser runtime requires empty services and preferences")
         }

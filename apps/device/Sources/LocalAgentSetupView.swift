@@ -349,7 +349,19 @@ private struct LocalAgentAddressRecoveryView: View {
 
 struct DeviceAccountDeletionSection: View {
     @ObservedObject var device: DeviceModel
-    @State private var confirmationAccountID: String?
+    @State private var confirmation: DeletionConfirmation?
+
+    private enum DeletionConfirmation {
+        case account(String)
+        case externalCredentials(String)
+
+        var title: String {
+            switch self {
+            case .account: return "Delete this Screenpunk account?"
+            case .externalCredentials: return "Delete account while credential removal is unconfirmed?"
+            }
+        }
+    }
 
     var body: some View {
         if let accountID = device.accountDeletionTargetID {
@@ -361,15 +373,17 @@ struct DeviceAccountDeletionSection: View {
                         DismissibleMessage(status.text, onDismiss: { device.dismissInlineMessage(.deletionStatus, id: status.id) }).id(status.id)
                             .font(.callout).foregroundStyle(.secondary)
                     }
-                    Button(device.accountDeletionRetryTitle, role: .destructive) {
+                    Button(retryTitle, role: .destructive) {
                         if device.accountDeletionRequiresConfirmation {
-                            confirmationAccountID = accountID
+                            confirmation = .account(accountID)
+                        } else if device.accountDeletionRequiresExternalCredentialConfirmation {
+                            confirmation = .externalCredentials(accountID)
                         } else {
                             Task { await device.deleteAccount(accountID: accountID) }
                         }
                     }
                 } else {
-                    Button("Delete This Account", role: .destructive) { confirmationAccountID = accountID }
+                    Button("Delete This Account", role: .destructive) { confirmation = .account(accountID) }
                         .disabled(device.accountOperationInProgress || device.routeChangeBlocked)
                 }
                 if let failure = device.presentedInlineMessage(.deletionError) {
@@ -381,18 +395,43 @@ struct DeviceAccountDeletionSection: View {
                     .font(.caption).foregroundStyle(.secondary)
                 Link("Manage App Store Subscriptions", destination: URL(string: "https://apps.apple.com/account/subscriptions")!)
             }
-            .alert("Delete this Screenpunk account?", isPresented: Binding(
-                get: { confirmationAccountID != nil },
-                set: { if !$0 { confirmationAccountID = nil } }
-            ), presenting: confirmationAccountID) { capturedAccountID in
-                Button("Delete", role: .destructive) {
-                    confirmationAccountID = nil
-                    Task { await device.deleteAccount(accountID: capturedAccountID, approvedAppleRevocation: true) }
+            .alert(confirmation?.title ?? "", isPresented: Binding(
+                get: { confirmation != nil },
+                set: { if !$0 { confirmation = nil } }
+            ), presenting: confirmation) { requested in
+                switch requested {
+                case .account(let capturedAccountID):
+                    Button("Delete", role: .destructive) {
+                        confirmation = nil
+                        Task { await device.deleteAccount(accountID: capturedAccountID, approvedAppleRevocation: true) }
+                    }
+                case .externalCredentials(let capturedAccountID):
+                    Button("Continue Deleting Account", role: .destructive) {
+                        confirmation = nil
+                        Task {
+                            guard device.accountDeletionTargetID == capturedAccountID,
+                                  device.accountDeletionRequiresExternalCredentialConfirmation else { return }
+                            await device.deleteAccount(accountID: capturedAccountID, approvedExternalCredentialCleanup: true)
+                        }
+                    }
                 }
-                Button("Cancel", role: .cancel) { confirmationAccountID = nil }
-            } message: { _ in
-                Text("Your account, screens and settings will be permanently deleted. This cannot be undone.\n\n\(DeviceAccountDeletionTransaction.appleAuthorizationWarning)\n\nSome security and purchase records remain to prevent old requests or purchases restoring the account. Deleting your account does not cancel an Apple subscription.")
+                Button("Cancel", role: .cancel) { confirmation = nil }
+            } message: { requested in
+                switch requested {
+                case .account:
+                    Text("Your account, screens and settings will be permanently deleted. This cannot be undone.\n\n\(DeviceAccountDeletionTransaction.appleAuthorizationWarning)\n\nSome security and purchase records remain to prevent old requests or purchases restoring the account. Deleting your account does not cancel an Apple subscription.")
+                case .externalCredentials:
+                    Text("\(DeviceAccountDeletionTransaction.externalCredentialCleanupWarning)\n\nEven if a provider is offline, Screenpunk removes saved credentials and access from this iPad.")
+                }
             }
+            .onChange(of: device.accountDeletionTargetID) { _ in confirmation = nil }
         }
+    }
+
+    private var retryTitle: String {
+        if device.accountDeletionRequiresExternalCredentialConfirmation && !device.accountDeletionRequiresConfirmation {
+            return "Review Credential Cleanup"
+        }
+        return device.accountDeletionRetryTitle
     }
 }
