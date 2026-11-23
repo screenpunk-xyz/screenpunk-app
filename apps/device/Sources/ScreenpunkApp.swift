@@ -472,9 +472,10 @@ struct DeviceRootView: View {
     }
 
     private var screenLayer: some View {
-        ZStack {
+        let missing = model.missingConnections.filter { $0.customAlias == nil }
+        return ZStack {
             screenContent
-            if !model.missingConnections.isEmpty && !model.settingsOpen && !speech.recording {
+            if !missing.isEmpty && !model.settingsOpen && !speech.recording {
                 Color.black.opacity(0.35).ignoresSafeArea()
                 VStack(spacing: 16) {
                     Image(systemName: "link.badge.plus").font(.largeTitle)
@@ -486,25 +487,18 @@ struct DeviceRootView: View {
                             .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
                         Button("Allow public data", action: model.allowCurrentPublicData).buttonStyle(.borderedProminent)
                         Button("Review sources", action: model.openConnectionSettings)
-                    } else if let requirement = model.missingConnections.first(where: { $0.customAlias != nil }) {
-                        Text("Connect " + requirement.name).font(.title2.bold())
-                        Text("Set up this connection and allow this screen to read from it.")
-                            .multilineTextAlignment(.center)
-                        Button("Set up " + requirement.name) { model.openConnectionSettings(customAlias: requirement.customAlias) }
-                            .buttonStyle(.borderedProminent)
-                            .accessibilityIdentifier("custom-connection.open")
-                    } else if let unsupported = model.missingConnections.first(where: { $0.unsupportedAlias != nil })?.unsupportedAlias {
+                    } else if let unsupported = missing.first(where: { $0.unsupportedAlias != nil })?.unsupportedAlias {
                         Text("Connection unavailable").font(.title2.bold())
                         Text("This screen requires the “\(unsupported)” connection, which this version of Screenpunk cannot run.")
                             .multilineTextAlignment(.center)
-                    } else if model.missingConnections.count == 1, model.missingConnections.first?.kind == .home {
+                    } else if missing.count == 1, missing.first?.kind == .home {
                         Text("Allow Home Assistant access").font(.title2.bold())
                         Text("Review this screen’s Home Assistant access in its settings.")
                             .multilineTextAlignment(.center)
                         Button("Screen settings", action: model.openConnectionSettings).buttonStyle(.borderedProminent)
                     } else {
                         Text("Finish setting up this screen").font(.title2.bold())
-                        Text("Configure \(model.missingConnections.map(\.name).joined(separator: ", ")) in Settings to use this screen.")
+                        Text("Configure \(missing.map(\.name).joined(separator: ", ")) in Settings to use this screen.")
                             .multilineTextAlignment(.center)
                         Button("Open Settings", action: model.openConnectionSettings).buttonStyle(.borderedProminent)
                     }
@@ -1141,29 +1135,8 @@ private struct CustomConnectionAccessModal: ViewModifier {
             .allowsHitTesting(prompt == nil)
             .overlay {
                 if let prompt {
-                    ZStack {
-                        Color.black.opacity(0.5).ignoresSafeArea()
-                            .onTapGesture { model.customConnectionPrompt = nil }
-                            .accessibilityHidden(true)
-                        VStack(spacing: 16) {
-                            Text("Connection access").font(.headline)
-                            Text("“\(prompt.use.screen.displayName)” needs your approval to use “\(prompt.use.declaration.label)”.")
-                            if let origin = prompt.status?.origin ?? model.customConnectionProposal(prompt.use)?.fields[prompt.use.declaration.originField] {
-                                Text(verbatim: origin).font(.body.monospaced()).fixedSize(horizontal: false, vertical: true)
-                            }
-                            ForEach(prompt.use.declaration.operations, id: \.name) { operation in
-                                Text(verbatim: operation.method + " " + operation.path)
-                            }
-                            if prompt.status != nil {
-                                Button("Approve") { model.approveCustomConnectionPrompt(prompt) }.buttonStyle(.borderedProminent)
-                            }
-                            Button("Show Details") { detailsID = prompt.id }.buttonStyle(.bordered)
-                        }
-                        .multilineTextAlignment(.center).padding(24)
-                        .frame(maxWidth: 420).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
-                        .padding().accessibilityAddTraits(.isModal)
-                        .accessibilityAction(.escape) { model.customConnectionPrompt = nil }
-                    }
+                    CustomConnectionAccessCard(model: model, prompt: prompt) { detailsID = prompt.id }
+                        .id(prompt.id)
                 }
             }
             .sheet(isPresented: Binding(get: { prompt != nil && detailsID == prompt?.id }, set: { presented in
@@ -1173,11 +1146,146 @@ private struct CustomConnectionAccessModal: ViewModifier {
                     NavigationStack {
                         DeviceCustomConnectionSettings(model: model, use: prompt.use, owner: prompt.owner, focusScreen: prompt.use.id)
                             .toolbar { ToolbarItem(placement: .confirmationAction) {
-                                Button("Done") { detailsID = nil; model.customConnectionPrompt = nil }
+                                Button("Done") { detailsID = nil; model.dismissCustomConnectionPrompt(prompt) }
                             } }
                     }
                 }
             }
+    }
+}
+
+private struct CustomConnectionAccessCard: View {
+    @ObservedObject var model: DeviceModel
+    let prompt: DeviceModel.CustomConnectionPrompt
+    let openSettings: () -> Void
+    @State private var detailsExpanded = false
+    @State private var action: Action?
+    @State private var registration: DeviceModel.ProvisioningStatus?
+    @State private var problem: String?
+    @State private var manualSetupRequired = false
+
+    private enum Action: Equatable { case prepare, trust }
+
+    private var origin: String? {
+        prompt.status?.origin ?? prompt.setupOrigin ??
+            model.customConnectionProposal(prompt.use)?.fields[prompt.use.declaration.originField]
+    }
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.5).ignoresSafeArea()
+                .onTapGesture(perform: dismiss)
+                .accessibilityHidden(true)
+            card
+        }
+    }
+
+    private var card: some View {
+        VStack(spacing: 16) {
+            Text(registration == nil ? "Allow connection access?" : "Review the server certificate")
+                .font(.title2.bold())
+            let operation = prompt.use.declaration.operations.count == 1 ? prompt.use.declaration.operations.first?.name ?? "data" : "data"
+            let name = model.connectionName(serviceID: prompt.use.declaration.id, fallback: prompt.use.declaration.label)
+            Text("“\(prompt.use.screen.displayName)” wants to read \(operation) from \(name).")
+            if let origin {
+                Text(verbatim: origin).font(.callout.monospaced()).textSelection(.enabled)
+            }
+            if let fingerprint = registration?.certificateFingerprint {
+                Text("Your setup agent reported this SHA-256 fingerprint. Verify it belongs to this server before trusting it.")
+                    .font(.callout)
+                Text(verbatim: fingerprint).font(.caption.monospaced()).textSelection(.enabled)
+            } else if prompt.status == nil, prompt.setupOrigin != nil, !manualSetupRequired {
+                Text("Allow starts setup for a credential on this iPad. You’ll review the server certificate before the screen can read.")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
+            if !manualSetupRequired && (prompt.status != nil || prompt.setupOrigin != nil) {
+                DisclosureGroup("Connection details", isExpanded: $detailsExpanded) {
+                    ForEach(prompt.use.declaration.operations, id: \.name) { operation in
+                        Text(verbatim: operation.method + " " + operation.path).font(.footnote.monospaced())
+                    }
+                }
+            }
+            if let problem { Text(problem).font(.callout).foregroundStyle(.secondary) }
+            if action != nil {
+                ProgressView(action == .trust ? "Saving connection…" : "Waiting for your agent to verify provider access…")
+            } else if registration?.certificateFingerprint != nil {
+                Button("Trust and allow") { action = .trust }
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("custom-connection.trust-and-allow")
+            } else if !manualSetupRequired && (prompt.status != nil || prompt.setupOrigin != nil) {
+                Button("Allow", action: allow).buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("custom-connection.allow")
+            } else {
+                Button("Connection details", action: openSettings).buttonStyle(.borderedProminent)
+            }
+            Button("Not now", action: dismiss)
+                .disabled(action == .trust)
+                .accessibilityIdentifier("custom-connection.not-now")
+        }
+        .multilineTextAlignment(.center)
+        .padding(24).frame(maxWidth: 420)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18)).padding()
+        .accessibilityAddTraits(.isModal)
+        .accessibilityAction(.escape) { dismiss() }
+        .task(id: action) {
+            guard let action else { return }
+            defer { self.action = nil }
+            problem = nil
+            do {
+                switch action {
+                case .prepare: try await prepare()
+                case .trust:
+                    guard let registration else { return }
+                    try await model.finishInlineConnectionSetup(registration, prompt: prompt)
+                }
+            } catch {
+                if !Task.isCancelled {
+                    problem = "Couldn’t finish secure setup. Try again or review the connection in Settings."
+                    if action == .trust { self.registration = nil; manualSetupRequired = true }
+                }
+            }
+        }
+    }
+
+    private func dismiss() {
+        guard action != .trust else { return }
+        model.dismissCustomConnectionPrompt(prompt)
+    }
+
+    private func allow() {
+        if prompt.status == nil {
+            action = .prepare
+            return
+        }
+        do { try model.approveCustomConnectionPrompt(prompt) }
+        catch {
+            problem = "This connection changed. Dismiss the prompt and try again."
+            manualSetupRequired = true
+        }
+    }
+
+    private func prepare() async throws {
+        var status = try await model.advanceInlineConnectionSetup(prompt, beginIfAvailable: true)
+        for delay in [2, 3, 5, 8] + Array(repeating: 8, count: 13) {
+            guard status?.state == "pending" else { break }
+            try await Task.sleep(for: .seconds(delay))
+            status = try await model.advanceInlineConnectionSetup(prompt, beginIfAvailable: false)
+        }
+        try Task.checkCancellation()
+        switch status?.state {
+        case "ready":
+            registration = status
+        case "pending":
+            problem = "Your agent is still preparing the connection. You can dismiss this and try reading again later."
+        case "unsupported":
+            manualSetupRequired = true
+            problem = "Your agent couldn’t verify setup access at this provider. You can enter its token in Connection details."
+        case "retry", "available":
+            problem = "Automatic setup wasn’t started. Tap Allow to try again."
+        default:
+            manualSetupRequired = true
+            problem = "Automatic setup couldn’t finish. Review the setup in Connection details."
+        }
     }
 }
 
