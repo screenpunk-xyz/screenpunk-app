@@ -132,19 +132,50 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
     }
 
     public func acceptCredentialHandoff(owner: String, declaration: CustomHTTPDeclaration, fields: [String: String],
-                                        token: String, certificatePin: ReviewedCertificatePin?, scope: CredentialHandoffScope,
-                                        expectedGeneration: UUID?, requestDeadline: Int64, now: Int64) throws {
-        guard !token.isEmpty, declaration.auth?.mode == "bearer", scope.serviceID == declaration.id,
+                                        payload: CredentialHandoffPayload, certificatePin: ReviewedCertificatePin?, scope: CredentialHandoffScope,
+                                        allowCertificateUpdate: Bool = false, expectedGeneration: UUID?, requestDeadline: Int64, now: Int64) throws {
+        try payload.requireReviewedPin(certificatePin, for: scope)
+        guard !payload.bearer.isEmpty, declaration.auth?.mode == "bearer", scope.serviceID == declaration.id,
               scope.declarationDigest == (try CredentialHandoffScope.declarationDigest(declaration)) else {
             throw ConnectionFailure.validationFailed
         }
-        try save(owner: owner, declaration: declaration, fields: fields, secret: token, allowInsecureHTTP: false,
-                 certificatePin: certificatePin, delivery: (scope, expectedGeneration, requestDeadline, now))
+        try save(owner: owner, declaration: declaration, fields: fields, secret: payload.bearer, allowInsecureHTTP: false,
+                 certificatePin: certificatePin, delivery: (scope, payload.leafCertificateSHA256, allowCertificateUpdate, expectedGeneration, requestDeadline, now))
+    }
+
+    public func savedPinForCredentialHandoff(owner: String, serviceID: String, origin: String) throws -> ReviewedCertificatePin? {
+        Self.lock.lock(); defer { Self.lock.unlock() }
+        guard let previous = try load()[owner]?.services[serviceID],
+              (try? CredentialHandoffScope.canonicalHTTPSOrigin(previous.origin)) == origin else { return nil }
+        return previous.certificatePin
+    }
+
+    public func requireCredentialHandoffSaveAllowed(owner: String, declaration: CustomHTTPDeclaration, origin: String,
+                                                      offeredFingerprint: String?, allowCertificateUpdate: Bool) throws {
+        Self.lock.lock(); defer { Self.lock.unlock() }
+        try Self.requireCredentialHandoffSaveAllowed(load()[owner]?.services[declaration.id], declaration: declaration,
+                                                       origin: origin, offeredFingerprint: offeredFingerprint,
+                                                       allowCertificateUpdate: allowCertificateUpdate)
+    }
+
+    private static func requireCredentialHandoffSaveAllowed(_ previous: Service?, declaration: CustomHTTPDeclaration,
+                                                             origin: String, offeredFingerprint: String?,
+                                                             allowCertificateUpdate: Bool) throws {
+        guard let previous, (try? CredentialHandoffScope.canonicalHTTPSOrigin(previous.origin)) == origin else { return }
+        let previousFingerprint = previous.certificatePin?.fingerprint
+        let addsOrChangesPin = offeredFingerprint != nil && offeredFingerprint != previousFingerprint
+        if previous.matches(declaration), previous.secret != nil {
+            guard allowCertificateUpdate, addsOrChangesPin else { throw ConnectionFailure.permissionRequired }
+        }
+        if previousFingerprint != nil, addsOrChangesPin, !allowCertificateUpdate {
+            throw ConnectionFailure.certificateRejected
+        }
     }
 
     private func save(owner: String, declaration: CustomHTTPDeclaration, fields: [String: String],
                       secret: String?, allowInsecureHTTP: Bool, certificatePin: ReviewedCertificatePin?,
-                      delivery: (scope: CredentialHandoffScope, expectedGeneration: UUID?, requestDeadline: Int64, now: Int64)?) throws {
+                      delivery: (scope: CredentialHandoffScope, offeredFingerprint: String?, allowCertificateUpdate: Bool,
+                                 expectedGeneration: UUID?, requestDeadline: Int64, now: Int64)?) throws {
         guard !owner.isEmpty else { throw ConnectionFailure.permissionRequired }
         try declaration.validate(alias: "customConnection")
         let visible = declaration.fields.filter { $0.type != "secret" }
@@ -170,6 +201,14 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
             guard try delivery.scope.origin == CredentialHandoffScope.canonicalHTTPSOrigin(origin),
                   delivery.expectedGeneration == previous?.generation else {
                 throw ConnectionFailure.permissionRequired
+            }
+            try Self.requireCredentialHandoffSaveAllowed(previous, declaration: declaration, origin: delivery.scope.origin,
+                                                           offeredFingerprint: delivery.offeredFingerprint,
+                                                           allowCertificateUpdate: delivery.allowCertificateUpdate)
+            if let previous, let previousPin = previous.certificatePin, delivery.offeredFingerprint == nil,
+               (try? CredentialHandoffScope.canonicalHTTPSOrigin(previous.origin)) == delivery.scope.origin,
+               certificatePin?.fingerprint != previousPin.fingerprint {
+                throw ConnectionFailure.certificateRejected
             }
             try Self.recordCredentialHandoff(delivery.scope, requestDeadline: delivery.requestDeadline, account: &account, now: delivery.now)
         }

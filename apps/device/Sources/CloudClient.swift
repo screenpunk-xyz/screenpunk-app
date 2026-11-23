@@ -20,6 +20,7 @@ struct AgentStatus: Decodable {
     let pluginConnected: Bool?
     let profileID: String?
     let authoringCapabilities: CloudAuthoringCapabilities?
+    let credentialHandoffVersion: Int?
     let latestRequest: Summary?
     let awaitingApplicationRequestIDs: [String]?
     let command: Command?

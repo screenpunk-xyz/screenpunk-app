@@ -25,24 +25,42 @@ public struct CredentialHandoffPair: Codable, Sendable {
     }
 
     public func challenge(for scope: CredentialHandoffScope) throws -> String {
+        try proof(for: scope, purpose: "challenge")
+    }
+
+    public func pinChallenge(for scope: CredentialHandoffScope) throws -> String {
+        try proof(for: scope, purpose: "challenge:leaf-sha256")
+    }
+
+    private func proof(for scope: CredentialHandoffScope, purpose: String) throws -> String {
         let message = try scope.authenticatedBytes()
-        let key = try derivedKey(for: scope, purpose: "challenge")
+        let key = try derivedKey(for: scope, purpose: purpose)
         return Self.base64URL(Data(HMAC<SHA256>.authenticationCode(for: message, using: key)))
     }
 
     public func open(_ envelope: String, for scope: CredentialHandoffScope) throws -> String {
-        guard envelope.utf8.count <= 5500, let bytes = Self.decodeBase64URL(envelope),
-              (29...4124).contains(bytes.count) else { throw ConnectionFailure.validationFailed }
-        let message = try scope.authenticatedBytes()
+        let box = try Self.envelopeBox(envelope, maximumBytes: 4124)
         let key = try derivedKey(for: scope, purpose: "envelope")
-        let box = try AES.GCM.SealedBox(combined: bytes)
-        let plaintext = try AES.GCM.open(box, using: key, authenticating: message)
-        guard let token = String(data: plaintext, encoding: .utf8), (1...4096).contains(plaintext.count),
-              plaintext.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) ||
-                  (97...122).contains($0) || [46, 95, 126, 43, 47, 61, 45].contains($0) }) else {
-            throw ConnectionFailure.validationFailed
+        let plaintext = try AES.GCM.open(box, using: key, authenticating: scope.authenticatedBytes())
+        return try CredentialHandoffPayload.decodeBearer(plaintext).bearer
+    }
+
+    public func openPayload(_ envelope: String, for scope: CredentialHandoffScope) throws -> CredentialHandoffPayload {
+        let box = try Self.envelopeBox(envelope, maximumBytes: 4300)
+        let message = try scope.authenticatedBytes()
+        let pinKey = try derivedKey(for: scope, purpose: "envelope:leaf-sha256")
+        if let plaintext = try? AES.GCM.open(box, using: pinKey, authenticating: message) {
+            return try CredentialHandoffPayload.decodeWithPin(plaintext)
         }
-        return token
+        let bearerKey = try derivedKey(for: scope, purpose: "envelope")
+        let plaintext = try AES.GCM.open(box, using: bearerKey, authenticating: message)
+        return try CredentialHandoffPayload.decodeBearer(plaintext)
+    }
+
+    private static func envelopeBox(_ envelope: String, maximumBytes: Int) throws -> AES.GCM.SealedBox {
+        guard envelope.utf8.count <= (maximumBytes * 4 + 2) / 3, let bytes = decodeBase64URL(envelope),
+              (29...maximumBytes).contains(bytes.count) else { throw ConnectionFailure.validationFailed }
+        return try AES.GCM.SealedBox(combined: bytes)
     }
 
     private func derivedKey(for scope: CredentialHandoffScope, purpose: String) throws -> SymmetricKey {
@@ -66,6 +84,42 @@ public struct CredentialHandoffPair: Codable, Sendable {
             String(repeating: "=", count: (4 - text.utf8.count % 4) % 4)
         guard let bytes = Data(base64Encoded: padded), base64URL(bytes) == text else { return nil }
         return bytes
+    }
+}
+
+public struct CredentialHandoffPayload: Sendable {
+    public let bearer: String
+    public let leafCertificateSHA256: String?
+
+    fileprivate static func decodeWithPin(_ plaintext: Data) throws -> Self {
+        guard let object = try? JSONSerialization.jsonObject(with: plaintext) as? [String: Any],
+              Set(object.keys) == ["bearer", "leafCertificateSHA256"],
+              let bearer = object["bearer"] as? String, isBearer(bearer.utf8),
+              let fingerprint = object["leafCertificateSHA256"] as? String,
+              CredentialHandoffScope.isDigest(fingerprint) else { throw ConnectionFailure.validationFailed }
+        return .init(bearer: bearer, leafCertificateSHA256: fingerprint)
+    }
+
+    fileprivate static func decodeBearer(_ plaintext: Data) throws -> Self {
+        guard isBearer(plaintext), let bearer = String(data: plaintext, encoding: .utf8) else {
+            throw ConnectionFailure.validationFailed
+        }
+        return .init(bearer: bearer, leafCertificateSHA256: nil)
+    }
+
+    private static func isBearer<C: Collection>(_ bytes: C) -> Bool where C.Element == UInt8 {
+        (1...4096).contains(bytes.count) && bytes.allSatisfy {
+            (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) ||
+                [46, 95, 126, 43, 47, 61, 45].contains($0)
+        }
+    }
+
+    public func requireReviewedPin(_ pin: ReviewedCertificatePin?, for scope: CredentialHandoffScope) throws {
+        guard let leafCertificateSHA256 else { return }
+        guard #available(iOS 18, macOS 15, *), let pin, pin.fingerprint == leafCertificateSHA256,
+              try CredentialHandoffScope.canonicalHTTPSOrigin(pin.origin) == scope.origin else {
+            throw ConnectionFailure.certificateRejected
+        }
     }
 }
 
