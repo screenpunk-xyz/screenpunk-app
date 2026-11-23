@@ -535,6 +535,21 @@ enum AuthoringRefreshPolicy {
     }
 }
 
+enum CredentialRegistrationEligibilityIssue: LocalizedError {
+    case system, session, environment, connection, proposal, server
+
+    var errorDescription: String? {
+        switch self {
+        case .system: return "Automatic setup requires iPadOS 18 or later. You can enter a provider token manually."
+        case .session: return "Sign in to the Cloud account that created this screen to use automatic setup."
+        case .environment: return "Automatic setup isn’t available in this Screenpunk environment. You can enter a provider token manually."
+        case .connection: return "Automatic setup requires a bearer connection with one fixed read operation. You can enter a provider token manually."
+        case .proposal: return "There’s no matching setup proposal for this screen on this iPad. Update the screen with your Cloud agent or enter a provider token manually."
+        case .server: return "Automatic setup uses the HTTPS server from this screen’s setup proposal. Use that server or enter a provider token manually."
+        }
+    }
+}
+
 /// Stored in the origin-scoped Keychain. A deletion capability is never a normal login credential.
 struct DeviceAccountDeletionIntent: Codable, Equatable {
     let origin: String

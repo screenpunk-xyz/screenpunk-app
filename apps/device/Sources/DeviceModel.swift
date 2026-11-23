@@ -1722,6 +1722,18 @@ import ScreenpunkLocalTransport
         (try? credentialRegistrationContext(use, owner: owner, server: server, deadlineAt: Self.credentialRegistrationNow + 900_000)) != nil
     }
 
+    func credentialRegistrationUnavailableReason(_ use: CustomConnectionUse, owner: String, server: String) -> String? {
+        guard use.declaration.auth?.mode == "bearer" else { return nil }
+        do {
+            _ = try credentialRegistrationContext(use, owner: owner, server: server, deadlineAt: Self.credentialRegistrationNow + 900_000)
+            return nil
+        } catch let reason as CredentialRegistrationEligibilityIssue {
+            return reason.errorDescription
+        } catch {
+            return "Automatic setup is unavailable for this connection. You can enter a provider token manually."
+        }
+    }
+
     func suggestedCredentialRegistrationOrigin(_ use: CustomConnectionUse, owner: String) -> String? {
         guard let origin = customConnectionProposal(use)?.fields[use.declaration.originField],
               canProvisionConnectionCredential(use, owner: owner, server: origin) else { return nil }
@@ -1735,12 +1747,8 @@ import ScreenpunkLocalTransport
         if let pending = try customHTTPVault.pendingCredentialRegistration(owner: owner, requestID: context.requestID, alias: use.alias) {
             context = try credentialRegistrationContext(use, owner: owner, server: server, deadlineAt: pending.context.deadlineAt)
             guard pending.context == context, !pending.removalRequested else { throw ConnectionFailure.permissionRequired }
-        } else {
-            let availability: CloudCredentialRegistration = try await cloud.call(path, authorizationToken: session.accessToken, authoringVersion: 2)
-            guard availability.status == "available", availability.alias == use.alias else {
-                throw DeviceError.message("Your agent hasn’t confirmed that it can register a credential for this source.")
-            }
         }
+        // Only explicit native setup submits a verifier. Cloud checks the applied proposal, enrollment and assigned agent.
         try await syncInventory()
         try requireCurrentCredentialRegistration(context, use: use, owner: owner, server: server, sessionToken: session.accessToken)
         let pending = try customHTTPVault.prepareCredentialRegistration(owner: owner, context: context, now: Self.credentialRegistrationNow)
@@ -1749,7 +1757,7 @@ import ScreenpunkLocalTransport
         let reply: CloudCredentialRegistration = try await cloud.call(path, method: "POST",
             body: body, authorizationToken: session.accessToken, authoringVersion: 2)
         try requireCurrentCredentialRegistration(context, use: use, owner: owner, server: server, sessionToken: session.accessToken)
-        return try registrationStatus(reply, pending: pending)
+        return try registrationStatus(reply, pending: pending, owner: owner)
     }
 
     func connectionCredentialProvisioningStatus(_ use: CustomConnectionUse, owner: String, server: String) async throws -> ProvisioningStatus? {
@@ -1772,14 +1780,14 @@ import ScreenpunkLocalTransport
                 let reply: CloudCredentialRegistration = try await cloud.call(Self.credentialRegistrationPath(pending.registrationID),
                     authorizationToken: session.accessToken)
                 try requireCurrentCredentialRegistration(pending.context, use: use, owner: owner, server: server, sessionToken: session.accessToken)
-                return try registrationStatus(reply, pending: pending)
+                return try registrationStatus(reply, pending: pending, owner: owner)
             } catch DeviceError.http(404, _) {
                 return .init(state: "retry", registrationID: pending.registrationID, origin: pending.context.origin,
                              certificateFingerprint: nil, receipt: nil)
             }
         }
         let availability: CloudCredentialRegistration = try await cloud.call(Self.credentialRegistrationRequestPath(context.requestID),
-            authorizationToken: session.accessToken, authoringVersion: 2)
+            authorizationToken: session.accessToken, authoringVersion: 2, queryItems: [URLQueryItem(name: "alias", value: use.alias)])
         try requireCurrentCredentialRegistration(context, use: use, owner: owner, server: server, sessionToken: session.accessToken)
         guard availability.status == "available", availability.alias == use.alias else { return nil }
         return .init(state: "available", registrationID: "", origin: context.origin, certificateFingerprint: nil, receipt: nil)
@@ -1822,7 +1830,7 @@ import ScreenpunkLocalTransport
         requestCredentialRegistrationRemovalSync()
     }
 
-    private func registrationStatus(_ reply: CloudCredentialRegistration, pending: PendingCredentialRegistration) throws -> ProvisioningStatus {
+    private func registrationStatus(_ reply: CloudCredentialRegistration, pending: PendingCredentialRegistration, owner: String) throws -> ProvisioningStatus {
         guard let receipt = reply.scope, receipt.relayOrigin == CloudClient.originScope.canonicalOrigin,
               receipt.matches(pending) else { throw ConnectionFailure.permissionRequired }
         let state: String
@@ -1839,6 +1847,10 @@ import ScreenpunkLocalTransport
         case "pending": state = "pending"
         case "accepted": state = "failed" // A lost acknowledgement never causes automatic local installation.
         case "failed": state = "failed"
+        case "unsupported":
+            guard reply.fingerprint == nil else { throw ConnectionFailure.validationFailed }
+            try customHTTPVault.discardUninstalledCredentialRegistration(owner: owner, registrationID: pending.registrationID)
+            state = "unsupported"
         case "removal_pending": state = "removing"
         case "removed": state = "removed"
         default: throw ConnectionFailure.validationFailed
@@ -1850,15 +1862,21 @@ import ScreenpunkLocalTransport
     private func credentialRegistrationContext(_ use: CustomConnectionUse, owner: String, server: String,
                                                deadlineAt: Int64) throws -> CredentialRegistrationContext {
         try requireCurrentCustomConnection(use, owner: owner)
-        guard #available(iOS 18, *), cloudBindingMatches, cloudSupportsCredentialRegistration, let session = cloud.session,
-              let source = connectionCredentialRegistrationSource(use), source.deviceID == session.deviceId,
-              let proposed = customConnectionProposal(use)?.fields[use.declaration.originField],
-              let operation = use.declaration.operations.first, use.declaration.operations.count == 1,
+        guard #available(iOS 18, *) else { throw CredentialRegistrationEligibilityIssue.system }
+        guard cloudBindingMatches, let session = cloud.session else { throw CredentialRegistrationEligibilityIssue.session }
+        guard cloudSupportsCredentialRegistration else { throw CredentialRegistrationEligibilityIssue.environment }
+        guard let operation = use.declaration.operations.first, use.declaration.operations.count == 1,
               operation.method == "GET", operation.parameters.isEmpty, use.declaration.auth?.mode == "bearer" else {
-            throw ConnectionFailure.permissionRequired
+            throw CredentialRegistrationEligibilityIssue.connection
         }
-        let origin = try CredentialRegistrationContext.canonicalHTTPSOrigin(server)
-        guard origin == (try? CredentialRegistrationContext.canonicalHTTPSOrigin(proposed)) else { throw ConnectionFailure.permissionRequired }
+        guard let source = connectionCredentialRegistrationSource(use), source.deviceID == session.deviceId,
+              let proposed = customConnectionProposal(use)?.fields[use.declaration.originField] else {
+            throw CredentialRegistrationEligibilityIssue.proposal
+        }
+        guard let origin = try? CredentialRegistrationContext.canonicalHTTPSOrigin(server),
+              origin == (try? CredentialRegistrationContext.canonicalHTTPSOrigin(proposed)) else {
+            throw CredentialRegistrationEligibilityIssue.server
+        }
         return try .init(requestID: source.requestID, inputDigest: source.inputDigest, operationID: source.operationID,
             deviceID: session.deviceId, screenID: use.screen.id, alias: use.alias, serviceID: use.declaration.id,
             origin: origin, readPath: operation.path, declarationDigest: CredentialRegistrationContext.declarationDigest(use.declaration),

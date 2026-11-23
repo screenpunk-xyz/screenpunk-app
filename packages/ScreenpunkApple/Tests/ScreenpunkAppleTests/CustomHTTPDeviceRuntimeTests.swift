@@ -215,6 +215,22 @@ final class CustomHTTPDeviceRuntimeTests: XCTestCase {
         }
     }
 
+    func testUnsupportedSourceDiscardsOnlyPendingRegistration() throws {
+        let (vault, _, declaration) = try configured()
+        let working = try XCTUnwrap(vault.status(owner: owner, declaration: declaration))
+        let context = try registrationContext(declaration: declaration, origin: working.origin, expectedGeneration: working.generation)
+        let first = try vault.prepareCredentialRegistration(owner: owner, context: context, now: 100)
+        try vault.discardUninstalledCredentialRegistration(owner: owner, registrationID: first.registrationID)
+        XCTAssertNil(try vault.pendingCredentialRegistration(owner: owner, requestID: context.requestID, alias: context.alias))
+        XCTAssertEqual(vault.status(owner: owner, declaration: declaration), working)
+        let retry = try vault.prepareCredentialRegistration(owner: owner, context: context, now: 101)
+        XCTAssertNotEqual(first.registrationID, retry.registrationID)
+        try vault.requestCredentialRegistrationRemoval(owner: owner, registrationID: retry.registrationID)
+        try vault.discardUninstalledCredentialRegistration(owner: owner, registrationID: retry.registrationID)
+        XCTAssertEqual(try vault.credentialRegistrationRemovals(owner: owner, deviceID: context.deviceID).first?.registrationID,
+                       retry.registrationID)
+    }
+
     func testLocalConnectionNameIsOwnerScoped() throws {
         let store = MemoryCredentialStore()
         let vault = CustomHTTPDeviceVault(store: store)

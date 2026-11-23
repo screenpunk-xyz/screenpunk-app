@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import definition from './definitions/authoring-v2.json';
 import fixture from './fixtures/conformance-v2.json';
 import {
-  authoringDesignGuidance, authoringRuntime, CREDENTIAL_REGISTRATION_FEATURE, CREDENTIAL_REGISTRATION_RULE, validateAuthoringRequest,
+  authoringDesignGuidance, authoringRuntime, CREDENTIAL_REGISTRATION_FEATURE, CREDENTIAL_REGISTRATION_LEGACY_RULE, CREDENTIAL_REGISTRATION_RULE, validateAuthoringRequest,
 } from './authoring';
 import { sealAuthoringRequestV2, validateAuthoringResultV2, type AuthoringRequestV2 } from './authoring-v2';
 
@@ -16,7 +16,8 @@ describe('device-generated credential registration negotiation', () => {
   }
 
   it('includes exact opt-in instructions only for a capable Cloud V2 device', async () => {
-    expect(definition.credentialRegistration).toEqual({feature:CREDENTIAL_REGISTRATION_FEATURE,rule:CREDENTIAL_REGISTRATION_RULE});
+    expect(definition.credentialRegistration).toEqual({feature:CREDENTIAL_REGISTRATION_FEATURE,rule:CREDENTIAL_REGISTRATION_RULE,
+      legacyRule:CREDENTIAL_REGISTRATION_LEGACY_RULE});
     const enabled = await sealAuthoringRequestV2(request(true, true));
     expect(enabled.designGuidance.rules).toContain(CREDENTIAL_REGISTRATION_RULE);
     expect(validateAuthoringResultV2({schemaVersion:2, requestID:enabled.requestID,
@@ -26,6 +27,14 @@ describe('device-generated credential registration negotiation', () => {
     const legacy = await sealAuthoringRequestV2(request(true, false));
     expect(legacy.runtime.features).not.toContain(CREDENTIAL_REGISTRATION_FEATURE);
     expect(legacy.designGuidance.rules).not.toContain(CREDENTIAL_REGISTRATION_RULE);
+  });
+
+  it('accepts exact previously sealed announcement guidance and rejects arbitrary rule drift', async () => {
+    const input = request(true, true);
+    input.designGuidance.rules = input.designGuidance.rules.map(rule => rule === CREDENTIAL_REGISTRATION_RULE ? CREDENTIAL_REGISTRATION_LEGACY_RULE : rule);
+    await expect(sealAuthoringRequestV2(input)).resolves.toMatchObject({designGuidance:input.designGuidance});
+    input.designGuidance.rules[input.designGuidance.rules.length - 1] = 'Arbitrary legacy hint';
+    await expect(sealAuthoringRequestV2(input)).rejects.toThrow('unsupported guidance/runtime');
   });
 
   it('requires prefill, Cloud and V2', async () => {

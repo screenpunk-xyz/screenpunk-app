@@ -73,6 +73,13 @@ final class AuthoringV2ContractTests: XCTestCase {
             supportsConnectionPrefill: true, supportsCredentialRegistration: true)
         XCTAssertTrue(try AuthoringV2Contract.seal(request).runtime.features.contains(AuthoringContract.credentialRegistrationFeature))
         XCTAssertTrue(request.designGuidance.rules.contains(AuthoringContract.credentialRegistrationRule))
+        let previousRule = try XCTUnwrap(AuthoringContract.legacyCredentialRegistrationRule)
+        request.designGuidance.rules[request.designGuidance.rules.count - 1] = previousRule
+        let previouslyInstalled = try AuthoringV2Contract.seal(request)
+        XCTAssertEqual(try AuthoringV2Contract.validateRequest(JSONEncoder().encode(previouslyInstalled)), previouslyInstalled)
+        request.designGuidance.rules[request.designGuidance.rules.count - 1] += " altered"
+        XCTAssertThrowsError(try AuthoringV2Contract.seal(request))
+        request.designGuidance.rules[request.designGuidance.rules.count - 1] = previousRule
         request.delivery.route = "local"
         XCTAssertThrowsError(try AuthoringV2Contract.seal(request))
         request.delivery.route = "cloud"

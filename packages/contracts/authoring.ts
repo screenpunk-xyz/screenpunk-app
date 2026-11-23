@@ -128,7 +128,8 @@ function screenBounds(screen: AuthoringScreen): void {
   if (manifest) checkAuthoringManifestScreenData(manifest.content);
 }
 export const CREDENTIAL_REGISTRATION_FEATURE = "credential-registration-v1";
-export const CREDENTIAL_REGISTRATION_RULE = "For a Cloud V2 request advertising credential-registration-v1, first complete the request with the matching HTTPS bearer connectionSetupProposals entry. If this is a source you are independently authorized and able to configure to accept a device-generated SHA-256 verifier, call announce_credential_registration with the request ID and alias. Do not announce provider-issued credentials as configurable. The device must separately initiate registration. Do not request or handle the bearer. The agent must independently confirm source configuration and the exact endpoint certificate before reporting success. Manual entry remains available.";
+export const CREDENTIAL_REGISTRATION_LEGACY_RULE = "For a Cloud V2 request advertising credential-registration-v1, first complete the request with the matching HTTPS bearer connectionSetupProposals entry. If this is a source you are independently authorized and able to configure to accept a device-generated SHA-256 verifier, call announce_credential_registration with the request ID and alias. Do not announce provider-issued credentials as configurable. The device must separately initiate registration. Do not request or handle the bearer. The agent must independently confirm source configuration and the exact endpoint certificate before reporting success. Manual entry remains available.";
+export const CREDENTIAL_REGISTRATION_RULE = "For a Cloud V2 request advertising credential-registration-v1, complete the request with a matching eligible HTTPS bearer connectionSetupProposals entry. Setup starts only after an explicit action on the device. No advance agent announcement is needed. After receiving assigned registration work, independently verify source authorization and support for device-generated SHA-256 verifiers before making any change. Report unsupported if you verified that no source write was attempted. Do not request or handle the bearer. Confirm source configuration and the exact endpoint certificate before reporting success. Manual entry remains available.";
 export const CREDENTIAL_HANDOFF_FEATURE = "credential-handoff-v1";
 export const CREDENTIAL_HANDOFF_RULE = "For a Cloud V2 request advertising credential-handoff-v1, a paired helper can deliver a bearer for an HTTPS custom connection. After complete_request succeeds with the matching connectionSetupProposals entry, call request_credential_handoff with the request ID, connection alias and operator-configured credential name. The name identifies the entry on the helper. Never read the bearer or include it in a tool call, screen, setup proposal, progress message or result. Delivery requires separate review on the requesting device. Manual entry is available.";
 export const CONNECTION_PREFILL_FEATURE = "custom-http-prefill-v1";
@@ -256,7 +257,12 @@ export function validateAuthoringRequest(value: unknown, validatingV2 = false): 
   const browser = isBrowserRuntime(request.runtime);
   const expectedRuntime = browser ? browserAuthoringRuntime() : authoringRuntime(screenData, customHTTP, prefill, handoff, registration);
   const expectedGuidance = browser ? browserAuthoringDesignGuidance() : authoringDesignGuidance(screenData, customHTTP, prefill, handoff, registration);
-  if (runtime !== canonicalJSON(expectedRuntime) || canonicalJSON(request.designGuidance) !== canonicalJSON(expectedGuidance)) fail("unsupported guidance/runtime definition");
+  const guidance = canonicalJSON(request.designGuidance);
+  const legacyRegistrationGuidance = registration ? canonicalJSON({...expectedGuidance,
+    rules:expectedGuidance.rules.map(rule => rule === CREDENTIAL_REGISTRATION_RULE ? CREDENTIAL_REGISTRATION_LEGACY_RULE : rule),
+  }) : undefined;
+  if (runtime !== canonicalJSON(expectedRuntime) || (guidance !== canonicalJSON(expectedGuidance) && guidance !== legacyRegistrationGuidance))
+    fail("unsupported guidance/runtime definition");
   if (browser && (request.services.length || request.preferences.length)) fail("browser runtime requires empty services and preferences");
   const seen = new Set<string>();
   for (const service of request.services) {
