@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import XCTest
 #if os(macOS)
@@ -110,10 +111,11 @@ final class CustomHTTPDeviceRuntimeTests: XCTestCase {
     func testCredentialHandoffOneUseAndDeclarationAndOriginBinding() throws {
         let (vault, manifest, declaration) = try configured()
         let old = try XCTUnwrap(vault.status(owner: owner, declaration: declaration))
-        let fields = ["server": old.origin + ":443", "tag": "weekly"]
-        let scope = try credentialScope(declaration: declaration, origin: old.origin)
+        let newOrigin = "https://handoff.test"
+        let fields = ["server": newOrigin + ":443", "tag": "weekly"]
+        let scope = try credentialScope(declaration: declaration, origin: newOrigin)
         func accept(fields: [String: String], generation: UUID?, now: Int64 = 1) throws {
-            try vault.acceptCredentialHandoff(owner: owner, declaration: declaration, fields: fields, token: "fixture-handoff",
+            try vault.acceptCredentialHandoff(owner: owner, declaration: declaration, fields: fields, payload: .init(bearer: "fixture-handoff", leafCertificateSHA256: nil),
                 certificatePin: nil, scope: scope, expectedGeneration: generation, requestDeadline: 20_000, now: now)
         }
         XCTAssertThrowsError(try accept(fields: fields, generation: nil))
@@ -136,13 +138,81 @@ final class CustomHTTPDeviceRuntimeTests: XCTestCase {
         XCTAssertTrue(vault.isApproved(owner: owner, screenID: screenID, manifest: manifest, alias: alias))
     }
 
+    func testPinEnvelopeSeparatesKeysAndRejectsIncorrectReview() throws {
+        guard #available(iOS 18, macOS 15, *) else { throw XCTSkip("Certificate pins unavailable") }
+        let (_, _, declaration) = try configured()
+        let scope = try credentialScope(declaration: declaration, origin: "https://example.test")
+        let pair = try CredentialHandoffPair.parse("""
+            {"version":1,"relayOrigin":"https://relay.test","pairID":"AAAAAAAAAAAAAAAAAAAAAA","pairKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","capabilityHash":"0000000000000000000000000000000000000000000000000000000000000000"}
+            """, relayOrigin: scope.relayOrigin)
+        let key = SymmetricKey(data: Data(repeating: 0, count: 32))
+        func seal(_ text: String, purpose: String) throws -> String {
+            let derived = HKDF<SHA256>.deriveKey(inputKeyMaterial: key, salt: Data(scope.deliveryID.utf8),
+                info: Data("screenpunk-credential-handoff-v1:\(purpose)".utf8), outputByteCount: 32)
+            let box = try AES.GCM.seal(Data(text.utf8), using: derived, authenticating: scope.authenticatedBytes())
+            return try XCTUnwrap(box.combined).base64EncodedString()
+                .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
+                .replacingOccurrences(of: "=", with: "")
+        }
+        XCTAssertNotEqual(try pair.challenge(for: scope), try pair.pinChallenge(for: scope))
+        let fingerprint = String(repeating: "a", count: 64)
+        let bearer = String(repeating: "t", count: 4096)
+        let json = #"{"bearer":"\#(bearer)","leafCertificateSHA256":"\#(fingerprint)"}"#
+        let envelope = try seal(json, purpose: "envelope:leaf-sha256")
+        XCTAssertThrowsError(try pair.open(envelope, for: scope))
+        let payload = try pair.openPayload(envelope, for: scope)
+        XCTAssertEqual(payload.bearer, bearer)
+        XCTAssertEqual(payload.leafCertificateSHA256, fingerprint)
+        XCTAssertThrowsError(try payload.requireReviewedPin(nil, for: scope))
+        XCTAssertThrowsError(try payload.requireReviewedPin(
+            ReviewedCertificatePin(origin: "https://wrong.test", fingerprint: fingerprint), for: scope))
+        XCTAssertThrowsError(try payload.requireReviewedPin(
+            ReviewedCertificatePin(origin: scope.origin, fingerprint: String(repeating: "b", count: 64)), for: scope))
+        try payload.requireReviewedPin(ReviewedCertificatePin(origin: scope.origin + ":443", fingerprint: fingerprint), for: scope)
+        XCTAssertThrowsError(try pair.openPayload(seal(json, purpose: "envelope"), for: scope))
+        XCTAssertThrowsError(try pair.openPayload(seal("ordinary-bearer", purpose: "envelope:leaf-sha256"), for: scope))
+        let uppercase = json.replacingOccurrences(of: fingerprint, with: fingerprint.uppercased())
+        XCTAssertThrowsError(try pair.openPayload(seal(uppercase, purpose: "envelope:leaf-sha256"), for: scope))
+        let legacy = try seal("ordinary-bearer", purpose: "envelope")
+        XCTAssertEqual(try pair.open(legacy, for: scope), "ordinary-bearer")
+        XCTAssertNil(try pair.openPayload(legacy, for: scope).leafCertificateSHA256)
+    }
+
+    func testHandoffRotatesPinAndBearerOnlyWithMatchingReview() throws {
+        guard #available(iOS 18, macOS 15, *) else { throw XCTSkip("Certificate pins unavailable") }
+        let origin = "https://example.test"
+        let (vault, manifest, declaration) = try configured(origin: origin)
+        let fields = ["server": origin, "tag": "weekly"]
+        let olderPin = try ReviewedCertificatePin(origin: origin, fingerprint: String(repeating: "a", count: 64))
+        let newerPin = try ReviewedCertificatePin(origin: origin, fingerprint: String(repeating: "b", count: 64))
+        try vault.save(owner: owner, declaration: declaration, fields: fields, allowInsecureHTTP: false, certificatePin: olderPin)
+        try vault.approve(owner: owner, screenID: screenID, manifest: manifest, alias: alias)
+        let old = try XCTUnwrap(vault.status(owner: owner, declaration: declaration))
+        let scope = try credentialScope(declaration: declaration, origin: origin)
+        let payload = CredentialHandoffPayload(bearer: "fixture-handoff", leafCertificateSHA256: newerPin.fingerprint)
+        func accept(_ offered: CredentialHandoffPayload, pin: ReviewedCertificatePin?, optedIn: Bool, generation: UUID?) throws {
+            try vault.acceptCredentialHandoff(owner: owner, declaration: declaration, fields: fields, payload: offered,
+                certificatePin: pin, scope: scope, allowCertificateUpdate: optedIn, expectedGeneration: generation,
+                requestDeadline: 20_000, now: 1)
+        }
+        XCTAssertThrowsError(try accept(payload, pin: newerPin, optedIn: false, generation: old.generation))
+        XCTAssertThrowsError(try accept(payload, pin: newerPin, optedIn: true, generation: UUID()))
+        XCTAssertThrowsError(try accept(payload, pin: olderPin, optedIn: true, generation: old.generation))
+        XCTAssertThrowsError(try accept(.init(bearer: "fixture-unpinned", leafCertificateSHA256: nil),
+            pin: olderPin, optedIn: true, generation: old.generation))
+        XCTAssertFalse(try vault.hasHandledCredentialHandoff(owner: owner, scope: scope, now: 1))
+        try accept(payload, pin: newerPin, optedIn: true, generation: old.generation)
+        XCTAssertEqual(vault.status(owner: owner, declaration: declaration)?.certificatePin, newerPin)
+        XCTAssertFalse(vault.isApproved(owner: owner, screenID: screenID, manifest: manifest, alias: alias))
+    }
+
     func testDeclinedCredentialHandoffCannotBeReplayed() throws {
         let (vault, _, declaration) = try configured()
         let saved = try XCTUnwrap(vault.status(owner: owner, declaration: declaration))
         let scope = try credentialScope(declaration: declaration, origin: saved.origin)
         try vault.declineCredentialHandoff(owner: owner, scope: scope, requestDeadline: 20_000, now: 1)
         XCTAssertThrowsError(try vault.acceptCredentialHandoff(owner: owner, declaration: declaration, fields: saved.fields,
-            token: "fixture-handoff", certificatePin: nil, scope: scope, expectedGeneration: saved.generation, requestDeadline: 20_000, now: 2))
+            payload: .init(bearer: "fixture-handoff", leafCertificateSHA256: nil), certificatePin: nil, scope: scope, expectedGeneration: saved.generation, requestDeadline: 20_000, now: 2))
         XCTAssertEqual(vault.status(owner: owner, declaration: declaration), saved)
     }
 
@@ -163,7 +233,7 @@ final class CustomHTTPDeviceRuntimeTests: XCTestCase {
         let afterInitialExpiry = initial.expiresAt + 1
         XCTAssertTrue(try vault.hasHandledCredentialHandoff(owner: owner, scope: reissued, now: afterInitialExpiry))
         XCTAssertThrowsError(try vault.acceptCredentialHandoff(owner: owner, declaration: declaration,
-            fields: saved.fields, token: "fixture-handoff", certificatePin: nil, scope: reissued,
+            fields: saved.fields, payload: .init(bearer: "fixture-handoff", leafCertificateSHA256: nil), certificatePin: nil, scope: reissued,
             expectedGeneration: saved.generation, requestDeadline: 20_000, now: afterInitialExpiry))
     }
 

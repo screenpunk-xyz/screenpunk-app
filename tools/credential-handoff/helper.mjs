@@ -13,6 +13,8 @@ const scopeKeys = [
 ];
 const maximumLifetime = 15 * 60_000;
 const maxOffers = 16;
+const maximumBearerBytes = 4096;
+const maximumPinnedPlaintextBytes = 4300 - 12 - 16;
 const maxResponse = 32 * 1024;
 const ascii = (value) => typeof value === 'string' && /^[ -!#-\[\]-~]{1,512}$/.test(value);
 const namePattern = /^[a-z][a-z0-9-]{1,47}$/u;
@@ -32,6 +34,12 @@ function httpsOrigin(value) {
   } catch { return false; }
 }
 
+function normalizedFingerprint(value) {
+  if (typeof value !== 'string') return null;
+  const fingerprint = value.trim().replaceAll(':', '').toLowerCase();
+  return hex(fingerprint) ? fingerprint : null;
+}
+
 function fail() { throw new Error('Invalid helper configuration or relay response.'); }
 
 export function validateConfig(config) {
@@ -41,7 +49,8 @@ export function validateConfig(config) {
       !Array.isArray(config.credentials) || config.credentials.length < 1 || config.credentials.length > 32) fail();
   for (const entry of config.credentials) {
     if (typeof entry?.name !== 'string' || !namePattern.test(entry.name) || !httpsOrigin(entry.origin) || !ascii(entry.serviceID) ||
-        !hex(entry.declarationDigest) || typeof entry.file !== 'string' || !isAbsolute(entry.file)) fail();
+        !hex(entry.declarationDigest) || typeof entry.file !== 'string' || !isAbsolute(entry.file) ||
+        ('leafCertificateSHA256' in entry && !normalizedFingerprint(entry.leafCertificateSHA256))) fail();
   }
   if (new Set(config.credentials.map((entry) => entry.name)).size !== config.credentials.length) fail();
   return config;
@@ -63,21 +72,28 @@ function matchesScope(scope, config, now) {
     Number.isSafeInteger(scope.expiresAt) && scope.expiresAt > now && scope.expiresAt <= now + maximumLifetime;
 }
 
-function authenticOffer(offer, now, config) {
-  if (!offer || !matchesScope(offer.scope, config, now)) return false;
-  const challenge = raw(offer.challenge, 32);
+function authenticProof(scope, key, proof, purpose) {
+  const challenge = raw(proof, 32);
   if (!challenge) return false;
-  const key = raw(config.pairKey, 32);
-  const expected = createHmac('sha256', derivedKey(key, offer.scope.deliveryID, 'challenge'))
-    .update(message(offer.scope)).digest();
+  const expected = createHmac('sha256', derivedKey(key, scope.deliveryID, purpose))
+    .update(message(scope)).digest();
   return timingSafeEqual(challenge, expected);
 }
 
-function encrypt(scope, key, plaintext) {
+function encrypt(scope, key, plaintext, purpose) {
   const iv = randomBytes(12);
-  const cipher = createCipheriv('aes-256-gcm', derivedKey(key, scope.deliveryID, 'envelope'), iv);
+  const cipher = createCipheriv('aes-256-gcm', derivedKey(key, scope.deliveryID, purpose), iv);
   cipher.setAAD(message(scope));
   return Buffer.concat([iv, cipher.update(plaintext), cipher.final(), cipher.getAuthTag()]).toString('base64url');
+}
+
+function credentialPayload(token, fingerprint) {
+  if (!fingerprint) return token;
+  // The validated bearer alphabet does not need JSON string escaping.
+  const prefix = Buffer.from('{"bearer":"');
+  const suffix = Buffer.from('","leafCertificateSHA256":"' + fingerprint + '"}');
+  if (prefix.length + token.length + suffix.length > maximumPinnedPlaintextBytes) fail();
+  return Buffer.concat([prefix, token, suffix]);
 }
 
 async function readPrivate(file, limit) {
@@ -97,14 +113,14 @@ async function readPrivate(file, limit) {
 }
 
 async function readToken(file) {
-  const bytes = await readPrivate(file, 4098);
+  const bytes = await readPrivate(file, maximumBearerBytes + 2);
   let length = bytes.length;
   if (bytes[length - 1] === 10) {
     length--;
     if (bytes[length - 1] === 13) length--;
   }
   const punctuation = Buffer.from('._~+/=-', 'ascii');
-  if (length < 1 || length > 4096 || !bytes.subarray(0, length).every((byte) =>
+  if (length < 1 || length > maximumBearerBytes || !bytes.subarray(0, length).every((byte) =>
     (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || punctuation.includes(byte))) {
     bytes.fill(0);
     fail();
@@ -144,23 +160,29 @@ export async function processOffers(config, fetchImpl = fetch, now = Date.now) {
   if (!Array.isArray(payload?.offers) || payload.offers.length > maxOffers) fail();
   let delivered = 0;
   let failed = 0;
+  const key = raw(config.pairKey, 32);
   const seen = new Set();
   for (const offer of payload.offers) {
-    if (!authenticOffer(offer, now(), config)) continue;
-    const { scope } = offer;
+    const scope = offer?.scope;
+    if (!matchesScope(scope, config, now()) || !authenticProof(scope, key, offer.challenge, 'challenge')) continue;
     if (seen.has(scope.deliveryID)) continue;
     const entry = config.credentials.find(({ name, origin, serviceID, declarationDigest }) =>
       name === scope.name && origin === scope.origin && serviceID === scope.serviceID &&
       declarationDigest === scope.declarationDigest);
     if (!entry) continue;
+    const fingerprint = normalizedFingerprint(entry.leafCertificateSHA256);
+    if (fingerprint && !authenticProof(scope, key, offer.pinChallenge, 'challenge:leaf-sha256')) continue;
     seen.add(scope.deliveryID);
     try {
       const token = await readToken(entry.file);
+      let payload;
       let envelope;
       try {
         if (scope.expiresAt <= now()) continue;
-        envelope = encrypt(scope, raw(config.pairKey, 32), token);
+        payload = credentialPayload(token, fingerprint);
+        envelope = encrypt(scope, key, payload, fingerprint ? 'envelope:leaf-sha256' : 'envelope');
       } finally {
+        payload?.fill(0);
         token.fill(0);
       }
       const sent = await fetchImpl(path + '/' + scope.deliveryID, {

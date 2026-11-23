@@ -12,7 +12,19 @@ struct DeviceCustomConnectionSettings: View {
     @State private var fingerprint = ""
     @State private var reviewingTrust = false
     @State private var credentialOffer: DeviceModel.ConnectionCredentialOffer?
-    @State private var pendingCredentialSave: DeviceModel.ConnectionCredentialOffer?
+    @State private var helperReview: HelperReview?
+    @State private var certificateUpdateOrigin: String?
+
+    private struct HelperReview: Identifiable {
+        let offer: DeviceModel.ConnectionCredentialOffer
+        let fields: [String: String]
+        let pin: ReviewedCertificatePin?
+        let previousFingerprint: String?
+        let replacedDraftFingerprint: String?
+        let savedServer: String?
+        let isCertificateUpdate: Bool
+        var id: String { offer.scope.deliveryID }
+    }
     @State private var handoffError: String?
     @State private var dismissedDelivery: String?
     @State private var handoffRetry = UUID()
@@ -31,6 +43,14 @@ struct DeviceCustomConnectionSettings: View {
         declaration.fields.first(where: { $0.type == "secret" })?.label
     }
     private var server: String { fields[declaration.originField] ?? "" }
+    private var formHTTPSOrigin: String? { try? CredentialHandoffScope.canonicalHTTPSOrigin(server) }
+    private var isCheckingCertificateUpdate: Bool {
+        certificateUpdateOrigin != nil && formHTTPSOrigin == certificateUpdateOrigin
+    }
+    private var canLookForCredentialOffer: Bool {
+        model.canLookForConnectionCredential(use, owner: owner, server: server,
+                                             allowCertificateUpdate: isCheckingCertificateUpdate)
+    }
     private var canReuseCredential: Bool {
         status?.canReuseCredential(for: server, allowInsecureHTTP: allowInsecureHTTP) == true
     }
@@ -73,6 +93,13 @@ struct DeviceCustomConnectionSettings: View {
                             .textSelection(.enabled)
                     }
                     Button("Edit connection") { editing = true }
+                    if canReuseCredential, let formHTTPSOrigin,
+                       model.canLookForConnectionCredential(use, owner: owner, server: server, allowCertificateUpdate: true) {
+                        Button("Check for a certificate update") {
+                            certificateUpdateOrigin = formHTTPSOrigin
+                            editing = true
+                        }
+                    }
                     if let suggested = model.suggestedCredentialOrigin(use, owner: owner) {
                         Button("Set up suggested server") {
                             fields[declaration.originField] = suggested
@@ -82,7 +109,7 @@ struct DeviceCustomConnectionSettings: View {
                 }
                 if allowsApproval { screenApproval }
             }
-            if enteringSettings && model.canLookForConnectionCredential(use, owner: owner, server: server) {
+            if enteringSettings && canLookForCredentialOffer {
                 credentialHandoffSection
             }
             if enteringSettings && declaration.auth?.mode == "bearer",
@@ -110,21 +137,31 @@ struct DeviceCustomConnectionSettings: View {
         }
         .onChange(of: model.customHTTPRendererKey) { _ in if !editing { loadSettings() } }
         .task(id: credentialLookupID) { await checkCredentialOffers() }
-        .alert("Review certificate trust", isPresented: $reviewingTrust) {
-            Button("Cancel", role: .cancel) { pendingCredentialSave = nil }
-            Button("Save connection") { save(offer: pendingCredentialSave) }
+        .alert(pinEnabled || status?.certificatePin != nil ? "Review certificate trust" : "Replace saved connection?",
+               isPresented: $reviewingTrust) {
+            Button("Cancel", role: .cancel) {}
+            Button("Save connection", action: saveManualConnection)
         } message: {
             Text(trustReview)
         }
-        .onChange(of: fields[declaration.originField]) { newOrigin in
-            if newOrigin != status?.fields[declaration.originField] {
+        .sheet(item: $helperReview) { review in
+            helperReviewSheet(review)
+        }
+        .onChange(of: formHTTPSOrigin) { newOrigin in
+            if newOrigin != certificateUpdateOrigin { certificateUpdateOrigin = nil }
+            guard let savedPin = status?.certificatePin,
+                  let newOrigin,
+                  newOrigin == (try? CredentialHandoffScope.canonicalHTTPSOrigin(savedPin.origin)) else {
                 pinEnabled = false
                 fingerprint = ""
+                return
             }
+            pinEnabled = true
+            fingerprint = savedPin.fingerprint
         }
         .onDisappear {
             secret = ""
-            pendingCredentialSave = nil
+            helperReview = nil
             credentialOffer = nil
             savingCredential?.cancel()
         }
@@ -153,10 +190,19 @@ struct DeviceCustomConnectionSettings: View {
             Button("Save connection") {
                 error = validationMessage(usingCredentialOffer: false)
                 guard error == nil else { return }
-                if pinEnabled || status?.certificatePin != nil { reviewingTrust = true } else { save(offer: nil) }
+                if pinEnabled || status?.certificatePin != nil || (savedService != nil && !secret.isEmpty) {
+                    reviewingTrust = true
+                } else {
+                    saveManualConnection()
+                }
             }.accessibilityIdentifier("custom-connection.save")
             if editing && status != nil {
-                Button("Cancel") { loadSettings(); editing = false; error = nil }
+                Button("Cancel") {
+                    certificateUpdateOrigin = nil
+                    loadSettings()
+                    editing = false
+                    error = nil
+                }
             }
         } header: {
             Text("Connection settings")
@@ -170,7 +216,9 @@ struct DeviceCustomConnectionSettings: View {
             if let offer = credentialOffer, offer.scope.deliveryID != dismissedDelivery {
                 LabeledContent("Credential", value: offer.scope.name)
                 LabeledContent("Server", value: offer.scope.origin)
-                Button("Use token on this iPad") { useCredentialOffer(offer) }
+                Button(offer.certificateFingerprint == nil ? "Review token" : "Review token and certificate") {
+                    reviewCredentialOffer(offer)
+                }
                 Button("Decline", role: .destructive) {
                     savingCredential = Task {
                         defer { savingCredential = nil }
@@ -209,9 +257,10 @@ struct DeviceCustomConnectionSettings: View {
     }
 
     private var credentialLookupID: String? {
-        guard enteringSettings, model.canLookForConnectionCredential(use, owner: owner, server: server),
+        guard enteringSettings, canLookForCredentialOffer,
               let pairID = model.credentialHelperPairID else { return nil }
-        return [owner, use.screen.revision, use.alias, pairID, server, handoffRetry.uuidString].joined(separator: "\n")
+        return [owner, use.screen.revision, use.alias, pairID, formHTTPSOrigin ?? server,
+                isCheckingCertificateUpdate ? "certificate" : "setup", handoffRetry.uuidString].joined(separator: "\n")
     }
 
     private func checkCredentialOffers() async {
@@ -219,9 +268,11 @@ struct DeviceCustomConnectionSettings: View {
         handoffError = nil
         guard credentialLookupID != nil else { return }
         let expectedServer = server
+        let allowCertificateUpdate = isCheckingCertificateUpdate
         do {
             for _ in 0..<30 {
-                let offer = try await model.connectionCredentialOffer(use, owner: owner, server: expectedServer)
+                let offer = try await model.connectionCredentialOffer(use, owner: owner, server: expectedServer,
+                                                                      allowCertificateUpdate: allowCertificateUpdate)
                 try Task.checkCancellation()
                 if let offer, offer.scope.deliveryID != dismissedDelivery {
                     credentialOffer = offer
@@ -237,15 +288,99 @@ struct DeviceCustomConnectionSettings: View {
         }
     }
 
-    private func useCredentialOffer(_ offer: DeviceModel.ConnectionCredentialOffer) {
-        error = validationMessage(usingCredentialOffer: true)
+    private func reviewCredentialOffer(_ offer: DeviceModel.ConnectionCredentialOffer) {
+        let offeredFingerprint = offer.certificateFingerprint
+        error = validationMessage(usingCredentialOffer: true, checkManualPin: offeredFingerprint == nil)
         guard error == nil else { return }
-        if pinEnabled || status?.certificatePin != nil {
-            pendingCredentialSave = offer
-            reviewingTrust = true
-        } else {
-            save(offer: offer)
+        do {
+            let origin = try CredentialHandoffScope.canonicalHTTPSOrigin(server)
+            guard origin == offer.scope.origin else { throw ConnectionFailure.validationFailed }
+            let existingPin = model.savedCertificatePinForCredentialOffer(use, owner: owner, origin: origin)
+            let sameOriginPin = try existingPin.map { try ReviewedCertificatePin(origin: server, fingerprint: $0.fingerprint) }
+            let draftPin = pinEnabled ? try? ReviewedCertificatePin(origin: server, fingerprint: fingerprint) : nil
+            let pin: ReviewedCertificatePin?
+            if let offeredFingerprint {
+                guard #available(iOS 18, *) else {
+                    error = "Reviewing a delivered certificate requires iPadOS 18 or later."
+                    return
+                }
+                pin = try ReviewedCertificatePin(origin: server, fingerprint: offeredFingerprint)
+            } else {
+                pin = draftPin ?? sameOriginPin
+            }
+            let savedFingerprint = (existingPin ?? status?.certificatePin)?.fingerprint
+            let priorDraft = draftPin?.fingerprint
+            helperReview = .init(offer: offer, fields: fields, pin: pin,
+                                 previousFingerprint: savedFingerprint == pin?.fingerprint ? nil : savedFingerprint,
+                                 replacedDraftFingerprint: priorDraft == pin?.fingerprint || priorDraft == savedFingerprint ? nil : priorDraft,
+                                 savedServer: savedService?.origin, isCertificateUpdate: isCheckingCertificateUpdate)
+        } catch {
+            self.error = "This offer doesn’t match the current HTTPS server. Request a new offer for this connection."
         }
+    }
+
+    private func helperReviewSheet(_ review: HelperReview) -> some View {
+        NavigationStack {
+            Form {
+                Section("Connection") {
+                    LabeledContent("Screen", value: use.screen.displayName)
+                    LabeledContent("Server", value: review.offer.scope.origin)
+                    LabeledContent("Credential", value: review.offer.scope.name)
+                    if let savedServer = review.savedServer {
+                        LabeledContent("Currently saved server", value: savedServer)
+                        Text("Saving replaces the stored connection settings and bearer token for this connection.")
+                            .font(.footnote)
+                    }
+                }
+                Section("Requested screen access") {
+                    ForEach(declaration.operations, id: \.name) { operation in
+                        LabeledContent(operation.name, value: operation.method + " " + operation.path)
+                    }
+                    Text("Screen access requires separate approval.")
+                        .font(.footnote)
+                }
+                if let pin = review.pin {
+                    Section {
+                        fingerprintRow(pin.fingerprint)
+                        if let previous = review.previousFingerprint {
+                            Text("Saved certificate SHA-256").font(.footnote)
+                            fingerprintRow(previous)
+                        }
+                        if let draft = review.replacedDraftFingerprint {
+                            Text("Fingerprint entered in this form").font(.footnote)
+                            fingerprintRow(draft)
+                        }
+                    } header: {
+                        Text(review.offer.certificateFingerprint == nil ? "Certificate SHA-256" : "Certificate SHA-256 from your paired helper")
+                    } footer: {
+                        Text("Confirm this fingerprint belongs to the server you intend to use. This pin applies only to the server above.")
+                    }
+                } else if let previous = review.previousFingerprint {
+                    Section("Previous server certificate") {
+                        fingerprintRow(previous)
+                        Text("The previous server’s certificate pin won’t apply to this server. The new server will use system trust.")
+                            .font(.footnote)
+                    }
+                }
+                Button(review.pin == nil ? "Accept token and save" : "Trust certificate, accept token and save") {
+                    helperReview = nil
+                    saveCredentialOffer(review)
+                }
+            }
+            .navigationTitle("Review connection")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { helperReview = nil }
+                }
+            }
+        }
+    }
+
+    private func fingerprintRow(_ value: String) -> some View {
+        let bytes = Array(value.uppercased())
+        let grouped = stride(from: 0, to: bytes.count, by: 4)
+            .map { String(bytes[$0..<min($0 + 4, bytes.count)]) }.joined(separator: " ")
+        return Text(grouped).font(.footnote.monospaced()).textSelection(.enabled)
     }
 
     private var screenApproval: some View {
@@ -320,12 +455,20 @@ struct DeviceCustomConnectionSettings: View {
     }
 
     private var trustReview: String {
-        let server = fields[declaration.originField] ?? ""
-        if pinEnabled { return "Trust the certificate with SHA-256 fingerprint \(fingerprint) for \(server)? Changes require new screen approval." }
-        return "Remove the certificate pin and use system trust for \(server)? Changes require new screen approval."
+        var details: [String] = []
+        if pinEnabled {
+            details.append("Trust the certificate with SHA-256 fingerprint \(fingerprint) for \(server)?")
+        } else if status?.certificatePin != nil {
+            details.append("Remove the certificate pin and use system trust for \(server)?")
+        }
+        if let savedService, !secret.isEmpty {
+            details.append("Saving replaces the bearer token stored for \(savedService.origin).")
+        }
+        details.append("Changes require new screen approval.")
+        return details.joined(separator: " ")
     }
 
-    private func validationMessage(usingCredentialOffer: Bool) -> String? {
+    private func validationMessage(usingCredentialOffer: Bool, checkManualPin: Bool = true) -> String? {
         for field in declaration.fields {
             if field.type == "secret" && usingCredentialOffer { continue }
             if field.type == "secret" && secret.isEmpty {
@@ -340,33 +483,37 @@ struct DeviceCustomConnectionSettings: View {
                 return "Check the value for \(field.label) before saving."
             }
         }
-        if pinEnabled && (try? ReviewedCertificatePin(origin: server, fingerprint: fingerprint)) == nil {
+        if checkManualPin && pinEnabled && (try? ReviewedCertificatePin(origin: server, fingerprint: fingerprint)) == nil {
             return "Check the HTTPS server address and enter its 64-digit SHA-256 fingerprint."
         }
         return nil
     }
 
-    private func save(offer: DeviceModel.ConnectionCredentialOffer?) {
-        defer { pendingCredentialSave = nil }
+    private func saveCredentialOffer(_ review: HelperReview) {
+        guard credentialOffer?.scope.deliveryID == review.id, fields == review.fields,
+              review.isCertificateUpdate == isCheckingCertificateUpdate else {
+            error = "The connection changed while you reviewed the offer. Review it again before saving."
+            return
+        }
+        savingCredential = Task {
+            defer { savingCredential = nil }
+            do {
+                try await model.saveConnectionCredential(review.offer, use: use, owner: owner,
+                                                         fields: review.fields, certificatePin: review.pin)
+                finishSave()
+            } catch {
+                if !Task.isCancelled {
+                    self.error = "The token offer expired or the connection changed. Request a new token offer or enter the token manually."
+                    credentialOffer = nil
+                    handoffRetry = UUID()
+                }
+            }
+        }
+    }
+
+    private func saveManualConnection() {
         do {
             let pin = pinEnabled ? try ReviewedCertificatePin(origin: server, fingerprint: fingerprint) : nil
-            if let offer {
-                let reviewedFields = fields
-                savingCredential = Task {
-                    defer { savingCredential = nil }
-                    do {
-                        try await model.saveConnectionCredential(offer, use: use, owner: owner, fields: reviewedFields, certificatePin: pin)
-                        finishSave()
-                    } catch {
-                        if !Task.isCancelled {
-                            self.error = "The token offer expired or the connection changed. Request a new token offer or enter the token manually."
-                            credentialOffer = nil
-                            handoffRetry = UUID()
-                        }
-                    }
-                }
-                return
-            }
             try model.saveCustomConnection(use, owner: owner, fields: fields, secret: secret.isEmpty ? nil : secret,
                                            allowInsecureHTTP: allowInsecureHTTP && server.lowercased().hasPrefix("http://"),
                                            certificatePin: pin)
@@ -377,6 +524,7 @@ struct DeviceCustomConnectionSettings: View {
     }
 
     private func finishSave() {
+        certificateUpdateOrigin = nil
         loadSettings()
         editing = false
         error = nil
@@ -384,7 +532,7 @@ struct DeviceCustomConnectionSettings: View {
 
     private func approve(_ allowed: Bool) {
         do {
-            try model.setCustomConnectionApproved(allowed, use: use, owner: owner)
+            try model.setCustomConnectionApproved(allowed, use: use, owner: owner, expectedGeneration: status?.generation)
             approved = model.customConnectionApproved(use)
             error = nil
         } catch {
