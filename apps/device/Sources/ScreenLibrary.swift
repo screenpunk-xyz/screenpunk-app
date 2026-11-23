@@ -39,16 +39,15 @@ import ScreenpunkCore
         var packagePaths: [String] { catalogAssetPaths ?? artifact.files.map(\.path) }
         var hasNativeAssets: Bool { catalogAssetPaths != nil || catalogPackageSchema == 2 }
     }
-    struct CredentialHandoffSource: Codable, Equatable {
+    struct CredentialRegistrationSource: Codable, Equatable {
         var requestID: String
         var inputDigest: String
         var operationID: String
         var deviceID: String
-        var deadlineAt: Int64?
     }
     struct ConnectionSetupDraft: Codable {
         var revision: String
-        var credentialHandoff: CredentialHandoffSource?
+        var credentialRegistration: CredentialRegistrationSource?
         var proposals: [CustomHTTPSetupProposal]
     }
     struct State: Codable { var connectionSetupDrafts: [String: ConnectionSetupDraft]?; var screens: [Saved] = []; var selectedID: String?; var previous: Saved?; var lastRequest: String?; var pendingID: String?; var pendingScreenID: String?; var consumedID: String?; var cancelledRequests: [String]?; var cancelIntents: [String]?; var lastInstruction: String?; var keyboardDrafts: [String: String]?; var submissionKey: String?; var submissionText: String?; var submissionScreen: ScreenArtifact?; var requestDeadline: Double?; var authoring: AuthoringStoreState?; var linkedProfile: LocalProfileDescriptor?; var localRequestIDs: Set<String>?; var bundledScreenSeeds: Set<String>?; var catalog: CatalogQueue?; var hiddenScreenIDs: Set<String>?; var onboarding: Onboarding?; var publicDataRevocations: Set<String>?; var screenDataGenerations: [String: String]?; var catalogScreenIDs: [String: Set<String>]?; var catalogLinks: [String: LinkedCatalogInstall]?; var catalogUnlinks: [LinkedCatalogInstall]?; var catalogLinkLibraryID: String?; var linkedEdits: [String: LinkedCatalogEdit]?; var linkedRollback: [String: Saved]?; var catalogForks: [String: CatalogForkPublication]?; var linkedConflictPins: [String: [String]]? }
@@ -1522,10 +1521,18 @@ import ScreenpunkCore
     }
 
     /// The complete next index (screen, CAS mutations, receipt, outbox) is one redo transaction.
-    func connectionCredentialHandoffSource(screenID: String, revision: String) -> CredentialHandoffSource? {
+    func credentialRegistrationRevision(for receipt: ApplicationReceiptV1) -> String? {
+        guard receipt.status == "applied" else { return nil }
+        return state.screens.first { screen in
+            guard let source = connectionCredentialRegistrationSource(screenID: screen.id, revision: screen.revision) else { return false }
+            return source.requestID == receipt.requestID && source.inputDigest == receipt.inputDigest && source.operationID == receipt.operationID
+        }?.revision
+    }
+
+    func connectionCredentialRegistrationSource(screenID: String, revision: String) -> CredentialRegistrationSource? {
         guard state.screens.contains(where: { $0.id == screenID && $0.revision == revision }),
               let draft = state.connectionSetupDrafts?[screenID], draft.revision == revision else { return nil }
-        return draft.credentialHandoff
+        return draft.credentialRegistration
     }
 
     func connectionSetupProposal(screenID: String, revision: String, alias: String, declaration: CustomHTTPDeclaration) -> CustomHTTPSetupProposal? {
@@ -1657,9 +1664,9 @@ import ScreenpunkCore
                 stagedRevision = revision
                 if next.connectionSetupDrafts == nil { next.connectionSetupDrafts = [:] }
                 next.connectionSetupDrafts?[saved.id] = result.connectionSetupProposals.map {
-                    ConnectionSetupDraft(revision: revision, credentialHandoff: request.delivery.route == "cloud" && request.runtime.features.contains(AuthoringContract.credentialHandoffFeature) ? .init(
+                    ConnectionSetupDraft(revision: revision, credentialRegistration: request.delivery.route == "cloud" && request.runtime.features.contains(AuthoringContract.credentialRegistrationFeature) ? .init(
                         requestID: request.requestID, inputDigest: request.delivery.snapshotDigest, operationID: result.operationID,
-                        deviceID: request.context.deviceID, deadlineAt: request.deadlineAt
+                        deviceID: request.context.deviceID
                     ) : nil, proposals: $0)
                 }
                 if let linkedEdit, linkedEdit.scope == .thisDevice, let current, let name = linkedEdit.forkName {

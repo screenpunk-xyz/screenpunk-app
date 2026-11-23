@@ -1947,5 +1947,9 @@ export default {
   "credentialHandoff": {
     "feature": "credential-handoff-v1",
     "rule": "For a Cloud V2 request advertising credential-handoff-v1, a paired helper can deliver a bearer for an HTTPS custom connection. After complete_request succeeds with the matching connectionSetupProposals entry, call request_credential_handoff with the request ID, connection alias and operator-configured credential name. The name identifies the entry on the helper. Never read the bearer or include it in a tool call, screen, setup proposal, progress message or result. Delivery requires separate review on the requesting device. Manual entry is available."
+  },
+  "credentialRegistration": {
+    "feature": "credential-registration-v1",
+    "rule": "For a Cloud V2 request advertising credential-registration-v1, first complete the request with the matching HTTPS bearer connectionSetupProposals entry. If this is a source you are independently authorized and able to configure to accept a device-generated SHA-256 verifier, call announce_credential_registration with the request ID and alias. Do not announce provider-issued credentials as configurable. The device must separately initiate registration. Do not request or handle the bearer. The agent must independently confirm source configuration and the exact endpoint certificate before reporting success. Manual entry remains available."
   }
 } as const;

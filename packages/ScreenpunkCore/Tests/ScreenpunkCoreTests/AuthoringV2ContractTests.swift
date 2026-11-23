@@ -64,6 +64,22 @@ final class AuthoringV2ContractTests: XCTestCase {
         XCTAssertFalse(AuthoringCapabilitiesV2(contractVersions: ["2"], features: []).supportsV2)
         XCTAssertFalse(AuthoringCapabilitiesV2(contractVersions: ["1"], features: ["asset-references-v2"]).supportsV2)
     }
+    func testCredentialRegistrationCapabilityIsCloudAndPrefillScoped() throws {
+        var request = try fixture().request
+        request.delivery.route = "cloud"
+        request.runtime = AuthoringContract.runtime(supportsScreenData: false, supportsCustomHTTP: true,
+            supportsConnectionPrefill: true, supportsCredentialRegistration: true)
+        request.designGuidance = AuthoringContract.designGuidance(supportsScreenData: false, supportsCustomHTTP: true,
+            supportsConnectionPrefill: true, supportsCredentialRegistration: true)
+        XCTAssertTrue(try AuthoringV2Contract.seal(request).runtime.features.contains(AuthoringContract.credentialRegistrationFeature))
+        XCTAssertTrue(request.designGuidance.rules.contains(AuthoringContract.credentialRegistrationRule))
+        request.delivery.route = "local"
+        XCTAssertThrowsError(try AuthoringV2Contract.seal(request))
+        request.delivery.route = "cloud"
+        request.runtime.features.removeAll { $0 == AuthoringContract.connectionPrefillFeature }
+        XCTAssertThrowsError(try AuthoringV2Contract.seal(request))
+    }
+
     func testBOMBytesSurviveAndEscapingCannotExceedMaterializedLimit() throws {
         let f = try fixture(); var request = f.request
         let asset = "\u{FEFF}" + f.assetRecipe.prefix + String(repeating: "A", count: f.assetRecipe.repeatCount) + f.assetRecipe.suffix

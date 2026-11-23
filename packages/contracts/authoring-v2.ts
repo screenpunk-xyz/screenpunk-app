@@ -1,5 +1,5 @@
 import definition from './generated/authoring-v2-definition';
-import { AUTHORING_DEFINITION, CUSTOM_HTTP_FEATURE, CONNECTION_PREFILL_FEATURE, CREDENTIAL_HANDOFF_FEATURE, AuthoringContractError, canonicalJSON, checkAuthoringManifestScreenData, sealAuthoringRequest, validateAuthoringRequest, validateAuthoringResult, validateAuthoringScreen, type AuthoringRequestV1, type AuthoringResultV1, type AuthoringScreen, type JSONSchema } from './authoring';
+import { AUTHORING_DEFINITION, CUSTOM_HTTP_FEATURE, CONNECTION_PREFILL_FEATURE, CREDENTIAL_HANDOFF_FEATURE, CREDENTIAL_REGISTRATION_FEATURE, AuthoringContractError, canonicalJSON, checkAuthoringManifestScreenData, sealAuthoringRequest, validateAuthoringRequest, validateAuthoringResult, validateAuthoringScreen, type AuthoringRequestV1, type AuthoringResultV1, type AuthoringScreen, type JSONSchema } from './authoring';
 export interface AuthoringSourceFileV2 { path: string; mediaType: string; byteLength: number; digest: string; reference: string; content?: string }
 export interface AuthoringSourceScreenV2 { title: string; entry: 'index.html'; files: AuthoringSourceFileV2[]; packageSchema?: 3 }
 export interface AuthoringContextV2 extends Omit<AuthoringRequestV1['context'],'currentScreen'> { libraryID: string; currentScreen?: AuthoringSourceScreenV2 }
@@ -8,7 +8,7 @@ export type AuthoringFileMutationV2 = {kind:'write';path:string;content:string} 
 export interface AuthoringScreenMutationV2 { title:string;entry:'index.html';files:AuthoringFileMutationV2[];deletedPaths:string[];requiredAssets?:string[] }
 export interface AuthoringResultV2 extends Omit<AuthoringResultV1,'schemaVersion'|'screen'> { schemaVersion:2;screen?:AuthoringScreenMutationV2;connectionSetupProposals?:CustomHTTPSetupProposal[] }
 export interface AuthoringCapabilitiesV2 { contractVersions: string[]; features: string[] }
-export const AUTHORING_V2_CAPABILITIES: Readonly<AuthoringCapabilitiesV2> = Object.freeze({contractVersions:Object.freeze(['1','2']) as unknown as string[],features:Object.freeze(['asset-references-v2','package-assets-v2',CUSTOM_HTTP_FEATURE,CONNECTION_PREFILL_FEATURE,CREDENTIAL_HANDOFF_FEATURE]) as unknown as string[]});
+export const AUTHORING_V2_CAPABILITIES: Readonly<AuthoringCapabilitiesV2> = Object.freeze({contractVersions:Object.freeze(['1','2']) as unknown as string[],features:Object.freeze(['asset-references-v2','package-assets-v2',CUSTOM_HTTP_FEATURE,CONNECTION_PREFILL_FEATURE,CREDENTIAL_HANDOFF_FEATURE,CREDENTIAL_REGISTRATION_FEATURE]) as unknown as string[]});
 export function supportsAuthoringV2(value: unknown): boolean { const v = value as AuthoringCapabilitiesV2 | null; return !!v && Array.isArray(v.contractVersions) && v.contractVersions.includes('2') && Array.isArray(v.features) && v.features.includes('asset-references-v2'); }
 export function supportsAuthoringPackageAssets(value: unknown): boolean {
   return supportsAuthoringV2(value) && (value as AuthoringCapabilitiesV2).features.includes('package-assets-v2');
@@ -83,7 +83,7 @@ export async function authoringReferenceV2(request:AuthoringRequestV2,file:Autho
 export async function authoringSnapshotDigestV2(request:AuthoringRequestV2):Promise<string> {const copy=structuredClone(request) as any;delete copy.delivery.snapshotDigest;return authoringContentDigestV2(canonicalJSON(copy));}
 function legacyRequest(request:AuthoringRequestV2):AuthoringRequestV1 {const {libraryID,currentScreen,...context}=request.context;return {...request,schemaVersion:1,context,delivery:{...request.delivery,contractVersion:'1'}};}
 export function validateAuthoringRequestV2(value:unknown):AuthoringRequestV2 {
- validateSchema('Request',value);const request=value as AuthoringRequestV2;validateAuthoringRequest(legacyRequest(request));
+ validateSchema('Request',value);const request=value as AuthoringRequestV2;validateAuthoringRequest(legacyRequest(request), true);
  const source=request.context.currentScreen;
  if(!!source !== (request.context.baseRevision !== null)) fail('base revision and source manifest must appear together');
  if(source) {
@@ -115,7 +115,7 @@ export async function verifyAuthoringReferencesV2(request:AuthoringRequestV2):Pr
 export async function verifyAuthoringRequestDigestV2(request:AuthoringRequestV2):Promise<boolean> {return await verifyAuthoringReferencesV2(request)&&(await authoringSnapshotDigestV2(request))===request.delivery.snapshotDigest;}
 export async function sealAuthoringRequestV2(request:AuthoringRequestV2):Promise<AuthoringRequestV2> {const copy=structuredClone(request);for(const file of copy.context.currentScreen?.files??[])file.reference=await authoringReferenceV2(copy,file);copy.delivery.snapshotDigest=await authoringSnapshotDigestV2(copy);validateAuthoringRequestV2(copy);if(!await verifyAuthoringReferencesV2(copy))fail('source content digest mismatch');return copy;}
 export async function makeAuthoringRequestV2(request:AuthoringRequestV1,libraryID:string,includeContent:(file:{path:string;content:string})=>boolean=file=>!(file.path.endsWith('.svg')&&/data:image\/|base64,/i.test(file.content))):Promise<AuthoringRequestV2> {
- validateAuthoringRequest(request);const {currentScreen,...context}=request.context;const files:AuthoringSourceFileV2[]=[];
+ validateAuthoringRequest(request, true);const {currentScreen,...context}=request.context;const files:AuthoringSourceFileV2[]=[];
  for(const file of currentScreen?.files??[])files.push({path:file.path,mediaType:authoringMediaTypeV2(file.path),byteLength:utf8(file.content).length,digest:await authoringContentDigestV2(file.content),reference:'0'.repeat(64),...(includeContent(file)?{content:file.content}:{})});
  return sealAuthoringRequestV2({...request,schemaVersion:2,context:{...context,libraryID,...(currentScreen?{currentScreen:{title:currentScreen.title,entry:currentScreen.entry,files}}:{})},delivery:{...request.delivery,contractVersion:'2'}});
 }
@@ -126,7 +126,7 @@ export function validateAuthoringResultV2(value:unknown,request?:AuthoringReques
  const {connectionSetupProposals,...legacyMetadata}=metadata;
  const legacy:AuthoringResultV1={...legacyMetadata,schemaVersion:1,...(!result.answer&&!result.preferenceMutations?.length?{answer:'v2 screen validation'}:{})};
  if(request){validateAuthoringRequestV2(request);if(result.requestID!==request.requestID||result.inputDigest!==request.delivery.snapshotDigest||result.baseRevision!==request.context.baseRevision)fail('result is not bound to request snapshot');}
- validateAuthoringResult(legacy,request?legacyRequest(request):undefined);
+ validateAuthoringResult(legacy,request?legacyRequest(request):undefined,true);
  if(utf8(canonicalJSON(result)).length>393216||utf8(canonicalJSON(metadata)).length>131072)fail('result byte limit');
  if(screen){
   const extended = request?.context.currentScreen?.packageSchema === 3;

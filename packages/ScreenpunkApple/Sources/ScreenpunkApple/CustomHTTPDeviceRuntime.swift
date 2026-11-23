@@ -28,6 +28,7 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
         var certificatePin: ReviewedCertificatePin?
         var secret: String?
         var secretDeclarationDigest: String?
+        var credentialRegistrationID: String?
         var origin: String
         var allowInsecureHTTP: Bool
         var generation: UUID
@@ -37,7 +38,7 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
                 definition.fields == declaration.fields && definition.originField == declaration.originField &&
                 definition.auth == declaration.auth &&
                 (secretDeclarationDigest == nil ||
-                 secretDeclarationDigest == (try? CredentialHandoffScope.declarationDigest(declaration)))
+                 secretDeclarationDigest == (try? CredentialRegistrationContext.declarationDigest(declaration)))
         }
 
         var status: Status {
@@ -52,11 +53,24 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
         var generation: UUID
     }
 
+    private struct StoredRegistration: Codable {
+        var registrationID: String
+        var context: CredentialRegistrationContext
+        var verifier: String
+        var pendingBearer: String?
+        var removalRequested: Bool
+
+        var summary: PendingCredentialRegistration {
+            .init(registrationID: registrationID, context: context, verifier: verifier, removalRequested: removalRequested)
+        }
+    }
+
     private struct Account: Codable {
         var services: [String: Service] = [:]
         var approvals: [String: [String: Approval]] = [:]
         var denials: [String: [String: String]]?
-        var consumedDeliveries: [String: Int64]?
+        var credentialRegistrations: [String: StoredRegistration]?
+        var connectionNames: [String: String]?
     }
 
     fileprivate struct Authorized: Sendable {
@@ -88,36 +102,124 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
             .sorted { $0.id < $1.id }
     }
 
-    public func hasHandledCredentialHandoff(owner: String, scope: CredentialHandoffScope, now: Int64) throws -> Bool {
+    public func connectionName(owner: String, serviceID: String) -> String? {
         Self.lock.lock(); defer { Self.lock.unlock() }
-        let consumed = try load()[owner]?.consumedDeliveries ?? [:]
-        return Self.handoffReplayKeys(scope).contains { (consumed[$0] ?? 0) > now }
+        return try? load()[owner]?.connectionNames?[serviceID]
     }
 
-    public func declineCredentialHandoff(owner: String, scope: CredentialHandoffScope, requestDeadline: Int64, now: Int64) throws {
+    public func renameConnection(owner: String, serviceID: String, name: String) throws {
+        let value = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !owner.isEmpty, !serviceID.isEmpty, (1...128).contains(value.utf8.count),
+              value.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }) else {
+            throw ConnectionFailure.validationFailed
+        }
         Self.lock.lock(); defer { Self.lock.unlock() }
         var accounts = try load()
         var account = accounts[owner] ?? Account()
-        try Self.recordCredentialHandoff(scope, requestDeadline: requestDeadline, account: &account, now: now)
+        var names = account.connectionNames ?? [:]
+        guard names.count < 128 || names[serviceID] != nil else { throw ConnectionFailure.sizeLimit }
+        names[serviceID] = value
+        account.connectionNames = names
         accounts[owner] = account
         try persist(accounts)
     }
 
-    private static func handoffReplayKeys(_ scope: CredentialHandoffScope) -> [String] {
-        // Newline cannot occur in authenticated scope identifiers.
-        [scope.deliveryID, "request\n" + scope.requestID + "\n" + scope.alias]
-    }
-
-    private static func recordCredentialHandoff(_ scope: CredentialHandoffScope, requestDeadline: Int64,
-                                                account: inout Account, now: Int64) throws {
-        let keys = handoffReplayKeys(scope)
-        var consumed = (account.consumedDeliveries ?? [:]).filter { $0.value > now }
-        guard scope.isCurrent(now: now, requestDeadline: requestDeadline),
-              keys.allSatisfy({ consumed[$0] == nil }), consumed.count + keys.count <= 256 else {
+    public func prepareCredentialRegistration(owner: String, context: CredentialRegistrationContext,
+                                              now: Int64) throws -> PendingCredentialRegistration {
+        guard !owner.isEmpty, context.isCurrent(now),
+              try CredentialRegistrationContext.canonicalHTTPSOrigin(context.origin) == context.origin else {
+            throw ConnectionFailure.validationFailed
+        }
+        Self.lock.lock(); defer { Self.lock.unlock() }
+        var accounts = try load()
+        var account = accounts[owner] ?? Account()
+        var registrations = account.credentialRegistrations ?? [:]
+        guard account.services[context.serviceID]?.generation == context.expectedGeneration else {
             throw ConnectionFailure.permissionRequired
         }
-        for key in keys { consumed[key] = requestDeadline }
-        account.consumedDeliveries = consumed
+        if let existing = registrations.values.first(where: { $0.context.requestID == context.requestID && $0.context.alias == context.alias }) {
+            guard existing.context == context, existing.pendingBearer != nil, !existing.removalRequested else {
+                throw ConnectionFailure.permissionRequired
+            }
+            return existing.summary
+        }
+        guard registrations.count < 128 else { throw ConnectionFailure.sizeLimit }
+        let generated = try DeviceBearerCredential.generate()
+        let record = StoredRegistration(registrationID: UUID().uuidString.lowercased(), context: context,
+                                        verifier: generated.verifier, pendingBearer: generated.bearer, removalRequested: false)
+        registrations[record.registrationID] = record
+        account.credentialRegistrations = registrations
+        accounts[owner] = account
+        try persist(accounts)
+        return record.summary
+    }
+
+    public func pendingCredentialRegistration(owner: String, requestID: String,
+                                              alias: String) throws -> PendingCredentialRegistration? {
+        Self.lock.lock(); defer { Self.lock.unlock() }
+        return try load()[owner]?.credentialRegistrations?.values.first {
+            $0.context.requestID == requestID && $0.context.alias == alias &&
+                ($0.pendingBearer != nil || $0.removalRequested)
+        }?.summary
+    }
+
+    public func stageStaleCredentialRegistrationRemovals(owner: String, deviceID: String,
+                                                         currentRevisions: [String: String], now: Int64) throws {
+        Self.lock.lock(); defer { Self.lock.unlock() }
+        var accounts = try load()
+        guard var account = accounts[owner] else { return }
+        let stale = (account.credentialRegistrations ?? [:]).values.filter { record in
+            let context = record.context
+            return context.deviceID == deviceID && record.pendingBearer != nil &&
+                (!context.isCurrent(now) || currentRevisions[context.screenID] != context.revision ||
+                    account.services[context.serviceID]?.generation != context.expectedGeneration)
+        }
+        guard !stale.isEmpty else { return }
+        for record in stale { Self.scheduleRemoval(record.registrationID, in: &account) }
+        accounts[owner] = account
+        try persist(accounts)
+    }
+
+    public func credentialRegistrationRemovals(owner: String, deviceID: String) throws -> [PendingCredentialRegistration] {
+        Self.lock.lock(); defer { Self.lock.unlock() }
+        return try load()[owner]?.credentialRegistrations?.values.filter {
+            $0.removalRequested && $0.context.deviceID == deviceID
+        }.map(\.summary) ?? []
+    }
+
+    /// Clear local bearer access and durably remember the exact source ID to revoke, even offline.
+    public func requestCredentialRegistrationRemoval(owner: String, registrationID: String) throws {
+        Self.lock.lock(); defer { Self.lock.unlock() }
+        var accounts = try load()
+        guard var account = accounts[owner],
+              let record = account.credentialRegistrations?[registrationID] else {
+            throw ConnectionFailure.permissionRequired
+        }
+        if account.services[record.context.serviceID]?.credentialRegistrationID == registrationID {
+            account.services[record.context.serviceID] = nil
+            Self.removeApprovals(for: record.context.serviceID, from: &account)
+        }
+        Self.scheduleRemoval(registrationID, in: &account)
+        accounts[owner] = account
+        try persist(accounts)
+    }
+
+    public func confirmCredentialRegistrationRemoval(owner: String, registrationID: String) throws {
+        Self.lock.lock(); defer { Self.lock.unlock() }
+        var accounts = try load()
+        guard var account = accounts[owner], account.credentialRegistrations?[registrationID]?.removalRequested == true else {
+            return
+        }
+        account.credentialRegistrations?[registrationID] = nil
+        accounts[owner] = account
+        try persist(accounts)
+    }
+
+    private static func scheduleRemoval(_ registrationID: String?, in account: inout Account) {
+        guard let registrationID, var record = account.credentialRegistrations?[registrationID] else { return }
+        record.pendingBearer = nil
+        record.removalRequested = true
+        account.credentialRegistrations?[registrationID] = record
     }
 
     public func serviceGeneration(owner: String, serviceID: String) throws -> UUID? {
@@ -128,23 +230,21 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
     public func save(owner: String, declaration: CustomHTTPDeclaration, fields: [String: String],
                      secret: String? = nil, allowInsecureHTTP: Bool, certificatePin: ReviewedCertificatePin? = nil) throws {
         try save(owner: owner, declaration: declaration, fields: fields, secret: secret,
-                 allowInsecureHTTP: allowInsecureHTTP, certificatePin: certificatePin, delivery: nil)
+                 allowInsecureHTTP: allowInsecureHTTP, certificatePin: certificatePin, registration: nil)
     }
 
-    public func acceptCredentialHandoff(owner: String, declaration: CustomHTTPDeclaration, fields: [String: String],
-                                        token: String, certificatePin: ReviewedCertificatePin?, scope: CredentialHandoffScope,
-                                        expectedGeneration: UUID?, requestDeadline: Int64, now: Int64) throws {
-        guard !token.isEmpty, declaration.auth?.mode == "bearer", scope.serviceID == declaration.id,
-              scope.declarationDigest == (try CredentialHandoffScope.declarationDigest(declaration)) else {
-            throw ConnectionFailure.validationFailed
-        }
-        try save(owner: owner, declaration: declaration, fields: fields, secret: token, allowInsecureHTTP: false,
-                 certificatePin: certificatePin, delivery: (scope, expectedGeneration, requestDeadline, now))
+    public func acceptCredentialRegistration(owner: String, declaration: CustomHTTPDeclaration, fields: [String: String],
+                                             registrationID: String, fingerprint: String,
+                                             certificatePin: ReviewedCertificatePin, now: Int64) throws {
+        guard #available(iOS 18, macOS 15, *), declaration.auth?.mode == "bearer",
+              fingerprint == certificatePin.fingerprint else { throw ConnectionFailure.certificateRejected }
+        try save(owner: owner, declaration: declaration, fields: fields, secret: nil, allowInsecureHTTP: false,
+                 certificatePin: certificatePin, registration: (registrationID, now))
     }
 
     private func save(owner: String, declaration: CustomHTTPDeclaration, fields: [String: String],
                       secret: String?, allowInsecureHTTP: Bool, certificatePin: ReviewedCertificatePin?,
-                      delivery: (scope: CredentialHandoffScope, expectedGeneration: UUID?, requestDeadline: Int64, now: Int64)?) throws {
+                      registration: (id: String, now: Int64)?) throws {
         guard !owner.isEmpty else { throw ConnectionFailure.permissionRequired }
         try declaration.validate(alias: "customConnection")
         let visible = declaration.fields.filter { $0.type != "secret" }
@@ -166,39 +266,56 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
         var accounts = try load()
         var account = accounts[owner] ?? Account()
         let previous = account.services[declaration.id]
-        if let delivery {
-            guard try delivery.scope.origin == CredentialHandoffScope.canonicalHTTPSOrigin(origin),
-                  delivery.expectedGeneration == previous?.generation else {
+        var token = secret
+        var tokenDeclarationDigest: String?
+        var credentialRegistrationID: String?
+        if let registration {
+            guard var pending = account.credentialRegistrations?[registration.id], !pending.removalRequested,
+                  let bearer = pending.pendingBearer, certificatePin != nil,
+                  pending.context.isCurrent(registration.now),
+                  try CredentialRegistrationContext.canonicalHTTPSOrigin(origin) == pending.context.origin,
+                  pending.context.serviceID == declaration.id,
+                  pending.context.declarationDigest == (try CredentialRegistrationContext.declarationDigest(declaration)),
+                  pending.context.expectedGeneration == previous?.generation else {
                 throw ConnectionFailure.permissionRequired
             }
-            try Self.recordCredentialHandoff(delivery.scope, requestDeadline: delivery.requestDeadline, account: &account, now: delivery.now)
+            token = bearer
+            tokenDeclarationDigest = pending.context.declarationDigest
+            credentialRegistrationID = registration.id
+            pending.pendingBearer = nil
+            account.credentialRegistrations?[registration.id] = pending
         }
-        var token: String?
-        var tokenDeclarationDigest = delivery?.scope.declarationDigest
         if let auth = declaration.auth {
             guard let field = declaration.fields.first(where: { $0.id == auth.field }) else { throw ConnectionFailure.validationFailed }
-            if let secret, !secret.isEmpty {
-                try field.validate(secret)
-                token = secret
+            if let token, !token.isEmpty {
+                try field.validate(token)
             } else if let previous, previous.matches(declaration), previous.origin == origin {
                 token = previous.secret
                 tokenDeclarationDigest = previous.secretDeclarationDigest
+                credentialRegistrationID = previous.credentialRegistrationID
             }
-            guard token != nil else { throw ConnectionFailure.permissionRequired }
+            guard token != nil, credentialRegistrationID == nil || certificatePin != nil else {
+                throw ConnectionFailure.permissionRequired
+            }
         } else if let secret, !secret.isEmpty {
             throw ConnectionFailure.validationFailed
         }
 
         let allowsHTTP = origin.hasPrefix("http://") && allowInsecureHTTP
-        if delivery == nil, let previous, previous.matches(declaration), previous.origin == origin,
+        if registration == nil, let previous, previous.matches(declaration), previous.origin == origin,
            previous.certificatePin == certificatePin, previous.fields == fields, previous.secret == token,
-           previous.secretDeclarationDigest == tokenDeclarationDigest, previous.allowInsecureHTTP == allowsHTTP {
+           previous.secretDeclarationDigest == tokenDeclarationDigest,
+           previous.credentialRegistrationID == credentialRegistrationID, previous.allowInsecureHTTP == allowsHTTP {
             return
         }
         guard previous != nil || account.services.count < 64 else { throw ConnectionFailure.sizeLimit }
+        if let oldID = previous?.credentialRegistrationID, oldID != credentialRegistrationID {
+            Self.scheduleRemoval(oldID, in: &account)
+        }
         Self.removeApprovals(for: declaration.id, from: &account)
         account.services[declaration.id] = .init(definition: declaration, fields: fields, certificatePin: certificatePin, secret: token,
-                                                 secretDeclarationDigest: tokenDeclarationDigest, origin: origin,
+                                                 secretDeclarationDigest: tokenDeclarationDigest, credentialRegistrationID: credentialRegistrationID,
+                                                 origin: origin,
                                                  allowInsecureHTTP: allowsHTTP, generation: UUID())
         accounts[owner] = account
         try persist(accounts)
@@ -275,7 +392,13 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
     public func remove(owner: String, serviceID: String) throws {
         Self.lock.lock(); defer { Self.lock.unlock() }
         var accounts = try load()
-        guard var account = accounts[owner], account.services.removeValue(forKey: serviceID) != nil else { return }
+        guard var account = accounts[owner] else { return }
+        account.services[serviceID] = nil
+        account.connectionNames?[serviceID] = nil
+        for registration in (account.credentialRegistrations ?? [:]).values
+            where registration.context.serviceID == serviceID {
+            Self.scheduleRemoval(registration.registrationID, in: &account)
+        }
         Self.removeApprovals(for: serviceID, from: &account)
         accounts[owner] = account
         try persist(accounts)
@@ -284,7 +407,14 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
     public func removeOwner(_ owner: String) throws {
         Self.lock.lock(); defer { Self.lock.unlock() }
         var accounts = try load()
-        guard accounts.removeValue(forKey: owner) != nil else { return }
+        guard let account = accounts[owner] else { return }
+        if let registrations = account.credentialRegistrations, !registrations.isEmpty {
+            var tombstones = Account(credentialRegistrations: registrations)
+            for id in registrations.keys { Self.scheduleRemoval(id, in: &tombstones) }
+            accounts[owner] = tombstones
+        } else {
+            accounts[owner] = nil
+        }
         try persist(accounts)
     }
 

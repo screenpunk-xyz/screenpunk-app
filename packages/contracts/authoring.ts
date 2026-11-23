@@ -33,13 +33,13 @@ export function browserAuthoringDesignGuidance(): AuthoringDesignGuidanceV1 {
 function isBrowserRuntime(runtime: AuthoringRuntimeV1): boolean {
   return canonicalJSON(runtime) === canonicalJSON(AUTHORING_DEFINITION.browser.runtime);
 }
-export function authoringRuntime(supportsScreenData: boolean, supportsCustomHTTP = false, supportsConnectionPrefill = false, supportsCredentialHandoff = false): AuthoringRuntimeV1 {
+export function authoringRuntime(supportsScreenData: boolean, supportsCustomHTTP = false, supportsConnectionPrefill = false, supportsCredentialHandoff = false, supportsCredentialRegistration = false): AuthoringRuntimeV1 {
   const { runtime, screenData } = AUTHORING_DEFINITION;
-  return { ...runtime, features: [...runtime.features, ...(supportsScreenData ? screenData.features : []), ...(supportsCustomHTTP ? [CUSTOM_HTTP_FEATURE] : []), ...(supportsConnectionPrefill ? [CONNECTION_PREFILL_FEATURE] : []), ...(supportsCredentialHandoff ? [CREDENTIAL_HANDOFF_FEATURE] : [])] };
+  return { ...runtime, features: [...runtime.features, ...(supportsScreenData ? screenData.features : []), ...(supportsCustomHTTP ? [CUSTOM_HTTP_FEATURE] : []), ...(supportsConnectionPrefill ? [CONNECTION_PREFILL_FEATURE] : []), ...(supportsCredentialHandoff ? [CREDENTIAL_HANDOFF_FEATURE] : []), ...(supportsCredentialRegistration ? [CREDENTIAL_REGISTRATION_FEATURE] : [])] };
 }
-export function authoringDesignGuidance(supportsScreenData: boolean, supportsCustomHTTP = false, supportsConnectionPrefill = false, supportsCredentialHandoff = false): AuthoringDesignGuidanceV1 {
+export function authoringDesignGuidance(supportsScreenData: boolean, supportsCustomHTTP = false, supportsConnectionPrefill = false, supportsCredentialHandoff = false, supportsCredentialRegistration = false): AuthoringDesignGuidanceV1 {
   const { designGuidance, screenData } = AUTHORING_DEFINITION;
-  return { ...designGuidance, rules: [...designGuidance.rules, ...(supportsScreenData ? screenData.rules : []), ...(supportsCustomHTTP ? AUTHORING_DEFINITION.customHTTP.rules : []), ...(supportsConnectionPrefill ? [CONNECTION_PREFILL_RULE] : []), ...(supportsCredentialHandoff ? [CREDENTIAL_HANDOFF_RULE] : [])] };
+  return { ...designGuidance, rules: [...designGuidance.rules, ...(supportsScreenData ? screenData.rules : []), ...(supportsCustomHTTP ? AUTHORING_DEFINITION.customHTTP.rules : []), ...(supportsConnectionPrefill ? [CONNECTION_PREFILL_RULE] : []), ...(supportsCredentialHandoff ? [CREDENTIAL_HANDOFF_RULE] : []), ...(supportsCredentialRegistration ? [CREDENTIAL_REGISTRATION_RULE] : [])] };
 }
 function inlineSchema(schema: JSONSchema, defs: JSONSchema = schema.$defs): JSONSchema {
   if (schema.$ref) return inlineSchema(defs[schema.$ref.split("/").pop()!], defs);
@@ -127,6 +127,8 @@ function screenBounds(screen: AuthoringScreen): void {
   const manifest = screen.files.find(f => f.path === "manifest.json");
   if (manifest) checkAuthoringManifestScreenData(manifest.content);
 }
+export const CREDENTIAL_REGISTRATION_FEATURE = "credential-registration-v1";
+export const CREDENTIAL_REGISTRATION_RULE = "For a Cloud V2 request advertising credential-registration-v1, first complete the request with the matching HTTPS bearer connectionSetupProposals entry. If this is a source you are independently authorized and able to configure to accept a device-generated SHA-256 verifier, call announce_credential_registration with the request ID and alias. Do not announce provider-issued credentials as configurable. The device must separately initiate registration. Do not request or handle the bearer. The agent must independently confirm source configuration and the exact endpoint certificate before reporting success. Manual entry remains available.";
 export const CREDENTIAL_HANDOFF_FEATURE = "credential-handoff-v1";
 export const CREDENTIAL_HANDOFF_RULE = "For a Cloud V2 request advertising credential-handoff-v1, a paired helper can deliver a bearer for an HTTPS custom connection. After complete_request succeeds with the matching connectionSetupProposals entry, call request_credential_handoff with the request ID, connection alias and operator-configured credential name. The name identifies the entry on the helper. Never read the bearer or include it in a tool call, screen, setup proposal, progress message or result. Delivery requires separate review on the requesting device. Manual entry is available.";
 export const CONNECTION_PREFILL_FEATURE = "custom-http-prefill-v1";
@@ -238,7 +240,7 @@ export function makeAuthoringServices(observedAt: number): AuthoringServiceV1[] 
   return AUTHORING_DEFINITION.serviceCatalog.map(service => ({id:service.id,provider:service.provider,operations:structuredClone(service.operations),supported:{state:"yes",observedAt},configured:{state:service.provider === "googleCalendar" ? "no" : "unknown",observedAt},authorized:{state:"unknown",observedAt},entitled:{state:"unknown",observedAt},reachable:{state:"unknown",observedAt}}));
 }
 export function validatePreferenceRecord(value: unknown): PreferenceRecordV1 { validate("Preference",value); return value as PreferenceRecordV1; }
-export function validateAuthoringRequest(value: unknown): AuthoringRequestV1 {
+export function validateAuthoringRequest(value: unknown, validatingV2 = false): AuthoringRequestV1 {
   validate("Request", value); const request = value as AuthoringRequestV1;
   if (request.deadlineAt <= request.createdAt) fail("deadline must follow creation");
   const runtime = canonicalJSON(request.runtime);
@@ -246,11 +248,14 @@ export function validateAuthoringRequest(value: unknown): AuthoringRequestV1 {
   const customHTTP = request.runtime.features.includes(CUSTOM_HTTP_FEATURE);
   const prefill = request.runtime.features.includes(CONNECTION_PREFILL_FEATURE);
   const handoff = request.runtime.features.includes(CREDENTIAL_HANDOFF_FEATURE);
+  const registration = request.runtime.features.includes(CREDENTIAL_REGISTRATION_FEATURE);
+  if (registration && (!validatingV2 || !prefill || request.delivery.route !== "cloud"))
+    fail("credential registration requires Cloud V2 connection prefill");
   if (handoff && (!prefill || request.delivery.route !== "cloud")) fail("credential handoff requires Cloud connection prefill");
   if (prefill && !customHTTP) fail("prefill requires custom HTTP");
   const browser = isBrowserRuntime(request.runtime);
-  const expectedRuntime = browser ? browserAuthoringRuntime() : authoringRuntime(screenData, customHTTP, prefill, handoff);
-  const expectedGuidance = browser ? browserAuthoringDesignGuidance() : authoringDesignGuidance(screenData, customHTTP, prefill, handoff);
+  const expectedRuntime = browser ? browserAuthoringRuntime() : authoringRuntime(screenData, customHTTP, prefill, handoff, registration);
+  const expectedGuidance = browser ? browserAuthoringDesignGuidance() : authoringDesignGuidance(screenData, customHTTP, prefill, handoff, registration);
   if (runtime !== canonicalJSON(expectedRuntime) || canonicalJSON(request.designGuidance) !== canonicalJSON(expectedGuidance)) fail("unsupported guidance/runtime definition");
   if (browser && (request.services.length || request.preferences.length)) fail("browser runtime requires empty services and preferences");
   const seen = new Set<string>();
@@ -271,7 +276,7 @@ export function validateAuthoringRequest(value: unknown): AuthoringRequestV1 {
   if (utf8(canonicalJSON(metadata)) > 131072 || utf8(canonicalJSON(request)) > 393216) fail("request byte limit");
   return request;
 }
-export function validateAuthoringResult(value: unknown, request?: AuthoringRequestV1): AuthoringResultV1 {
+export function validateAuthoringResult(value: unknown, request?: AuthoringRequestV1, validatingV2 = false): AuthoringResultV1 {
   validate("Result", value); const result = value as AuthoringResultV1;
   if (result.answer !== undefined && (!result.answer.trim() || result.answer.length > 16000)) fail("answer requires 1–16000 UTF16 code units", "$.answer");
   if (utf8(canonicalJSON(result)) > AUTHORING_RESULT_LIMITS.resultBytes) fail("result byte limit");
@@ -288,7 +293,7 @@ export function validateAuthoringResult(value: unknown, request?: AuthoringReque
     } else if (mutation.record !== undefined || mutation.expectedRevision === null) fail("invalid delete mutation");
   }
   if (request) {
-    validateAuthoringRequest(request);
+    validateAuthoringRequest(request, validatingV2);
     if (isBrowserRuntime(request.runtime) && mutations.length) fail("browser runtime does not support preference mutations");
     const manifest = result.screen?.files.find(f => f.path === "manifest.json");
     if (manifest) checkAuthoringManifestScreenData(manifest.content, request.context.currentScreen?.files.find(f => f.path === "manifest.json")?.content,
