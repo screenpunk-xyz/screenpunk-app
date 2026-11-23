@@ -179,6 +179,8 @@ struct DeviceCustomConnectionSettings: View {
             .disabled(provisioningTask != nil)
             if canProvision || provisioning != nil {
                 automaticCredentialSetup
+            } else if let reason = model.credentialRegistrationUnavailableReason(use, owner: owner, server: server) {
+                Text(reason).font(.footnote).foregroundStyle(.secondary)
             }
             if let error {
                 Text(error).foregroundStyle(.red).accessibilityIdentifier("connection.error")
@@ -246,7 +248,7 @@ struct DeviceCustomConnectionSettings: View {
             case "ready":
                 Button("Review automatic setup") { reviewProvisioning(provisioning) }
             case "pending":
-                Text("Waiting for the connection provider to prepare a credential.")
+                Text("Your agent is checking whether it can configure this provider.")
                     .font(.footnote)
                 Button("Check setup again") { provisioningRetry = UUID() }
             case "removing":
@@ -264,8 +266,12 @@ struct DeviceCustomConnectionSettings: View {
                 Text("Automatic setup couldn’t finish. Check that your agent has setup access at the provider, or enter a token manually.")
                     .font(.footnote)
                 Button("Check setup again") { provisioningRetry = UUID() }
+            case "unsupported":
+                Text("Your agent couldn’t verify access to set up this provider. Enter a provider token manually.")
+                    .font(.footnote)
+                Button("Check automatic setup again") { provisioningRetry = UUID() }
             case "available":
-                Button("Set up credential automatically", action: beginProvisioning)
+                Button("Set up connection", action: beginProvisioning)
                     .accessibilityIdentifier("custom-connection.setup-credential")
             default:
                 Button("Check for automatic setup") { provisioningRetry = UUID() }
@@ -274,7 +280,7 @@ struct DeviceCustomConnectionSettings: View {
                 Button("Cancel automatic setup", role: .destructive) { removingProvisioning = true }
             }
         } else if provisioningChecked {
-            Text("Automatic setup is unavailable for this connection. Enter a token from the provider, or ask your agent to confirm it has setup access.")
+            Text("Screenpunk couldn’t verify automatic setup for this installed screen. Update the screen with your Cloud agent or enter a provider token manually.")
                 .font(.footnote)
             Button("Check for automatic setup") { provisioningRetry = UUID() }
         } else {

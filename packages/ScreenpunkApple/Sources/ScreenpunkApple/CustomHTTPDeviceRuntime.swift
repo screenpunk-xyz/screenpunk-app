@@ -204,6 +204,17 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
         try persist(accounts)
     }
 
+    /// An authorized source explicitly confirmed that it did not attempt an external credential write.
+    public func discardUninstalledCredentialRegistration(owner: String, registrationID: String) throws {
+        Self.lock.lock(); defer { Self.lock.unlock() }
+        var accounts = try load()
+        guard var account = accounts[owner], let record = account.credentialRegistrations?[registrationID],
+              record.pendingBearer != nil, !record.removalRequested else { return }
+        account.credentialRegistrations?[registrationID] = nil
+        accounts[owner] = account
+        try persist(accounts)
+    }
+
     public func confirmCredentialRegistrationRemoval(owner: String, registrationID: String) throws {
         Self.lock.lock(); defer { Self.lock.unlock() }
         var accounts = try load()

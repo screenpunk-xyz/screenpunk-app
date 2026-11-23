@@ -24,12 +24,18 @@ final class ScreenLibraryAuthoringTests: XCTestCase {
               durablePreferenceAuthorization: .init(requestID: request.requestID, quote: request.context.userRequest))
     }
 
-    @MainActor func testConnectionProposalsRemainLocalRevisionBoundDrafts() throws {
+    @MainActor func testAppliedConnectionProposalRetainsExactSetupAcrossReopenWithoutAgentAnnouncement() throws {
         let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
         let library = try ScreenLibrary(accountID: "fixture-account", rootDirectory: root)
         var input = try request(library)
-        input.runtime = AuthoringContract.runtime(supportsScreenData: false, supportsCustomHTTP: true, supportsConnectionPrefill: true)
-        input.designGuidance = AuthoringContract.designGuidance(supportsScreenData: false, supportsCustomHTTP: true, supportsConnectionPrefill: true)
+        input.delivery.route = "cloud"
+        input.runtime = AuthoringContract.runtime(supportsScreenData: false, supportsCustomHTTP: true, supportsConnectionPrefill: true,
+            supportsCredentialRegistration: true)
+        input.designGuidance = AuthoringContract.designGuidance(supportsScreenData: false, supportsCustomHTTP: true, supportsConnectionPrefill: true,
+            supportsCredentialRegistration: true)
+        // The upgrade must accept the sealed guidance previously used by installed screens.
+        input.designGuidance.rules[input.designGuidance.rules.count - 1] =
+            "For a Cloud V2 request advertising credential-registration-v1, first complete the request with the matching HTTPS bearer connectionSetupProposals entry. If this is a source you are independently authorized and able to configure to accept a device-generated SHA-256 verifier, call announce_credential_registration with the request ID and alias. Do not announce provider-issued credentials as configurable. The device must separately initiate registration. Do not request or handle the bearer. The agent must independently confirm source configuration and the exact endpoint certificate before reporting success. Manual entry remains available."
         input = try AuthoringContract.seal(input)
         let snapshot = try library.makeAuthoringRequestV2(from: input)
         try library.saveAuthoringRequest(snapshot)
@@ -61,6 +67,16 @@ final class ScreenLibraryAuthoringTests: XCTestCase {
         let saved = try XCTUnwrap(library.state.screens.first { $0.id == "fixture-screen" })
         let reopened = try ScreenLibrary(accountID: "fixture-account", rootDirectory: root)
         XCTAssertEqual(reopened.connectionSetupProposal(screenID: saved.id, revision: saved.revision, alias: "synthetic", declaration: declaration), proposal)
+        let binding = try XCTUnwrap(reopened.connectionCredentialRegistrationSource(screenID: saved.id, revision: saved.revision))
+        XCTAssertEqual(binding.requestID, snapshot.requestID)
+        XCTAssertEqual(binding.inputDigest, snapshot.delivery.snapshotDigest)
+        XCTAssertEqual(binding.operationID, result.operationID)
+        XCTAssertEqual(binding.deviceID, snapshot.context.deviceID)
+        XCTAssertEqual(reopened.credentialRegistrationRevision(for: receipt), saved.revision)
+        XCTAssertFalse(saved.artifact.files.contains { $0.content.contains("announce_credential_registration") })
+        try reopened.acknowledgeReceipt(receipt)
+        let afterAck = try ScreenLibrary(accountID: "fixture-account", rootDirectory: root)
+        XCTAssertEqual(afterAck.connectionCredentialRegistrationSource(screenID: saved.id, revision: saved.revision), binding)
         XCTAssertFalse(saved.artifact.files.contains { $0.content.contains("https://synthetic.example") })
         XCTAssertNil(reopened.connectionSetupProposal(screenID: "other", revision: saved.revision, alias: "synthetic", declaration: declaration))
         XCTAssertNil(reopened.connectionSetupProposal(screenID: saved.id, revision: "stale", alias: "synthetic", declaration: declaration))
@@ -69,6 +85,7 @@ final class ScreenLibraryAuthoringTests: XCTestCase {
         XCTAssertEqual(try reopened.applyAuthoringResult(result, now: 2000).status, "applied")
         try reopened.install(artifact("Replacement"), requestID: "replacement", replacing: saved.id)
         XCTAssertNil(reopened.connectionSetupProposal(screenID: saved.id, revision: saved.revision, alias: "synthetic", declaration: declaration))
+        XCTAssertNil(reopened.connectionCredentialRegistrationSource(screenID: saved.id, revision: saved.revision))
     }
 
     @MainActor func testKeyboardDraftSurvivesReopenAndNewScreenPreservesExistingPackages() throws {

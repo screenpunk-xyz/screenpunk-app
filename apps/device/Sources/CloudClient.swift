@@ -283,7 +283,7 @@ struct AgentStatus: Decodable {
         guard var value = session, value.profileID != profileID else { return }
         value.profileID = profileID; try SessionKeychain.save(value); session = value
     }
-    func call<T: Decodable>(_ path: String, method: String = "GET", body: Any? = nil, authenticated: Bool = true, authorizationToken: String? = nil, authoringVersion: Int = 1, idempotencyKey: String? = nil, timelineRequestID: String? = nil, screenDataProtocol: Bool = false, requiredStatus: Int? = nil) async throws -> T {
+    func call<T: Decodable>(_ path: String, method: String = "GET", body: Any? = nil, authenticated: Bool = true, authorizationToken: String? = nil, authoringVersion: Int = 1, idempotencyKey: String? = nil, timelineRequestID: String? = nil, screenDataProtocol: Bool = false, requiredStatus: Int? = nil, queryItems: [URLQueryItem] = []) async throws -> T {
 #if DEBUG
         let timeline: (start: RequestTimeline.Event, end: RequestTimeline.Event, id: String?, operation: RequestTimeline.Operation)?
         if path == "api/device/status" && method == "GET" {
@@ -307,7 +307,13 @@ struct AgentStatus: Decodable {
             if let timeline { RequestTimeline.record(timeline.end, requestID: timeline.id, httpStatus: timelineHTTPStatus) }
         }
 #endif
-        var request = URLRequest(url: Self.origin.appendingPathComponent(path))
+        let endpoint = Self.origin.appendingPathComponent(path)
+        guard var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false) else {
+            throw ConnectionFailure.validationFailed
+        }
+        if !queryItems.isEmpty { components.queryItems = queryItems }
+        guard let url = components.url else { throw ConnectionFailure.validationFailed }
+        var request = URLRequest(url: url)
         let capturedSession = session
         let requestToken = authorizationToken ?? (authenticated ? capturedSession?.accessToken : nil)
         request.httpMethod = method

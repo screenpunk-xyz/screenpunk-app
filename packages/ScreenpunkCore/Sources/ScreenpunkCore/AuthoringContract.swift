@@ -41,6 +41,11 @@ public enum AuthoringContract {
               case .string(let rule) = config["rule"] else { preconditionFailure("Bundled credential registration rule missing") }
         return rule
     }()
+    static var legacyCredentialRegistrationRule: String? {
+        guard case .object(let config) = AuthoringV2Contract.definition["credentialRegistration"],
+              case .string(let rule) = config["legacyRule"] else { return nil }
+        return rule
+    }
     public static let credentialHandoffFeature = "credential-handoff-v1"
     public static let credentialHandoffRule = "For a Cloud V2 request advertising credential-handoff-v1, a paired helper can deliver a bearer for an HTTPS custom connection. After complete_request succeeds with the matching connectionSetupProposals entry, call request_credential_handoff with the request ID, connection alias and operator-configured credential name. The name identifies the entry on the helper. Never read the bearer or include it in a tool call, screen, setup proposal, progress message or result. Delivery requires separate review on the requesting device. Manual entry is available."
     public static let connectionPrefillFeature = "custom-http-prefill-v1"
@@ -107,8 +112,20 @@ public enum AuthoringContract {
         }
         guard !prefill || customHTTP else { throw AuthoringContractError("prefill requires custom HTTP") }
         let browser = request.runtime == browserRuntime
+        let guidance = browser ? browserDesignGuidance : designGuidance(supportsScreenData: screenData,
+            supportsCustomHTTP: customHTTP, supportsConnectionPrefill: prefill,
+            supportsCredentialHandoff: handoff, supportsCredentialRegistration: registration)
+        var legacyGuidance: AuthoringDesignGuidanceV1?
+        if !browser, registration, let legacyRule = legacyCredentialRegistrationRule {
+            var previous = guidance
+            // The registration rule is appended last. Preserve the exact sealed prior guidance only.
+            previous.rules[previous.rules.count - 1] = legacyRule
+            legacyGuidance = previous
+        }
         guard request.runtime == (browser ? browserRuntime : runtime(supportsScreenData: screenData, supportsCustomHTTP: customHTTP, supportsConnectionPrefill: prefill, supportsCredentialHandoff: handoff, supportsCredentialRegistration: registration)),
-              request.designGuidance == (browser ? browserDesignGuidance : designGuidance(supportsScreenData: screenData, supportsCustomHTTP: customHTTP, supportsConnectionPrefill: prefill, supportsCredentialHandoff: handoff, supportsCredentialRegistration: registration)) else { throw AuthoringContractError("unsupported guidance/runtime definition") }
+              request.designGuidance == guidance || request.designGuidance == legacyGuidance else {
+            throw AuthoringContractError("unsupported guidance/runtime definition")
+        }
         if browser, !request.services.isEmpty || !request.preferences.isEmpty {
             throw AuthoringContractError("browser runtime requires empty services and preferences")
         }
