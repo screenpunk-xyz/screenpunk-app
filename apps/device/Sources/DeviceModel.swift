@@ -1676,6 +1676,7 @@ import ScreenpunkLocalTransport
         let owner: String
         let use: CustomConnectionUse
         let status: CustomHTTPDeviceVault.Status?
+        let setupOrigin: String?
     }
     @Published var customConnectionPrompt: CustomConnectionPrompt?
 
@@ -1685,20 +1686,63 @@ import ScreenpunkLocalTransport
               let use = customConnectionUses().first(where: { $0.alias == alias && $0.screen.revision == revision }),
               !customConnectionApproved(use),
               customHTTPVault.shouldOfferAccess(owner: owner, screenID: use.screen.id, alias: alias, declaration: use.declaration) else { return }
-        customConnectionPrompt = .init(owner: owner, use: use, status: customConnectionStatus(use.declaration))
+        let status = customConnectionStatus(use.declaration)
+        let setupOrigin = status == nil && savedCustomConnections.allSatisfy({ $0.id != use.declaration.id })
+            ? suggestedCredentialRegistrationOrigin(use, owner: owner) : nil
+        customConnectionPrompt = .init(owner: owner, use: use, status: status, setupOrigin: setupOrigin)
     }
 
-    func approveCustomConnectionPrompt(_ prompt: CustomConnectionPrompt) {
-        guard customConnectionPrompt?.id == prompt.id, screen?.id == prompt.use.screen.id,
-              screen?.revision == prompt.use.screen.revision, let status = prompt.status else { return }
-        defer { customConnectionPrompt = nil }
-        do {
-            try requireCurrentCustomConnection(prompt.use, owner: prompt.owner)
-            try customHTTPVault.approve(owner: prompt.owner, screenID: prompt.use.screen.id,
-                                        manifest: prompt.use.manifest, alias: prompt.use.alias,
-                                        expectedGeneration: status.generation)
-            refreshCustomConnections()
-        } catch { message = "Connection access could not be approved. Review the current connection in Settings." }
+    func dismissCustomConnectionPrompt(_ prompt: CustomConnectionPrompt) {
+        if customConnectionPrompt?.id == prompt.id { customConnectionPrompt = nil }
+    }
+
+    private func requireCurrentCustomConnectionPrompt(_ prompt: CustomConnectionPrompt) throws {
+        guard !settingsOpen, customConnectionPrompt?.id == prompt.id, screen?.id == prompt.use.screen.id,
+              screen?.revision == prompt.use.screen.revision,
+              try customHTTPVault.serviceGeneration(owner: prompt.owner, serviceID: prompt.use.declaration.id) == prompt.status?.generation,
+              customHTTPVault.shouldOfferAccess(owner: prompt.owner, screenID: prompt.use.screen.id,
+                                               alias: prompt.use.alias, declaration: prompt.use.declaration) else {
+            throw ConnectionFailure.permissionRequired
+        }
+        try requireCurrentCustomConnection(prompt.use, owner: prompt.owner)
+    }
+
+    func approveCustomConnectionPrompt(_ prompt: CustomConnectionPrompt) throws {
+        try requireCurrentCustomConnectionPrompt(prompt)
+        guard let status = prompt.status else { throw ConnectionFailure.permissionRequired }
+        try customHTTPVault.approve(owner: prompt.owner, screenID: prompt.use.screen.id,
+                                   manifest: prompt.use.manifest, alias: prompt.use.alias,
+                                   expectedGeneration: status.generation, requireOfferedAccess: true)
+        // The denied read has already returned. Keep its renderer mounted and wait for the screen's next read.
+        dismissCustomConnectionPrompt(prompt)
+    }
+
+    func advanceInlineConnectionSetup(_ prompt: CustomConnectionPrompt, beginIfAvailable: Bool) async throws -> ProvisioningStatus? {
+        try requireCurrentCustomConnectionPrompt(prompt)
+        guard let origin = prompt.setupOrigin,
+              suggestedCredentialRegistrationOrigin(prompt.use, owner: prompt.owner) == origin else {
+            throw ConnectionFailure.permissionRequired
+        }
+        var status = try await connectionCredentialProvisioningStatus(prompt.use, owner: prompt.owner, server: origin)
+        try Task.checkCancellation()
+        try requireCurrentCustomConnectionPrompt(prompt)
+        if beginIfAvailable, status?.state == "available" || status?.state == "retry" {
+            status = try await beginConnectionCredentialProvisioning(prompt.use, owner: prompt.owner, server: origin)
+            try Task.checkCancellation()
+            try requireCurrentCustomConnectionPrompt(prompt)
+        }
+        return status
+    }
+
+    func finishInlineConnectionSetup(_ registration: ProvisioningStatus, prompt: CustomConnectionPrompt) async throws {
+        try requireCurrentCustomConnectionPrompt(prompt)
+        guard let origin = prompt.setupOrigin, let fingerprint = registration.certificateFingerprint,
+              let fields = customConnectionProposal(prompt.use)?.fields,
+              fields[prompt.use.declaration.originField] == origin else { throw ConnectionFailure.permissionRequired }
+        let pin = try ReviewedCertificatePin(origin: origin, fingerprint: fingerprint)
+        try await saveProvisionedConnectionCredential(registration, use: prompt.use, owner: prompt.owner,
+                                                       fields: fields, certificatePin: pin, approvalPrompt: prompt)
+        dismissCustomConnectionPrompt(prompt)
     }
 
     struct ProvisioningStatus: Equatable {
@@ -1794,7 +1838,9 @@ import ScreenpunkLocalTransport
     }
 
     func saveProvisionedConnectionCredential(_ status: ProvisioningStatus, use: CustomConnectionUse, owner: String,
-                                             fields: [String: String], certificatePin: ReviewedCertificatePin) async throws {
+                                             fields: [String: String], certificatePin: ReviewedCertificatePin,
+                                             approvalPrompt: CustomConnectionPrompt? = nil) async throws {
+        if let approvalPrompt { try requireCurrentCustomConnectionPrompt(approvalPrompt) }
         guard let source = connectionCredentialRegistrationSource(use), let session = cloud.session,
               let pending = try customHTTPVault.pendingCredentialRegistration(owner: owner, requestID: source.requestID, alias: use.alias),
               pending.registrationID == status.registrationID, !pending.removalRequested, status.state == "ready",
@@ -1809,12 +1855,14 @@ import ScreenpunkLocalTransport
         let reply: CloudCredentialRegistration = try await cloud.call(Self.credentialRegistrationPath(pending.registrationID) + "/accept",
             method: "POST", body: [String: String](), authorizationToken: session.accessToken)
         try requireCurrentCredentialRegistration(pending.context, use: use, owner: owner, server: server, sessionToken: session.accessToken)
+        if let approvalPrompt { try requireCurrentCustomConnectionPrompt(approvalPrompt) }
         guard reply.status == "accepted", reply.scope == receipt,
               receipt.isCurrent(for: pending, now: Self.credentialRegistrationNow),
               reply.fingerprint == nil || reply.fingerprint == fingerprint else { throw ConnectionFailure.permissionRequired }
         try customHTTPVault.acceptCredentialRegistration(owner: owner, declaration: use.declaration, fields: fields,
-            registrationID: pending.registrationID, fingerprint: fingerprint, certificatePin: certificatePin, now: Self.credentialRegistrationNow)
-        refreshCustomConnections()
+            registrationID: pending.registrationID, fingerprint: fingerprint, certificatePin: certificatePin,
+            now: Self.credentialRegistrationNow, approveScreenRead: approvalPrompt != nil)
+        if approvalPrompt == nil { refreshCustomConnections() }
         requestCredentialRegistrationRemovalSync()
     }
 
@@ -2068,7 +2116,8 @@ import ScreenpunkLocalTransport
         }
     }
     var canAllowCurrentPublicData: Bool {
-        !missingConnections.isEmpty && missingConnections.allSatisfy { $0.kind == .publicData }
+        let gate = missingConnections.filter { $0.customAlias == nil }
+        return !gate.isEmpty && gate.allSatisfy { $0.kind == .publicData }
     }
     var currentPublicDataOrigins: [String] {
         Array(Set(manifest?.connections.compactMap { $0.publicHTTP?.origin } ?? [])).sorted()

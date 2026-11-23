@@ -88,6 +88,34 @@ final class CustomHTTPDeviceRuntimeTests: XCTestCase {
         XCTAssertTrue(vault.isApproved(owner: owner, screenID: screenID, manifest: manifest, alias: alias))
     }
 
+    func testAppGrantDoesNotReplayRejectedReadAndDenialRequiresExplicitSettingsGrant() async throws {
+        let (vault, manifest, declaration) = try configured()
+        try vault.revoke(owner: owner, screenID: screenID, alias: alias)
+        let current = try XCTUnwrap(vault.status(owner: owner, declaration: declaration))
+        let transport = ProbeTransport(.init(status: 200, body: Data("{}".utf8)))
+        let runtime = broker(vault: vault, manifest: manifest, transport: transport)
+        do {
+            _ = try await runtime.request(alias: alias, operation: "queue", parameters: ["limit":"3"])
+            XCTFail("The first unapproved read must finish denied")
+        } catch {
+            XCTAssertEqual(error as? ConnectionFailure, .permissionRequired)
+        }
+        try vault.approve(owner: owner, screenID: screenID, manifest: manifest, alias: alias,
+                          expectedGeneration: current.generation, requireOfferedAccess: true)
+        let beforeRetry = await transport.sends
+        XCTAssertEqual(beforeRetry, 0)
+        _ = try await runtime.request(alias: alias, operation: "queue", parameters: ["limit":"3"])
+        let afterRetry = await transport.sends
+        XCTAssertEqual(afterRetry, 1)
+        try vault.deny(owner: owner, screenID: screenID, alias: alias, declaration: declaration)
+        XCTAssertThrowsError(try vault.approve(owner: owner, screenID: screenID, manifest: manifest, alias: alias,
+                                              expectedGeneration: current.generation, requireOfferedAccess: true))
+        XCTAssertFalse(vault.isApproved(owner: owner, screenID: screenID, manifest: manifest, alias: alias))
+        try vault.approve(owner: owner, screenID: screenID, manifest: manifest, alias: alias,
+                          expectedGeneration: current.generation)
+        XCTAssertTrue(vault.isApproved(owner: owner, screenID: screenID, manifest: manifest, alias: alias))
+    }
+
     func testApprovalFromOldPromptCannotGrantAccessToReplacementServer() throws {
         let (vault, manifest, declaration) = try configured()
         let old = try XCTUnwrap(vault.status(owner: owner, declaration: declaration))
@@ -156,6 +184,36 @@ final class CustomHTTPDeviceRuntimeTests: XCTestCase {
         XCTAssertTrue(try vault.credentialRegistrationRemovals(owner: owner, deviceID: "different").isEmpty)
         try vault.confirmCredentialRegistrationRemoval(owner: owner, registrationID: pending.registrationID)
         XCTAssertTrue(try vault.credentialRegistrationRemovals(owner: owner, deviceID: context.deviceID).isEmpty)
+    }
+
+    func testInlineCertificateReviewSavesAndGrantsOnlyTheBoundScreenAtomically() throws {
+        guard #available(iOS 18, macOS 15, *) else { throw XCTSkip("Certificate pin reviews unavailable") }
+        let (vault, manifest, declaration) = try configured()
+        try vault.remove(owner: owner, serviceID: declaration.id)
+        let origin = "https://ready.test"
+        let context = try registrationContext(declaration: declaration, origin: origin, expectedGeneration: nil)
+        let pending = try vault.prepareCredentialRegistration(owner: owner, context: context, now: 100)
+        let fingerprint = String(repeating: "a", count: 64)
+        let pin = try ReviewedCertificatePin(origin: origin, fingerprint: fingerprint)
+        let fields = ["server": origin, "tag": "weekly"]
+        func accept() throws {
+            try vault.acceptCredentialRegistration(owner: owner, declaration: declaration, fields: fields,
+                registrationID: pending.registrationID, fingerprint: fingerprint, certificatePin: pin, now: 101,
+                approveScreenRead: true)
+        }
+        try vault.deny(owner: owner, screenID: screenID, alias: alias, declaration: declaration)
+        XCTAssertThrowsError(try accept())
+        XCTAssertNil(vault.status(owner: owner, declaration: declaration))
+        XCTAssertEqual(try vault.pendingCredentialRegistration(owner: owner, requestID: context.requestID, alias: alias), pending)
+        let freshOwner = "fresh-owner"
+        let fresh = try vault.prepareCredentialRegistration(owner: freshOwner, context: context, now: 100)
+        try vault.acceptCredentialRegistration(owner: freshOwner, declaration: declaration, fields: fields,
+            registrationID: fresh.registrationID, fingerprint: fingerprint, certificatePin: pin, now: 101,
+            approveScreenRead: true)
+        XCTAssertEqual(vault.status(owner: freshOwner, declaration: declaration)?.certificatePin, pin)
+        XCTAssertTrue(vault.isApproved(owner: freshOwner, screenID: screenID, manifest: manifest, alias: alias))
+        XCTAssertFalse(vault.isApproved(owner: freshOwner, screenID: "another-screen", manifest: manifest, alias: alias))
+        XCTAssertFalse(vault.isApproved(owner: owner, screenID: screenID, manifest: manifest, alias: alias))
     }
 
     func testRegistrationReceiptBindsSourceReadAndInstalledRevision() throws {

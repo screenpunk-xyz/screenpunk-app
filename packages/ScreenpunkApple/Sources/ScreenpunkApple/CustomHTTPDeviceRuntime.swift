@@ -246,16 +246,17 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
 
     public func acceptCredentialRegistration(owner: String, declaration: CustomHTTPDeclaration, fields: [String: String],
                                              registrationID: String, fingerprint: String,
-                                             certificatePin: ReviewedCertificatePin, now: Int64) throws {
+                                             certificatePin: ReviewedCertificatePin, now: Int64,
+                                             approveScreenRead: Bool = false) throws {
         guard #available(iOS 18, macOS 15, *), declaration.auth?.mode == "bearer",
               fingerprint == certificatePin.fingerprint else { throw ConnectionFailure.certificateRejected }
         try save(owner: owner, declaration: declaration, fields: fields, secret: nil, allowInsecureHTTP: false,
-                 certificatePin: certificatePin, registration: (registrationID, now))
+                 certificatePin: certificatePin, registration: (registrationID, now, approveScreenRead))
     }
 
     private func save(owner: String, declaration: CustomHTTPDeclaration, fields: [String: String],
                       secret: String?, allowInsecureHTTP: Bool, certificatePin: ReviewedCertificatePin?,
-                      registration: (id: String, now: Int64)?) throws {
+                      registration: (id: String, now: Int64, approveScreenRead: Bool)?) throws {
         guard !owner.isEmpty else { throw ConnectionFailure.permissionRequired }
         try declaration.validate(alias: "customConnection")
         let visible = declaration.fields.filter { $0.type != "secret" }
@@ -280,6 +281,7 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
         var token = secret
         var tokenDeclarationDigest: String?
         var credentialRegistrationID: String?
+        var reviewedRead: CredentialRegistrationContext?
         if let registration {
             guard var pending = account.credentialRegistrations?[registration.id], !pending.removalRequested,
                   let bearer = pending.pendingBearer, certificatePin != nil,
@@ -295,6 +297,7 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
             credentialRegistrationID = registration.id
             pending.pendingBearer = nil
             account.credentialRegistrations?[registration.id] = pending
+            if registration.approveScreenRead { reviewedRead = pending.context }
         }
         if let auth = declaration.auth {
             guard let field = declaration.fields.first(where: { $0.id == auth.field }) else { throw ConnectionFailure.validationFailed }
@@ -324,10 +327,23 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
             Self.scheduleRemoval(oldID, in: &account)
         }
         Self.removeApprovals(for: declaration.id, from: &account)
+        let generation = UUID()
         account.services[declaration.id] = .init(definition: declaration, fields: fields, certificatePin: certificatePin, secret: token,
                                                  secretDeclarationDigest: tokenDeclarationDigest, credentialRegistrationID: credentialRegistrationID,
                                                  origin: origin,
-                                                 allowInsecureHTTP: allowsHTTP, generation: UUID())
+                                                 allowInsecureHTTP: allowsHTTP, generation: generation)
+        if let reviewedRead {
+            guard !reviewedRead.screenID.isEmpty else { throw ConnectionFailure.permissionRequired }
+            try declaration.validate(alias: reviewedRead.alias)
+            let declarationDigest = try Self.digest(declaration)
+            // A denial at the generation shown by the modal cannot be bypassed by setup.
+            let priorScope = declarationDigest + "/" + (previous?.generation.uuidString ?? "unconfigured")
+            guard account.denials?[reviewedRead.screenID]?[reviewedRead.alias] != priorScope else {
+                throw ConnectionFailure.permissionRequired
+            }
+            try Self.recordApproval(screenID: reviewedRead.screenID, alias: reviewedRead.alias, serviceID: declaration.id,
+                                    declarationDigest: declarationDigest, generation: generation, in: &account)
+        }
         accounts[owner] = account
         try persist(accounts)
     }
@@ -337,7 +353,8 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
         return (try? authorized(owner: owner, screenID: screenID, alias: alias, declaration: declaration)) != nil
     }
 
-    public func approve(owner: String, screenID: String, manifest: DashboardManifest, alias: String, expectedGeneration: UUID? = nil) throws {
+    public func approve(owner: String, screenID: String, manifest: DashboardManifest, alias: String, expectedGeneration: UUID? = nil,
+                        requireOfferedAccess: Bool = false) throws {
         guard !screenID.isEmpty, let declaration = manifest.connections.first(where: { $0.alias == alias })?.customHTTP else {
             throw ConnectionFailure.permissionRequired
         }
@@ -349,18 +366,28 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
             throw ConnectionFailure.permissionRequired
         }
         guard expectedGeneration == nil || service.generation == expectedGeneration else { throw ConnectionFailure.permissionRequired }
-        let existing = account.approvals[screenID]?[alias]
-        if let existing, existing.declarationDigest == declarationDigest, existing.serviceGeneration == service.generation { return }
+        if requireOfferedAccess,
+           account.denials?[screenID]?[alias] == declarationDigest + "/" + service.generation.uuidString {
+            throw ConnectionFailure.permissionRequired
+        }
+        if let existing = account.approvals[screenID]?[alias],
+           existing.declarationDigest == declarationDigest, existing.serviceGeneration == service.generation { return }
+        try Self.recordApproval(screenID: screenID, alias: alias, serviceID: declaration.id,
+                                declarationDigest: declarationDigest, generation: service.generation, in: &account)
+        accounts[owner] = account
+        try persist(accounts)
+    }
+
+    private static func recordApproval(screenID: String, alias: String, serviceID: String, declarationDigest: String,
+                                       generation: UUID, in account: inout Account) throws {
         guard account.approvals[screenID] != nil || account.approvals.count < 256 else {
             throw ConnectionFailure.sizeLimit
         }
         var dashboard = account.approvals[screenID] ?? [:]
-        guard existing != nil || dashboard.count < 32 else { throw ConnectionFailure.sizeLimit }
-        dashboard[alias] = .init(serviceID: declaration.id, declarationDigest: declarationDigest, serviceGeneration: service.generation, generation: UUID())
+        guard dashboard[alias] != nil || dashboard.count < 32 else { throw ConnectionFailure.sizeLimit }
+        dashboard[alias] = .init(serviceID: serviceID, declarationDigest: declarationDigest, serviceGeneration: generation, generation: UUID())
         account.approvals[screenID] = dashboard
         account.denials?[screenID]?[alias] = nil
-        accounts[owner] = account
-        try persist(accounts)
     }
 
     public func revoke(owner: String, screenID: String, alias: String) throws {
