@@ -417,7 +417,9 @@ final class CustomHTTPDeviceRuntimeTests: XCTestCase {
             "index.html": .init(path: "index.html", data: html, mime: "text/html"),
             "manifest.json": .init(path: "manifest.json", data: try JSONEncoder().encode(manifest), mime: "application/json")
         ])
-        let coordinator = DashboardWebCoordinator(store: assets, customHTTP: runtime, revision: manifest.revision, onReady: {}, onUnlinkHold: {})
+        var health: [Bool] = []
+        let coordinator = DashboardWebCoordinator(store: assets, customHTTP: runtime, revision: manifest.revision,
+            onConnectionHealth: { health.append($0) }, onReady: {}, onUnlinkHold: {})
         let view = coordinator.makeWebView()
         defer { coordinator.stop() }
         var loaded = false
@@ -437,6 +439,7 @@ final class CustomHTTPDeviceRuntimeTests: XCTestCase {
             return result.value.running === true && result.value.queue === 3 && result.stale === false;
             """, arguments: [:], in: nil, contentWorld: .page)
         XCTAssertEqual(result as? Bool, true)
+        XCTAssertEqual(health, [true])
         let nativeRequest = await transport.last
         XCTAssertEqual(nativeRequest?.url.path, "/telemetry")
         XCTAssertEqual(nativeRequest?.headers["Authorization"], "Bearer fixture-token")
@@ -448,8 +451,22 @@ final class CustomHTTPDeviceRuntimeTests: XCTestCase {
             return "unexpected_success";
             """, arguments: [:], in: nil, contentWorld: .page)
         XCTAssertEqual(denied as? String, "permission_required")
+        XCTAssertEqual(health, [true])
         let sends = await transport.sends
         XCTAssertEqual(sends, 1)
+
+        try vault.approve(owner: owner, screenID: screenID, manifest: manifest, alias: alias)
+        await transport.setResponse(.init(status: 503, body: Data()))
+        XCTAssertEqual(health, [true])
+        let sendsAfterGrant = await transport.sends
+        XCTAssertEqual(sendsAfterGrant, 1)
+        let offline = try await view.callAsyncJavaScript("""
+            try { await screenpunk.connections.request("generator", "telemetry", {}); }
+            catch (error) { return error.code; }
+            return "unexpected_success";
+            """, arguments: [:], in: nil, contentWorld: .page)
+        XCTAssertEqual(offline as? String, "device_offline")
+        XCTAssertEqual(health, [true, false])
     }
     #endif
 
@@ -485,7 +502,7 @@ final class CustomHTTPDeviceRuntimeTests: XCTestCase {
     }
 
     private actor ProbeTransport: HTTPTransport {
-        private let response: HTTPTransportResponse
+        private var response: HTTPTransportResponse
         private let beforeResponse: @Sendable () throws -> Void
         private(set) var last: AuthorizedHTTPRequest?
         private(set) var sends = 0
@@ -494,6 +511,8 @@ final class CustomHTTPDeviceRuntimeTests: XCTestCase {
             self.response = response
             self.beforeResponse = beforeResponse
         }
+
+        func setResponse(_ response: HTTPTransportResponse) { self.response = response }
 
         func send(_ request: AuthorizedHTTPRequest) async throws -> HTTPTransportResponse {
             last = request
