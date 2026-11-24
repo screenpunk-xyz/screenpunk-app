@@ -52,10 +52,10 @@ jobs:
           if-no-files-found: warn
   apple:
     name: Unsigned Apple build and regressions
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 45
     env:
-      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
     steps:
       - name: Select run-owned scratch root
         shell: bash

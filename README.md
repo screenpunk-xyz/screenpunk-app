@@ -2,7 +2,7 @@
 
 Universal iPhone and iPad app with local rendering, device services, local agent authoring, and the public Screenpunk authoring contracts. The app supports account-free local use. Cloud service implementation and official signing/release orchestration are maintained separately.
 
-Requires macOS 26+, Xcode 26.6, Swift 6.3, and Node.js 24 for contract checks. Minimum app deployment target remains iOS/iPadOS 16.
+Requires macOS 26.6 or later, Xcode 27.2, Swift 6.4, and Node.js 24 for contract checks. Minimum app deployment target remains iOS/iPadOS 16.
 
 ```sh
 npm ci

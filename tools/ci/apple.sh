@@ -5,7 +5,7 @@ set -euo pipefail
 test -f "$CI_SCRATCH_ROOT/ownership.json"
 mkdir -p "$CI_SCRATCH_ROOT/build" "$CI_SCRATCH_ROOT/evidence"
 xcodebuild -version | tee "$CI_SCRATCH_ROOT/evidence/xcode.txt"
-test "$(xcodebuild -version)" = $'Xcode 26.6\nBuild version 17F113' || { echo 'Reviewed Xcode unavailable; update the pin after verification.'; exit 1; }
+test "$(xcodebuild -version)" = $'Xcode 27.2\nBuild version 27B52' || { echo 'Reviewed Xcode unavailable; update the pin after verification.'; exit 1; }
 # These suites use real macOS JXA against isolated synthetic fixture homes.
 # Never enable optional host launchctl probes or invoke the actual setup installer.
 export SCREENPUNK_SETUP_TEST_ROOT="$CI_SCRATCH_ROOT/evidence/setup-fixtures"
@@ -20,5 +20,17 @@ for entry in 'core:packages/ScreenpunkCore' 'device:apps/device' 'apple:packages
   swift test --package-path "$package" --scratch-path "$CI_SCRATCH_ROOT/build/$name" --force-resolved-versions 2>&1 | tee "$CI_SCRATCH_ROOT/evidence/$name-tests.log"
 done
 for sdk in iphoneos iphonesimulator; do
-  xcodebuild -project apps/device/ScreenpunkOne.xcodeproj -scheme ScreenpunkOne -configuration Debug -sdk "$sdk" -destination "generic/platform=$([ "$sdk" = iphoneos ] && echo iOS || echo 'iOS Simulator')" -derivedDataPath "$CI_SCRATCH_ROOT/build/derived-data" -clonedSourcePackagesDirPath "$CI_SCRATCH_ROOT/build/xcode-packages" -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile CODE_SIGNING_ALLOWED=NO build 2>&1 | tee "$CI_SCRATCH_ROOT/evidence/$sdk-build.log"
+  configuration=Debug
+  action=(build)
+  if [[ "$sdk" == iphoneos ]]; then
+    configuration=Release
+    archive="$CI_SCRATCH_ROOT/build/ScreenpunkOne.xcarchive"
+    action=(-archivePath "$archive" archive)
+  fi
+  xcodebuild -project apps/device/ScreenpunkOne.xcodeproj -scheme ScreenpunkOne -configuration "$configuration" -sdk "$sdk" -destination "generic/platform=$([ "$sdk" = iphoneos ] && echo iOS || echo 'iOS Simulator')" -derivedDataPath "$CI_SCRATCH_ROOT/build/derived-data" -clonedSourcePackagesDirPath "$CI_SCRATCH_ROOT/build/xcode-packages" -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile CODE_SIGNING_ALLOWED=NO "${action[@]}" 2>&1 | tee "$CI_SCRATCH_ROOT/evidence/$sdk-build.log"
+  if [[ "$sdk" == iphoneos ]]; then
+    info="$archive/Products/Applications/ScreenpunkOne.app/Info.plist"
+    plutil -extract DTSDKName raw -o - "$info" | tee "$CI_SCRATCH_ROOT/evidence/device-sdk.txt"
+    test "$(cat "$CI_SCRATCH_ROOT/evidence/device-sdk.txt")" = iphoneos27.2
+  fi
 done
