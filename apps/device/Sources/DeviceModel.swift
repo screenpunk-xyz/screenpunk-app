@@ -228,7 +228,12 @@ import ScreenpunkLocalTransport
             (routePreference == .cloud || (routePreference == .automatic && localAgent?.lastSuccessfulConnectionAt == nil))
     }
     var onboardingCloudPluginConnected: Bool? {
-        guard shouldCheckCloudSetup, !accountOperationInProgress, !cloudAuthorizationRejected,
+        guard shouldCheckCloudSetup else { return nil }
+        return cloudPluginConnected
+    }
+
+    var cloudPluginConnected: Bool? {
+        guard !accountOperationInProgress, !cloudAuthorizationRejected,
               activeProfile?.cloudBinding == nil || cloudBindingMatches,
               let session = cloud.session else { return nil }
         return cloudListenerObservation?.pluginConnection(accountID: cloud.localAccountID, deviceID: session.deviceId,
@@ -251,9 +256,6 @@ import ScreenpunkLocalTransport
     var galleryIntroOwner: String? {
         guard onboarding == .gallery, !accountOperationInProgress, library?.hasTemporaryScreen == false else { return nil }
         return activeProfile?.libraryOwner
-    }
-    var canHideInstructions: Bool {
-        !needsAgentSetup && installedScreens.contains { !hiddenScreenIDs.contains($0.id) }
     }
     func finishAgentSetup() {
         guard !settingsOpen, canFinishAgentSetup, let library else { return }
@@ -1628,18 +1630,25 @@ import ScreenpunkLocalTransport
         } catch { message = error.localizedDescription }
     }
     var allInstalledScreensHidden: Bool {
-        onboarding != .connectAgent && onboarding != .gallery &&
+        library?.explicitlyCreatingScreen != true && onboarding != .connectAgent && onboarding != .gallery &&
             hiddenScreenIDs.contains(ScreenLibrary.instructionsID) && installedScreens.allSatisfy { hiddenScreenIDs.contains($0.id) }
     }
 
     func setScreenShown(_ shown: Bool, id: String, owner: String) {
-        guard !needsAgentSetup, !accountOperationInProgress, !owner.isEmpty, permissionOwner == owner, let library,
-              shown || id != ScreenLibrary.instructionsID || canHideInstructions else { return }
+        guard !needsAgentSetup, !accountOperationInProgress, !owner.isEmpty, permissionOwner == owner, let library else { return }
         do {
             let oldSelection = library.state.selectedID
             try library.setScreenShown(shown, id: id)
             if oldSelection != library.state.selectedID { refreshScreen() }
             else { hiddenScreenIDs = library.state.hiddenScreenIDs ?? [] }
+        } catch { message = error.localizedDescription }
+    }
+
+    func hideCreationScreen(owner: String) {
+        guard !needsAgentSetup, !accountOperationInProgress, !owner.isEmpty, permissionOwner == owner, let library else { return }
+        do {
+            try library.hideCreationScreen()
+            refreshScreen()
         } catch { message = error.localizedDescription }
     }
 

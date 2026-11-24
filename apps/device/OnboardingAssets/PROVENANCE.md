@@ -14,3 +14,8 @@ Guidelines verified 2026-11-17:
 The dark Google button uses Google's dark color tokens and the official G. Both controls center the mark and label using Google Sans Medium and share the iOS guide's 16pt corner radius.
 
 Both providers now share the user-selected near-black #131314 fill and subtle #636F77 border.
+
+Provider picker artwork came from the approved Screenpunk iPad Settings design review. The source PNGs were retained without editing.
+
+- OpenAI mark, `openai.png`, SHA-256 8a33312f6bb17c1edddf8f9d7fbac09ce1d1d697d6601f37227afa879e94c52e.
+- Grokbot mark, `grokbot.png`, SHA-256 f9c039bd0650b55913397046abb12f283d94a03be4b43f8d69135196b05adb1a.
