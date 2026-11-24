@@ -2,18 +2,27 @@ import StoreKit
 import SwiftUI
 import UIKit
 
-struct DeviceBillingSection: View {
+struct DeviceBillingRow: View {
     @ObservedObject var device: DeviceModel
+    @ObservedObject var billing: DeviceBillingStore
+    let openPlan: () -> Void
 
     var body: some View {
-        Section {
-            NavigationLink {
-                DeviceBillingSettings(device: device, billing: device.billing)
-            } label: {
-                Label("Billing", systemImage: "creditcard")
-            }
+        Button(action: openPlan) {
+            AccountFieldRow(title: "Plan", value: planName)
+        }
+        .buttonStyle(.plain)
+        .disabled(device.accountOperationInProgress)
+        .task(id: device.cloud.localAccountID) {
+            await billing.refreshBackupAccess(cloud: device.cloud)
         }
     }
+
+    private var planName: String {
+        guard let financial = billing.snapshot(for: device.cloud)?.financial else { return billing.loading ? "Checking…" : "Unavailable" }
+        return financial.proActive ? "Pro" : "Free"
+    }
+
 }
 
 struct DeviceBillingSettings: View {
@@ -40,10 +49,9 @@ struct DeviceBillingSettings: View {
                     }
                 }
             }
-            if signedIn { purchaseSupport }
             legalSection
         }
-        .navigationTitle("Billing")
+        .navigationTitle("Plan")
         .navigationBarTitleDisplayMode(.inline)
         .task(id: AccountState(id: device.cloud.localAccountID, changing: device.accountOperationInProgress)) {
             confirmation = nil
@@ -83,18 +91,17 @@ struct DeviceBillingSettings: View {
 
     private var plansSection: some View {
         Section("Plan") {
-            VStack(alignment: .leading, spacing: 6) {
-                planTitle("Free", current: snapshot?.financial?.proActive == false)
+            planRow("Free", current: snapshot?.financial?.proActive == false) {
                 Text("Use your Local agent without an account. Sign in to use Screenpunk Cloud on up to three devices.")
                     .foregroundStyle(.secondary)
             }
-            VStack(alignment: .leading, spacing: 6) {
-                planTitle("Screenpunk Pro", current: snapshot?.financial?.proActive == true)
-                Text("More than three Cloud devices, 1 GB of Cloud backup storage, and up to 200 API data credits each month.")
-                    .foregroundStyle(.secondary)
+            planRow("Screenpunk Pro", current: snapshot?.financial?.proActive == true) {
+                let benefits = "More than three Cloud devices, 1 GB of Cloud backup storage, and up to 200 API data credits each month."
                 if snapshot?.financial?.proActive == false, let offer = billing.offer(.proAnnual, for: device.cloud) {
-                    Text("\(offer.product.displayPrice) per year. Renews automatically until canceled.")
+                    Text("\(benefits) \(offer.product.displayPrice) per year. Renews automatically until canceled.")
                         .foregroundStyle(.secondary)
+                } else {
+                    Text(benefits).foregroundStyle(.secondary)
                 }
                 if snapshot?.financial?.proActive == true {
                     switch billing.subscriptionDate(for: device.cloud) {
@@ -110,21 +117,34 @@ struct DeviceBillingSettings: View {
             if !signedIn {
                 Button("Sign in for Screenpunk Cloud") { Task { await device.signIn() } }
                     .disabled(busy || device.routeChangeBlocked)
+            } else if snapshot?.financial?.proActive == true {
+                manageSubscription
+            } else if billing.offer(.proAnnual, for: device.cloud) != nil {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 16) { offerButton(.proAnnual); Spacer(minLength: 0); restorePurchases }
+                    VStack(alignment: .leading, spacing: 12) { offerButton(.proAnnual); restorePurchases }
+                }
+                .buttonStyle(.borderless)
             } else {
-                if snapshot?.financial?.proActive != true { offerButton(.proAnnual) }
-                Button("Refresh Billing") { Task { await billing.refresh(cloud: device.cloud) } }
-                    .disabled(busy || billing.loading)
+                offerButton(.proAnnual)
+                restorePurchases
             }
         }
     }
 
-    @ViewBuilder private func planTitle(_ title: LocalizedStringKey, current: Bool) -> some View {
-        if current {
-            Label(title, systemImage: "checkmark.circle.fill")
-                .font(.headline)
-                .accessibilityValue("Current plan")
-        } else {
-            Text(title).font(.headline)
+    private func planRow<Details: View>(_ title: LocalizedStringKey, current: Bool,
+                                        @ViewBuilder details: () -> Details) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.title3)
+                .foregroundStyle(.tint)
+                .opacity(current ? 1 : 0)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(title).font(.headline)
+                    .accessibilityAddTraits(current ? .isSelected : [])
+                details()
+            }
         }
     }
 
@@ -138,23 +158,24 @@ struct DeviceBillingSettings: View {
         }
     }
 
-    private var purchaseSupport: some View {
-        Section("App Store purchases") {
-            Button("Restore Purchases") { Task { await billing.restore(cloud: device.cloud) } }
-                .disabled(busy || billing.loading || snapshot?.canVerify != true)
-            Button("Manage Subscription") {
-                Task {
-                    guard let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene })
-                        .first(where: { $0.windows.contains(where: \.isKeyWindow) }) else {
-                        openURL(Self.subscriptionsURL)
-                        return
-                    }
-                    do {
-                        try await AppStore.showManageSubscriptions(in: scene)
-                        await billing.refresh(cloud: device.cloud)
-                    }
-                    catch { openURL(Self.subscriptionsURL) }
+    private var restorePurchases: some View {
+        Button("Restore Purchases") { Task { await billing.restore(cloud: device.cloud) } }
+            .disabled(busy || billing.loading || snapshot?.canVerify != true)
+    }
+
+    private var manageSubscription: some View {
+        Button("Manage Subscription") {
+            Task {
+                guard let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene })
+                    .first(where: { $0.windows.contains(where: \.isKeyWindow) }) else {
+                    openURL(Self.subscriptionsURL)
+                    return
                 }
+                do {
+                    try await AppStore.showManageSubscriptions(in: scene)
+                    await billing.refresh(cloud: device.cloud)
+                }
+                catch { openURL(Self.subscriptionsURL) }
             }
         }
     }

@@ -132,7 +132,7 @@ struct DeviceCustomConnectionSettings: View {
     private var connectionOverview: some View {
         Section("Connection") {
             LabeledContent("Name") {
-                TextField("Connection name", text: $connectionName)
+                TextField("Connection name", text: $connectionName, prompt: Text("Connection name").foregroundColor(Color(uiColor: .tertiaryLabel)))
                     .accessibilityIdentifier("custom-connection.name")
                     .multilineTextAlignment(.trailing)
                     .focused($editingName)
@@ -428,7 +428,7 @@ struct DeviceCustomConnectionSettings: View {
                     setScreenAccess(enabled, use: screenUse, generation: generation)
                 })) {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(screenUse.screen.displayName)
+                        Text(screenUse.screen.displayName).foregroundStyle(.primary)
                         ForEach(screenUse.declaration.operations, id: \.name) { operation in
                             Text(operation.method + " " + operation.path).font(.footnote).foregroundStyle(.secondary)
                         }

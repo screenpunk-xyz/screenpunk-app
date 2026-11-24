@@ -55,24 +55,29 @@ struct DeviceDisplaySettings: View {
     var body: some View {
         Form {
             Section {
-                TextField("Device name", text: $deviceName)
-                    .textInputAutocapitalization(.words)
-                    .submitLabel(.done)
-                    .focused($nameFocused)
-                    .onSubmit(finishNameEditing)
-                    .disabled(device.accountOperationInProgress)
-                    .accessibilityIdentifier("deviceName")
+                LabeledContent("Name") {
+                    TextField("Device name", text: $deviceName,
+                              prompt: Text("Device name").foregroundColor(Color(uiColor: .tertiaryLabel)))
+                        .multilineTextAlignment(.trailing)
+                        .textInputAutocapitalization(.words)
+                        .submitLabel(.done)
+                        .focused($nameFocused)
+                        .onSubmit(finishNameEditing)
+                        .disabled(device.accountOperationInProgress)
+                        .accessibilityIdentifier("deviceName")
+                }
                 if deviceName != device.displayName, (try? DeviceNameStore.normalized(deviceName)) == nil {
                     DismissibleMessage("Enter a valid device name.").id(deviceName)
                 }
-            } header: {
-                Text("Device Name")
-            }
-            Section("Brightness") {
-                Picker("Control", selection: Binding(get: { draft.mode }, set: changeMode)) {
-                    Text("System").tag(DeviceBrightnessMode.system)
-                    Text("Fixed Level").tag(DeviceBrightnessMode.fixed)
-                    Text("Time of Day").tag(DeviceBrightnessMode.schedule)
+                LabeledContent("Brightness") {
+                    Picker("Brightness", selection: Binding(get: { draft.mode }, set: changeMode)) {
+                        Text("System").tag(DeviceBrightnessMode.system)
+                        Text("Fixed Level").tag(DeviceBrightnessMode.fixed)
+                        Text("Time of Day").tag(DeviceBrightnessMode.schedule)
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .tint(.primary)
                 }
                 if draft.mode == .fixed { levelSlider($draft.fixedLevel) }
                 if draft.mode == .schedule {

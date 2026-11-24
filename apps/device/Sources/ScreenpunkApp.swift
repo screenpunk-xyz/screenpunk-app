@@ -43,8 +43,8 @@ private struct GalleryIntroSheet: View {
     private var content: some View {
         ScrollView {
             VStack(spacing: 20) {
-                Text("Explore the Gallery").font(.largeTitle.bold())
-                Text("Weather and NASA Gallery are ready to explore. Swipe left or right with two fingers to switch screens.")
+                Text("See sample screens").font(.largeTitle.bold())
+                Text("Try the sample Weather and NASA screens. Swipe left or right with two fingers to switch screens. You can hide or remove them from this device in Settings.")
                     .font(.title3).foregroundStyle(.secondary)
                 Button("Got it", action: confirm)
                     .buttonStyle(.borderedProminent)
@@ -577,14 +577,11 @@ struct DeviceRootView: View {
             OnboardingAgentConnection(model: model)
         } else {
             CreationPlaceholder(
-                canHide: model.canHideInstructions && !model.hiddenScreenIDs.contains(ScreenLibrary.instructionsID),
                 hideDisabled: model.permissionOwner.isEmpty || model.accountOperationInProgress,
                 openSettings: { model.openSettings() },
                 addUsingKeyboard: { keyboardRequestPresented = true },
                 keyboardDisabled: model.busy || model.requestPending || model.routeChangeBlocked || model.accountOperationInProgress,
-                hide: {
-                    model.setScreenShown(false, id: ScreenLibrary.instructionsID, owner: model.permissionOwner)
-                }
+                hide: { model.hideCreationScreen(owner: model.permissionOwner) }
             )
         }
     }
@@ -792,7 +789,6 @@ private struct OnboardingAgentPlugin: View {
 }
 
 private struct CreationPlaceholder: View {
-    let canHide: Bool
     let hideDisabled: Bool
     let openSettings: () -> Void
     let addUsingKeyboard: () -> Void
@@ -821,15 +817,21 @@ private struct CreationPlaceholder: View {
                     Text("Create a screen")
                         .font(OnboardingTypography.condensedTitle)
                         .accessibilityAddTraits(.isHeader)
-                    HStack(spacing: 8) {
-                        Button("Settings", action: openSettings).buttonStyle(.bordered)
-                        Button("Gestures") { showsGestures = true }.buttonStyle(.bordered)
-                        if canHide {
-                            Button("Hide", action: hide).buttonStyle(.bordered)
-                                .accessibilityLabel("Hide this screen")
-                                .disabled(hideDisabled)
+                    ViewThatFits(in: .horizontal) {
+                        HStack(spacing: 8) {
+                            Button("Settings", action: openSettings)
+                            Button("Gestures") { showsGestures = true }
+                            Button("Hide this screen", action: hide).disabled(hideDisabled)
+                        }
+                        VStack(spacing: 8) {
+                            HStack(spacing: 8) {
+                                Button("Settings", action: openSettings)
+                                Button("Gestures") { showsGestures = true }
+                            }
+                            Button("Hide this screen", action: hide).disabled(hideDisabled)
                         }
                     }
+                    .buttonStyle(.bordered)
                 }
             }
             .multilineTextAlignment(.center)
@@ -871,11 +873,9 @@ private struct CreationPlaceholder: View {
             Button("Open Settings", action: openSettings).buttonStyle(.bordered)
         }
         panel("Switch screens", instruction: "Swipe left or right with two fingers.", compact: compact) {
-            if canHide {
-                Button("Hide this screen", action: hide)
-                    .buttonStyle(.bordered)
-                    .disabled(hideDisabled)
-            }
+            Button("Hide this screen", action: hide)
+                .buttonStyle(.bordered)
+                .disabled(hideDisabled)
         }
     }
 
@@ -897,13 +897,12 @@ private struct CreationPlaceholder: View {
 }
 
 enum CloudSetupStage: Hashable {
-    case plugin, listener, completeGuide
+    case plugin, listener
 
     var sheetTitle: String {
         switch self {
-        case .plugin: return "Connect in ChatGPT"
+        case .plugin: return "Install Screenpunk plugin"
         case .listener: return "Activate the listener"
-        case .completeGuide: return "Cloud setup"
         }
     }
 }
@@ -914,7 +913,7 @@ struct CloudListenerSetupView: View {
     let scope: CloudOriginScope
     let email: String?
     var isPlaceholder = false
-    var stage: CloudSetupStage = .completeGuide
+    var stage: CloudSetupStage = .listener
     @State private var copied = false
 
     private let listenerTitle = "Activate the listener"
@@ -930,13 +929,12 @@ struct CloudListenerSetupView: View {
     var body: some View {
         Group {
             if isPlaceholder {
-                placeholder
+                placeholder.foregroundStyle(.white)
             } else {
                 guide
             }
         }
         .background(isPlaceholder ? Color.black : Color.clear)
-        .foregroundStyle(.white)
         .onChange(of: email) { _ in copied = false }
     }
 
@@ -993,26 +991,40 @@ struct CloudListenerSetupView: View {
     }
 
     private var guide: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
-                OnboardingTypography.wordmark
-                Text(stage.sheetTitle).font(OnboardingTypography.title).accessibilityAddTraits(.isHeader)
-                if stage != .listener {
-                    step(1, "Install the Screenpunk plugin in ChatGPT", "Open ChatGPT Plugins, search for Screenpunk, and install the plugin.")
-                    step(2, "Connect your Screenpunk account", "Choose Connect, then use the same sign-in option you used on this device.")
-                }
-                if stage == .plugin {
-                    step(3, "Set up the Screenpunk plugin", "After connecting your Screenpunk account, click Set up Screenpunk in ChatGPT.")
-                } else {
-                    step(stage == .listener ? 1 : 3, "Open a persistent ChatGPT session", "Open Work → Cloud or your dot and select @\(pluginName).")
-                    step(stage == .listener ? 2 : 4, "Send the listener request", "Copy the request below, paste it into the session, and send it.")
-                    copyButton
-                    step(stage == .listener ? 3 : 5, "Return to Screenpunk", "Keep the session listening. When the listener is active, this device can accept your screen requests.")
-                }
+        VStack(alignment: .leading, spacing: 24) {
+            if stage == .plugin {
+                setupGuideStep(1, "Install the Screenpunk plugin in ChatGPT", "Open ChatGPT Plugins, search for Screenpunk, and install the plugin.")
+                setupGuideStep(2, "Connect your Screenpunk account", "Choose Connect, then use the same sign-in option you used on this device.")
+                setupGuideStep(3, "Set up the Screenpunk plugin", "After connecting your Screenpunk account, click Set up Screenpunk in ChatGPT.")
+            } else {
+                manualListenerSteps
             }
-            .padding(24)
-            .frame(maxWidth: 680, alignment: .leading)
-            .frame(maxWidth: .infinity)
+        }
+        .padding(.horizontal, stage == .plugin ? 40 : 24)
+        .padding(.vertical, stage == .plugin ? 32 : 40)
+        .frame(maxWidth: 680, alignment: .leading)
+        .frame(maxWidth: .infinity)
+    }
+
+    private var manualListenerSteps: some View {
+        VStack(alignment: .leading, spacing: 24) {
+            setupGuideStep(1, "Open a new ChatGPT task", "Open Work → Cloud or your dot and select @\(pluginName).")
+            VStack(alignment: .leading, spacing: 10) {
+                setupGuideStep(2, "Send the listener request", "Copy this request and send it in that task.")
+                HStack(alignment: .top, spacing: 10) {
+                    promptText
+                    if #available(iOS 26, *) {
+                        copyIcon.buttonStyle(.glass).buttonBorderShape(.circle)
+                    } else {
+                        copyIcon.buttonStyle(.bordered).buttonBorderShape(.capsule)
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
+                .padding(.leading, 40)
+            }
+            setupGuideStep(3, "Return to Screenpunk", "Leave the listener running to receive requests from this iPad.")
         }
     }
 
@@ -1021,68 +1033,115 @@ struct CloudListenerSetupView: View {
     }
 
     private var copyButton: some View {
-        Button(copied ? "Copied" : "Copy listener request") {
-            UIPasteboard.general.string = setupRequest
-            copied = true
-        }
+        Button(copied ? "Copied" : "Copy listener request", action: copyRequest)
         .buttonStyle(.borderedProminent)
     }
 
-    private func step(_ number: Int, _ title: String, _ detail: String) -> some View {
-        HStack(alignment: .top, spacing: 14) {
-            Text(String(number)).font(.headline).foregroundStyle(.orange)
-                .padding(8).background(.orange.opacity(0.15), in: Circle())
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 5) {
-                Text(title).font(.headline).accessibilityAddTraits(.isHeader)
-                Text(detail).font(OnboardingTypography.caption).foregroundStyle(.secondary)
-            }
+    private var copyIcon: some View {
+        Button(action: copyRequest) {
+            Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                .foregroundStyle(.primary)
+        }
+        .controlSize(.large)
+        .accessibilityLabel(copied ? "Copied" : "Copy listener request")
+    }
+
+    private func copyRequest() {
+        UIPasteboard.general.string = setupRequest
+        copied = true
+    }
+}
+
+private func setupGuideStep(_ number: Int, _ title: String, _ detail: String) -> some View {
+    HStack(alignment: .top, spacing: 14) {
+        Text(String(number)).font(.headline).foregroundStyle(.orange)
+            .padding(8).background(.orange.opacity(0.15), in: Circle())
+            .accessibilityHidden(true)
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title).font(.headline).accessibilityAddTraits(.isHeader)
+            Text(detail).font(OnboardingTypography.caption).foregroundStyle(.secondary)
         }
     }
 }
 
-/// One presentation surface shared by the current and future agent guides.
-/// Standard iOS 26 sheets supply Liquid Glass; do not stack another glass card inside.
-private struct AgentInstructionsSurface: ViewModifier {
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    @Environment(\.colorSchemeContrast) private var contrast
+private struct SettingsSheetHeader: View {
+    let title: String
+    let dismissLabel: String
+    let close: () -> Void
 
-    @ViewBuilder func body(content: Content) -> some View {
-        if #available(iOS 16.4, *) {
-            if reduceTransparency || contrast == .increased {
-                content.presentationBackground(Color(uiColor: .secondarySystemBackground))
-            } else if #available(iOS 26, *) {
-                content
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            Text(title)
+                .font(.title2.bold())
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 52)
+                .frame(maxWidth: .infinity, minHeight: 44)
+                .accessibilityAddTraits(.isHeader)
+            if #available(iOS 26, *) {
+                dismissButton.buttonStyle(.plain)
+                    .glassEffect(.regular.interactive(), in: .circle)
             } else {
-                content.presentationBackground(.regularMaterial)
-            }
-        } else {
-            // iOS 16.0–16.3 has no public presentation-background override.
-            // Keep the system sheet backing and a legible material fallback.
-            if reduceTransparency || contrast == .increased {
-                content.background(Color(uiColor: .secondarySystemBackground).ignoresSafeArea())
-            } else {
-                content.background(.regularMaterial)
+                dismissButton.buttonStyle(.plain)
+                    .background(.thinMaterial, in: Circle())
             }
         }
+    }
+
+    private var dismissButton: some View {
+        Button(role: .cancel) { close() } label: {
+            Image(systemName: "xmark").font(.body.weight(.semibold))
+                .frame(width: 44, height: 44)
+                .contentShape(Circle())
+        }
+        .accessibilityLabel(dismissLabel)
+        .keyboardShortcut(.cancelAction)
     }
 }
 
 struct CloudListenerSetupSheet: View {
     let scope: CloudOriginScope
     let email: String?
-    var stage: CloudSetupStage = .completeGuide
+    var stage: CloudSetupStage = .listener
+    var startsWithPluginPicker = false
+    @State private var choseChatGPT = false
+    private var choosingPlugin: Bool { startsWithPluginPicker && !choseChatGPT }
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        NavigationStack {
-            CloudListenerSetupView(scope: scope, email: email, stage: stage)
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbarBackground(.hidden, for: .navigationBar)
-                .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+        if #available(iOS 18, *) {
+            content.presentationSizing(.fitted)
+        } else {
+            content.presentationDetents([.medium, .large])
         }
-        .modifier(AgentInstructionsSurface())
-        .preferredColorScheme(.dark)
+    }
+
+    private var content: some View {
+        VStack(spacing: 0) {
+            SettingsSheetHeader(title: stage.sheetTitle, dismissLabel: "Close") { dismiss() }
+                .padding([.horizontal, .top], 24)
+            ViewThatFits(in: .vertical) {
+                stepContent.fixedSize(horizontal: false, vertical: true)
+                ScrollView { stepContent }
+            }
+        }
+        .frame(idealWidth: stage == .listener ? 640 : 480, maxWidth: stage == .listener ? 640 : 480)
+    }
+
+    @ViewBuilder private var stepContent: some View {
+        if choosingPlugin {
+            ZStack(alignment: .top) {
+                instructions.hidden().accessibilityHidden(true)
+                CloudPluginPicker { choseChatGPT = true }
+                    .padding(.horizontal, 24)
+            }
+        } else {
+            instructions
+        }
+    }
+
+    private var instructions: some View {
+        CloudListenerSetupView(scope: scope, email: email, stage: stage)
     }
 }
 
@@ -1158,7 +1217,6 @@ private struct CustomConnectionAccessCard: View {
     @ObservedObject var model: DeviceModel
     let prompt: DeviceModel.CustomConnectionPrompt
     let openSettings: () -> Void
-    @State private var detailsExpanded = false
     @State private var action: Action?
     @State private var registration: DeviceModel.ProvisioningStatus?
     @State private var problem: String?
@@ -1181,50 +1239,12 @@ private struct CustomConnectionAccessCard: View {
     }
 
     private var card: some View {
-        VStack(spacing: 16) {
-            Text(registration == nil ? "Allow connection access?" : "Review the server certificate")
-                .font(.title2.bold())
-            let operation = prompt.use.declaration.operations.count == 1 ? prompt.use.declaration.operations.first?.name ?? "data" : "data"
-            let name = model.connectionName(serviceID: prompt.use.declaration.id, fallback: prompt.use.declaration.label)
-            Text("“\(prompt.use.screen.displayName)” wants to read \(operation) from \(name).")
-            if let origin {
-                Text(verbatim: origin).font(.callout.monospaced()).textSelection(.enabled)
-            }
-            if let fingerprint = registration?.certificateFingerprint {
-                Text("Your setup agent reported this SHA-256 fingerprint. Verify it belongs to this server before trusting it.")
-                    .font(.callout)
-                Text(verbatim: fingerprint).font(.caption.monospaced()).textSelection(.enabled)
-            } else if prompt.status == nil, prompt.setupOrigin != nil, !manualSetupRequired {
-                Text("Allow starts setup for a credential on this iPad. You’ll review the server certificate before the screen can read.")
-                    .font(.callout).foregroundStyle(.secondary)
-            }
-            if !manualSetupRequired && (prompt.status != nil || prompt.setupOrigin != nil) {
-                DisclosureGroup("Connection details", isExpanded: $detailsExpanded) {
-                    ForEach(prompt.use.declaration.operations, id: \.name) { operation in
-                        Text(verbatim: operation.method + " " + operation.path).font(.footnote.monospaced())
-                    }
-                }
-            }
-            if let problem { Text(problem).font(.callout).foregroundStyle(.secondary) }
-            if action != nil {
-                ProgressView(action == .trust ? "Saving connection…" : "Waiting for your agent to verify provider access…")
-            } else if registration?.certificateFingerprint != nil {
-                Button("Trust and allow") { action = .trust }
-                    .buttonStyle(.borderedProminent)
-                    .accessibilityIdentifier("custom-connection.trust-and-allow")
-            } else if !manualSetupRequired && (prompt.status != nil || prompt.setupOrigin != nil) {
-                Button("Allow", action: allow).buttonStyle(.borderedProminent)
-                    .accessibilityIdentifier("custom-connection.allow")
-            } else {
-                Button("Connection details", action: openSettings).buttonStyle(.borderedProminent)
-            }
-            Button("Not now", action: dismiss)
-                .disabled(action == .trust)
-                .accessibilityIdentifier("custom-connection.not-now")
+        ViewThatFits(in: .vertical) {
+            cardContents.fixedSize(horizontal: false, vertical: true)
+            ScrollView { cardContents }
         }
-        .multilineTextAlignment(.center)
-        .padding(24).frame(maxWidth: 420)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18)).padding()
+        .padding(24).frame(maxWidth: 440)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24)).padding()
         .accessibilityAddTraits(.isModal)
         .accessibilityAction(.escape) { dismiss() }
         .task(id: action) {
@@ -1245,6 +1265,75 @@ private struct CustomConnectionAccessCard: View {
                 }
             }
         }
+    }
+
+    private var cardContents: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            if registration == nil {
+                let operations = prompt.use.declaration.operations.map(\.name).joined(separator: ", ")
+                let name = model.connectionName(serviceID: prompt.use.declaration.id, fallback: prompt.use.declaration.label)
+                Text("Allow “\(prompt.use.screen.displayName)” to read \(operations) from \(name)?")
+                    .font(.title2.bold()).accessibilityAddTraits(.isHeader)
+            } else {
+                Text("Review the server certificate").font(.title2.bold()).accessibilityAddTraits(.isHeader)
+            }
+            if let origin {
+                Text(verbatim: origin).font(.callout.monospaced()).textSelection(.enabled)
+            }
+            VStack(alignment: .leading, spacing: 5) {
+                Text("Connection details").font(.subheadline.weight(.semibold))
+                ForEach(prompt.use.declaration.operations, id: \.name) { operation in
+                    Text(verbatim: operation.method + " " + operation.path).font(.callout.monospaced())
+                }
+            }
+            if let fingerprint = registration?.certificateFingerprint {
+                Text("Your setup agent reported this SHA-256 fingerprint. Verify it belongs to this server before trusting it.")
+                    .font(.callout)
+                Text(verbatim: fingerprint).font(.caption.monospaced()).textSelection(.enabled)
+            } else if prompt.status == nil, prompt.setupOrigin != nil, !manualSetupRequired {
+                Text("Approve starts setup for a credential on this iPad. You’ll review the server certificate before the screen can read.")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
+            if let problem { Text(problem).font(.callout).foregroundStyle(.secondary) }
+            if action != nil {
+                ProgressView(action == .trust ? "Saving connection…" : "Waiting for your agent to verify provider access…")
+            }
+            if #available(iOS 26, *) {
+                GlassEffectContainer(spacing: 8) {
+                    HStack(spacing: 12) {
+                        cancelButton.buttonStyle(.glass)
+                        primaryButton.buttonStyle(.glassProminent)
+                    }
+                }
+            } else {
+                HStack(spacing: 12) {
+                    cancelButton.buttonStyle(.bordered)
+                    primaryButton.buttonStyle(.borderedProminent)
+                }
+            }
+        }
+        .controlSize(.large)
+    }
+
+    private var cancelButton: some View {
+        Button(role: .cancel, action: dismiss) { Text("Cancel").frame(maxWidth: .infinity) }
+            .disabled(action == .trust)
+            .accessibilityIdentifier("custom-connection.not-now")
+    }
+
+    private var primaryButton: some View {
+        let hasCertificate = registration?.certificateFingerprint != nil
+        let canApprove = !manualSetupRequired && (prompt.status != nil || prompt.setupOrigin != nil)
+        let title = hasCertificate ? "Trust and allow" : canApprove ? "Approve" : "Connection settings"
+        return Button {
+            if hasCertificate { action = .trust }
+            else if canApprove { allow() }
+            else { openSettings() }
+        } label: {
+            Text(title).frame(maxWidth: .infinity)
+        }
+        .disabled(action != nil)
+        .accessibilityIdentifier(hasCertificate ? "custom-connection.trust-and-allow" : canApprove ? "custom-connection.allow" : "custom-connection.open")
     }
 
     private func dismiss() {
@@ -1281,7 +1370,7 @@ private struct CustomConnectionAccessCard: View {
             manualSetupRequired = true
             problem = "Your agent couldn’t verify setup access at this provider. You can enter its token in Connection details."
         case "retry", "available":
-            problem = "Automatic setup wasn’t started. Tap Allow to try again."
+            problem = "Automatic setup wasn’t started. Tap Approve to try again."
         default:
             manualSetupRequired = true
             problem = "Automatic setup couldn’t finish. Review the setup in Connection details."
@@ -1357,17 +1446,61 @@ private struct ScreenDataAccessSettings: View {
 }
 
 private enum ScreenSettingsRoute: Hashable {
-    case instructions(owner: String)
     case screen(String, owner: String)
     case shared(DeviceSettingsPage)
     case custom(String, alias: String, owner: String)
     case sharedCustom(String, owner: String)
 }
 
+private struct SettingsFieldStyle: LabeledContentStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        LabeledContent {
+            configuration.content.foregroundStyle(.primary)
+        } label: {
+            configuration.label.foregroundStyle(.secondary)
+        }
+        .labeledContentStyle(.automatic)
+    }
+}
+
+private struct ScreenNameField: View {
+    let name: String
+    let save: (String) throws -> Void
+    let reportError: (String) -> Void
+    @State private var draft = ""
+    @FocusState private var focused: Bool
+    @State private var editing = false
+
+    var body: some View {
+        LabeledContent("Name") {
+            TextField("Screen name", text: $draft, prompt: Text("Screen name").foregroundColor(Color(uiColor: .tertiaryLabel)))
+                .accessibilityIdentifier("screen.name")
+                .multilineTextAlignment(.trailing)
+                .focused($focused)
+                .onSubmit { focused = false; commit() }
+        }
+        .onAppear { draft = name }
+        .onChange(of: name) { if !editing { draft = $0 } }
+        .onChange(of: focused) { if $0 { editing = true } else { commit() } }
+        .onDisappear(perform: commit)
+    }
+
+    private func commit() {
+        guard editing else { return }
+        editing = false
+        guard draft != name else { return }
+        do {
+            try save(draft)
+            draft = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        } catch {
+            draft = name
+            reportError(error.localizedDescription)
+        }
+    }
+}
+
 struct DeviceSettingsView: View {
     @State private var path: [ScreenSettingsRoute] = []
-    @State private var renameText = ""
-    @State private var renameTarget: ScreenSettingsRoute?
     @State private var renameError: String?
     @State private var customConnectionToRemove: ScreenSettingsRoute?
     @State private var customConnectionError: String?
@@ -1381,10 +1514,9 @@ struct DeviceSettingsView: View {
     @State private var linkedConflictError: String?
     @State private var sheet: SettingsSheet?
     private enum SettingsSheet: String, Identifiable {
-        case cloudListener, catalog, editKeyboardRequest
+        case addCloudAgent, cloudListener, catalog, editKeyboardRequest
         var id: String { rawValue }
     }
-    @State private var columns: NavigationSplitViewVisibility = .all
     @Environment(\.horizontalSizeClass) private var sizeClass
     @State private var promptDestination: ScreenSettingsRoute?
 
@@ -1402,9 +1534,10 @@ struct DeviceSettingsView: View {
 
     var body: some View {
         Group {
-            if promptDestination != nil { settingsStack }
+            if promptDestination != nil { settingsStack() }
             else { settingsBrowser }
         }
+        .labeledContentStyle(SettingsFieldStyle())
         .modifier(AccountCreationAlert(model: model, isHost: model.settingsOpen))
         .modifier(ScreenDataConsentAlert(model: model, isHost: model.settingsOpen && sheet == nil && screenToRemove == nil))
         .modifier(BackupUpgradeAlert(model: model, billing: model.billing,
@@ -1413,7 +1546,10 @@ struct DeviceSettingsView: View {
         // controller can resolve the presentation against the outer cover.
         .sheet(item: $sheet) { destination in
             switch destination {
-            case .cloudListener: CloudListenerSetupSheet(scope: CloudClient.originScope, email: model.email)
+            case .addCloudAgent:
+                CloudListenerSetupSheet(scope: CloudClient.originScope, email: model.email, stage: .plugin, startsWithPluginPicker: true)
+            case .cloudListener:
+                CloudListenerSetupSheet(scope: CloudClient.originScope, email: model.email, stage: .listener)
             case .catalog: CatalogScreenPicker(model: model)
             case .editKeyboardRequest: KeyboardRequestEditor(model: model, creatingNew: false)
             }
@@ -1429,18 +1565,9 @@ struct DeviceSettingsView: View {
             if $0 != .account { showBilling = false }
         }
         .onChange(of: model.permissionOwner) { _ in
-            path.removeAll(); renameTarget = nil; screenToRemove = nil
+            path.removeAll(); screenToRemove = nil
             linkedConflictToDiscard = nil; linkedConflictError = nil
             customConnectionToRemove = nil; customConnectionError = nil
-        }
-        .alert("Rename screen", isPresented: Binding(get: { renameTarget != nil }, set: { if !$0 { renameTarget = nil } }), presenting: renameTarget) { target in
-            TextField("Screen name", text: $renameText)
-            Button("Cancel", role: .cancel) {}
-            Button("Save") {
-                guard case let .screen(id, owner) = target else { return }
-                do { try model.renameScreen(id, to: renameText, owner: owner) }
-                catch { renameError = error.localizedDescription }
-            }
         }
         .alert("Couldn’t rename screen", isPresented: Binding(get: { renameError != nil }, set: { if !$0 { renameError = nil } })) {
             Button("OK") {}
@@ -1485,32 +1612,57 @@ struct DeviceSettingsView: View {
 
     }
     private var settingsBrowser: some View {
-        NavigationSplitView(columnVisibility: $columns) {
-            List(selection: Binding(get: { selection }, set: { newPage in
-                if selection != newPage { path.removeAll() }; selection = newPage
-            })) {
-                Section {
-                    row(.account)
+        GeometryReader { geometry in
+            if geometry.size.width >= 700 && sizeClass != .compact {
+                HStack(spacing: 0) {
+                    NavigationStack { settingsMenu(isSidebar: true) }
+                        .frame(width: 260)
+                    Divider()
+                    settingsStack()
                 }
-                Section("Device") { row(.display); row(.screens) }
-                if !usedSharedProviders.isEmpty {
-                    Section("Shared Connections") {
-                        ForEach(usedSharedProviders, id: \.self) { row($0) }
-                    }
+            } else {
+                NavigationSplitView {
+                    settingsMenu(isSidebar: false)
+                } detail: {
+                    settingsStack(showClose: true)
                 }
-                Section("Help") { row(.overview); row(.guidedAccess) }
+                .environment(\.horizontalSizeClass, .compact)
             }
-            .listStyle(.sidebar)
-            .navigationTitle("Settings")
-            .toolbar { if sizeClass == .compact { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } } }
-            .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 320)
-        } detail: {
-            settingsStack
         }
-        .navigationSplitViewStyle(.balanced)
     }
 
-    private var settingsStack: some View {
+    private var closeSettings: some View {
+        Button { dismiss() } label: {
+            Image(systemName: "xmark").accessibilityLabel("Close Settings")
+        }
+    }
+
+    private func settingsMenu(isSidebar: Bool) -> some View {
+        List(selection: Binding(get: { selection }, set: { newPage in
+            if selection != newPage { path.removeAll() }
+            selection = newPage
+        })) {
+            Section { row(.account, isSidebar: isSidebar) }
+            Section("Device") {
+                row(.display, isSidebar: isSidebar)
+                row(.screens, isSidebar: isSidebar)
+            }
+            if !usedSharedProviders.isEmpty {
+                Section("Shared Connections") {
+                    ForEach(usedSharedProviders, id: \.self) { row($0, isSidebar: isSidebar) }
+                }
+            }
+            Section("Help") {
+                row(.overview, isSidebar: isSidebar)
+                row(.guidedAccess, isSidebar: isSidebar)
+            }
+        }
+        .listStyle(.sidebar)
+        .navigationTitle("Settings")
+        .toolbar { ToolbarItem(placement: .navigationBarLeading) { closeSettings } }
+    }
+
+    private func settingsStack(showClose: Bool = false) -> some View {
         NavigationStack(path: $path) {
             Group {
                 if let promptDestination { destination(promptDestination) }
@@ -1520,7 +1672,11 @@ struct DeviceSettingsView: View {
                     destination(route)
                 }
                 .navigationBarTitleDisplayMode(.inline)
-                .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+                .toolbar {
+                    if promptDestination != nil || (showClose && path.isEmpty && !showBilling) {
+                        ToolbarItem(placement: .navigationBarLeading) { closeSettings }
+                    }
+                }
                 .navigationDestination(isPresented: $showBilling) {
                     DeviceBillingSettings(device: model, billing: model.billing)
                 }
@@ -1529,14 +1685,6 @@ struct DeviceSettingsView: View {
 
     @ViewBuilder private func destination(_ route: ScreenSettingsRoute) -> some View {
         switch route {
-        case let .instructions(owner):
-            if owner == model.permissionOwner {
-                Form {
-                    Button("Open screen") { model.selectScreen(ScreenLibrary.instructionsID) }
-                        .disabled(model.needsAgentSetup || model.hiddenScreenIDs.contains(ScreenLibrary.instructionsID) || model.accountOperationInProgress)
-                }
-                .navigationTitle("Add a screen")
-            } else { Text("Screen unavailable") }
         case let .screen(id, owner):
             if owner == model.permissionOwner, let saved = model.installedScreens.first(where: { $0.id == id }) {
                 screenDetails(saved, owner: owner)
@@ -1561,24 +1709,39 @@ struct DeviceSettingsView: View {
         return pages
     }
 
-    private func row(_ page: DeviceSettingsPage) -> some View {
-        NavigationLink(value: page) { Label(page.rawValue, systemImage: page.symbol) }
+    @ViewBuilder private func row(_ page: DeviceSettingsPage, isSidebar: Bool) -> some View {
+        let label = Label(page.rawValue, systemImage: page.symbol)
+        if isSidebar {
+            Button {
+                if selection != page { path.removeAll() }
+                selection = page
+            } label: {
+                label.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .tag(page)
+        } else {
+            NavigationLink(value: page) { label }
+        }
     }
     @ViewBuilder private var detail: some View {
         switch selection ?? .overview {
         case .overview:
             Form {
-                Section("Talk to your agent") {
+                Section("Ask your agent to make or update a screen") {
                     Label("Hold three fingers while speaking", systemImage: "mic")
                     Text("Keep all three fingers on the screen as you describe what you want to create or change. Lift them to send your instructions.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
                 Section("Change screens") {
                     Label("Swipe left or right with two fingers", systemImage: "hand.draw")
                     Text("Move between the screens saved on this device.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
                 Section("Open Settings") {
                     Label("Hold two fingers for three seconds", systemImage: "gearshape")
                     Text("Settings opens directly. Your current screen stays saved while you adjust this device.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
             }
         case .guidedAccess:
@@ -1586,12 +1749,15 @@ struct DeviceSettingsView: View {
                 Section("Keep Screenpunk on screen") {
                     Text("Guided Access can restrict this device to Screenpunk. You configure and end it using Apple’s system controls.")
                 }
-                Section("Set up") {
-                    Text("1. Open the device’s Settings → Accessibility → Guided Access. Turn it on and choose a Guided Access passcode.")
-                    Text("2. Return to Screenpunk. Triple-click the Home button if your device has one. Otherwise, triple-click the top button on iPad or the side button on iPhone.")
-                    Text("3. Choose Guided Access if a shortcut menu appears. Keep Touch enabled so Screenpunk’s gestures work, then tap Start.")
+                Section("Start Guided Access") {
+                    VStack(alignment: .leading, spacing: 24) {
+                        setupGuideStep(1, "Turn on Guided Access", "Open this device’s Settings → Accessibility → Guided Access. Turn it on and choose a passcode.")
+                        setupGuideStep(2, "Return to Screenpunk", "Triple-click the Home button if your device has one. Otherwise, triple-click the top button on iPad or the side button on iPhone.")
+                        setupGuideStep(3, "Start Guided Access", "Choose Guided Access if a shortcut menu appears. Keep Touch enabled so Screenpunk’s gestures work, then tap Start.")
+                    }
+                    .padding(.vertical, 16)
                 }
-                Section("End a session") {
+                Section("Exit Guided Access") {
                     Text("Triple-click the same button, enter your Guided Access passcode, and tap End. Available biometric shortcuts depend on the device and your Guided Access settings.")
                     Link("Apple’s Guided Access instructions", destination: URL(string: "https://support.apple.com/111795")!)
                 }
@@ -1600,19 +1766,26 @@ struct DeviceSettingsView: View {
             DeviceDisplaySettings(preferences: display, device: model)
         case .account:
             if let localSettings = model.localSettings {
-                DeviceAccountSettings(device: model, model: localSettings, showCloudSetup: { sheet = .cloudListener })
+                DeviceAccountSettings(device: model, model: localSettings, addCloudAgent: { sheet = .addCloudAgent },
+                                      showCloudSetup: { sheet = .cloudListener }, openPlan: { showBilling = true })
             } else {
                 Form {
-                    DeviceCloudAccountSection(device: model, showListenerSetup: { sheet = .cloudListener })
-                    DeviceBillingSection(device: model)
+                    DeviceCloudAccountSection(device: model, addCloudAgent: { sheet = .addCloudAgent },
+                                              showListenerSetup: { sheet = .cloudListener }, openPlan: { showBilling = true })
                     Section("Local agent") { Text("Local agent storage could not be opened.") }
-                    DeviceAccountDeletionSection(device: model)
                 }
             }
         case .screens:
             Form {
                 Section {
-                    Button("Create another screen", action: model.newScreen).disabled(model.needsAgentSetup)
+                    HStack {
+                        Button("Add a screen", action: model.newScreen)
+                            .buttonStyle(.borderless)
+                            .disabled(model.needsAgentSetup)
+                        Spacer()
+                        showScreenToggle("Add a screen", id: ScreenLibrary.instructionsID, owner: model.permissionOwner)
+                            .disabled(model.needsAgentSetup)
+                    }
                     if model.catalogBackupAccess.allowsBackups {
                         Button("Add a screen from my catalog") { sheet = .catalog }
                             .disabled(!model.canAddCatalogScreen)
@@ -1625,12 +1798,6 @@ struct DeviceSettingsView: View {
                     showBilling = true
                 }
                 Section("On this device") {
-                    let instructionOwner = model.permissionOwner
-                    screenSettingsRow(model.needsAgentSetup ? "Connect an agent" : "Add a screen",
-                                      id: ScreenLibrary.instructionsID, owner: instructionOwner,
-                                      route: .instructions(owner: instructionOwner),
-                                      toggleDisabled: model.needsAgentSetup ||
-                                        (!model.hiddenScreenIDs.contains(ScreenLibrary.instructionsID) && !model.canHideInstructions))
                     ForEach(model.needsAgentSetup ? [] : model.installedScreens) { saved in
                         let owner = model.permissionOwner
                         screenSettingsRow(saved.displayName, id: saved.id, owner: owner,
@@ -1648,8 +1815,7 @@ struct DeviceSettingsView: View {
         }
     }
 
-    private func screenSettingsRow(_ title: String, id: String, owner: String, route: ScreenSettingsRoute,
-                                   toggleDisabled: Bool = false) -> some View {
+    private func screenSettingsRow(_ title: String, id: String, owner: String, route: ScreenSettingsRoute) -> some View {
         HStack {
             Button {
                 path.append(route)
@@ -1662,18 +1828,22 @@ struct DeviceSettingsView: View {
                 .frame(minHeight: 44).contentShape(Rectangle())
             }
             .buttonStyle(.borderless)
-            Toggle("Show", isOn: Binding(
-                get: { !model.hiddenScreenIDs.contains(id) },
-                set: { model.setScreenShown($0, id: id, owner: owner) }
-            ))
-            .fixedSize().accessibilityLabel("Show " + title)
-            .disabled(owner.isEmpty || model.accountOperationInProgress || toggleDisabled)
+            showScreenToggle(title, id: id, owner: owner)
             Button { path.append(route) } label: {
                 Image(systemName: "chevron.right").foregroundStyle(.secondary)
                     .frame(width: 32, height: 44, alignment: .trailing).contentShape(Rectangle())
             }
             .buttonStyle(.borderless).accessibilityHidden(true)
         }
+    }
+
+    private func showScreenToggle(_ title: String, id: String, owner: String) -> some View {
+        Toggle("Show", isOn: Binding(
+            get: { !model.hiddenScreenIDs.contains(id) },
+            set: { model.setScreenShown($0, id: id, owner: owner) }
+        ))
+        .fixedSize().accessibilityLabel("Show " + title)
+        .disabled(owner.isEmpty || model.accountOperationInProgress)
     }
 
     @ViewBuilder private func sharedProvider(_ provider: DeviceSettingsPage) -> some View {
@@ -1743,13 +1913,10 @@ struct DeviceSettingsView: View {
         let linked = model.linkedEditOptions(for: saved.id)
         return Form {
             Section {
-                Button("Rename screen") {
-                    renameText = saved.displayName
-                    renameTarget = .screen(saved.id, owner: owner)
-                }
-                if !model.hiddenScreenIDs.contains(saved.id) {
-                    Button("Open screen") { model.selectScreen(saved.id) }
-                }
+                ScreenNameField(name: saved.displayName) { name in
+                    try model.renameScreen(saved.id, to: name, owner: owner)
+                } reportError: { renameError = $0 }
+                .id(saved.id)
                 if saved.id == model.screen?.id {
                     Button("Edit this screen with keyboard") { sheet = .editKeyboardRequest }
                         .disabled(model.routeChangeBlocked || model.accountOperationInProgress || linked?.blocksEditing == true)
@@ -1785,7 +1952,12 @@ struct DeviceSettingsView: View {
                     ForEach(customUses, id: \.alias) { use in
                         NavigationLink(value: ScreenSettingsRoute.custom(saved.id, alias: use.alias, owner: owner)) {
                             let label = model.connectionName(serviceID: use.declaration.id, fallback: use.declaration.label)
-                            LabeledContent(label, value: model.customConnectionApproved(use) ? "Allowed" : "Approval required")
+                            LabeledContent {
+                                Text(model.customConnectionApproved(use) ? "Allowed" : "Approval required")
+                                    .foregroundStyle(.secondary)
+                            } label: {
+                                Text(label).foregroundStyle(.primary)
+                            }
                         }
                     }
                 }
@@ -1837,17 +2009,107 @@ struct DeviceSettingsView: View {
     }
 }
 
+let screenpunkSignInTitle = "Sign in, or create a Screenpunk account"
+
+private struct ProviderPicker<Options: View>: View {
+    let title: String
+    let dismissLabel: String
+    let close: () -> Void
+    @ViewBuilder let buttons: () -> Options
+
+    var body: some View {
+        if #available(iOS 18, *) {
+            content.presentationSizing(.fitted)
+        } else {
+            content.presentationDetents([.medium, .large])
+        }
+    }
+
+    private var content: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            SettingsSheetHeader(title: title, dismissLabel: dismissLabel, close: close)
+            ProviderButtons(buttons: buttons)
+        }
+        .padding(.horizontal, 24)
+        .padding(.top, 24)
+        .frame(idealWidth: 420, maxWidth: 420)
+    }
+
+}
+
+private struct ProviderButtons<Options: View>: View {
+    @ViewBuilder let buttons: () -> Options
+
+    var body: some View {
+        if #available(iOS 26, *) {
+            GlassEffectContainer(spacing: 8) {
+                options.buttonStyle(.glass)
+            }
+        } else {
+            options.buttonStyle(.bordered)
+        }
+    }
+
+    private var options: some View {
+        VStack(spacing: 12) { buttons() }
+            .controlSize(.large)
+            .padding(.vertical, 24)
+    }
+}
+
+private struct CloudPluginPicker: View {
+    @ScaledMetric(relativeTo: .body) private var logoSize: CGFloat = 22
+    let showChatGPT: () -> Void
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            buttons.fixedSize(horizontal: true, vertical: false)
+            buttons
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var buttons: some View {
+        ProviderButtons {
+            option("ChatGPT instructions", logo: "openai", action: showChatGPT)
+            option("Grokbot instructions (coming soon)", logo: "grokbot") {}
+                .disabled(true)
+        }
+    }
+
+    private func option(_ title: String, logo: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 14) {
+                if let path = Bundle.main.path(forResource: logo, ofType: "png", inDirectory: "OnboardingAssets"),
+                   let symbol = UIImage(contentsOfFile: path) {
+                    Image(uiImage: symbol).renderingMode(.template).resizable().scaledToFit()
+                        .frame(width: logoSize, height: logoSize)
+                        .accessibilityHidden(true)
+                }
+                Text(title).font(.body.weight(.medium))
+            }
+            .padding(.horizontal, 8)
+            .frame(maxWidth: .infinity, minHeight: 30, alignment: .leading)
+        }
+    }
+}
+
 private struct AccountCreationAlert: ViewModifier {
     @ObservedObject var model: DeviceModel
     let isHost: Bool
+    @State private var selectedProvider: CloudSignInProvider?
+    @ScaledMetric(relativeTo: .body) private var logoSize: CGFloat = 22
+
     func body(content: Content) -> some View {
-        content.confirmationDialog("Continue to Screenpunk", isPresented: Binding(
+        content.sheet(isPresented: Binding(
             get: { isHost && model.choosingSignInProvider },
             set: { if isHost { model.choosingSignInProvider = $0 } }
-        ), titleVisibility: .visible) {
-            Button("Continue with Apple") { Task { await model.signIn(provider: .apple) } }
-            Button("Continue with Google") { Task { await model.signIn(provider: .google) } }
-            Button("Cancel", role: .cancel) { model.choosingSignInProvider = false }
+        ), onDismiss: {
+            guard let provider = selectedProvider else { return }
+            selectedProvider = nil
+            Task { await model.signIn(provider: provider) }
+        }) {
+            signInOptions
         }
         .alert("Create a new Screenpunk account?", isPresented: Binding(
             get: { isHost && model.accountCreationEmail != nil },
@@ -1859,6 +2121,41 @@ private struct AccountCreationAlert: ViewModifier {
             Text("Create a new Screenpunk account with \(model.accountCreationEmail ?? "this Apple Account")?")
         }
     }
+
+    private var signInOptions: some View {
+        ProviderPicker(title: screenpunkSignInTitle, dismissLabel: "Cancel", close: {
+            model.choosingSignInProvider = false
+        }) {
+            providerOption(.apple, title: "Continue with Apple")
+            providerOption(.google, title: "Continue with Google")
+        }
+    }
+
+    private func providerOption(_ provider: CloudSignInProvider, title: String) -> some View {
+        Button {
+            selectedProvider = provider
+            model.choosingSignInProvider = false
+        } label: {
+            HStack(spacing: 14) {
+                Group {
+                    if provider == .apple {
+                        Image(systemName: "apple.logo").resizable()
+                    } else if let path = Bundle.main.path(forResource: "google-g.png", ofType: nil,
+                                                          inDirectory: "OnboardingAssets"),
+                              let logo = UIImage(contentsOfFile: path) {
+                        Image(uiImage: logo).renderingMode(.original).resizable()
+                    }
+                }
+                .scaledToFit().frame(width: logoSize, height: logoSize)
+                .accessibilityHidden(true)
+                Text(title).font(.body.weight(.medium))
+            }
+            .padding(.horizontal, 8)
+            .frame(maxWidth: .infinity, minHeight: 30, alignment: .leading)
+        }
+        .foregroundStyle(.primary)
+    }
+
 }
 
 private struct BackupUpgradeAlert: ViewModifier {
@@ -1894,7 +2191,7 @@ private struct DeviceCloudBackupsSection: View {
 
     var body: some View {
         Section {
-            Toggle("Back up this device", isOn: Binding(
+            Toggle("Back up screens on this device", isOn: Binding(
                 get: { model.catalogBackupsEnabled },
                 set: { enabled in
                     if enabled, model.catalogBackupAccess == .inactive { showUpgrade = true }
@@ -1902,6 +2199,11 @@ private struct DeviceCloudBackupsSection: View {
                 }
             ))
             .disabled(!model.catalogBackupsCanConfigure)
+
+            if !model.catalogBackupsCanConfigure, model.email == nil {
+                Text("Go to Account and sign in to Screenpunk to enable backups.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
 
             if model.catalogBackupsEnabled {
                 if let status = model.presentedInlineMessage(.backup) {
@@ -1915,7 +2217,7 @@ private struct DeviceCloudBackupsSection: View {
                 }
             }
         } header: {
-            Text("Cloud Backups")
+            Text("Screen backups")
         } footer: {
             if model.catalogBackupsCanConfigure, model.catalogBackupAccess == .unknown {
                 Text("Backups are paused until Screenpunk can verify your plan.")
@@ -1923,8 +2225,6 @@ private struct DeviceCloudBackupsSection: View {
                 Text("Save current screens, screenshots, and future edits to your Screenpunk account. Turning this off keeps existing backups.")
             } else if model.email != nil {
                 Text("Backups require a connected Cloud library.")
-            } else {
-                Text("Sign in to Screenpunk Cloud in Account to set up backups.")
             }
         }
         .alert("Resume current-screen backups?", isPresented: $confirmResume) {
@@ -1937,8 +2237,11 @@ private struct DeviceCloudBackupsSection: View {
             Button("Upgrade now", action: openBilling)
             Button("Cancel", role: .cancel) {}
         } message: {
-            let price = model.billing.offer(.proAnnual, for: model.cloud)?.product.displayPrice ?? "US$19.95"
-            Text("Back up this device with Screenpunk Pro for \(price)/year. You can upgrade anytime in Account → Billing.")
+            if let price = model.billing.offer(.proAnnual, for: model.cloud)?.product.displayPrice {
+                Text("Back up screens with Screenpunk Pro for \(price) per year. Review the plan in Account → Plan.")
+            } else {
+                Text("Screen backups require Screenpunk Pro. Review the plan in Account → Plan.")
+            }
         }
     }
 }
@@ -2213,6 +2516,7 @@ private struct RequestStatusPill: View {
         }
         .font(.callout).multilineTextAlignment(.center)
         .frame(maxHeight: maximumTextHeight)
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 

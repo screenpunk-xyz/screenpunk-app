@@ -79,6 +79,48 @@ final class ScreenLibraryVisibilityTests: XCTestCase {
         XCTAssertTrue(reopened.instructionsSelected)
     }
 
+    @MainActor func testExplicitCreationAndHidePreserveOffSwitches() throws {
+        let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
+        let library = try ScreenLibrary(accountID: "one", rootDirectory: root)
+        try install(["weather"], in: library)
+        try library.setScreenShown(false, id: ScreenLibrary.instructionsID)
+        try library.newScreen()
+        XCTAssertTrue(library.explicitlyCreatingScreen)
+        XCTAssertNil(library.selected)
+        XCTAssertFalse(library.isScreenShown(ScreenLibrary.instructionsID))
+        try library.hideCreationScreen()
+        XCTAssertFalse(library.explicitlyCreatingScreen)
+        XCTAssertEqual(library.selected?.id, "weather")
+        XCTAssertFalse(library.isScreenShown(ScreenLibrary.instructionsID))
+
+        try library.setScreenShown(false, id: "weather")
+        try library.newScreen()
+        XCTAssertTrue(library.explicitlyCreatingScreen)
+        XCTAssertNil(library.selected)
+        try library.hideCreationScreen()
+        XCTAssertFalse(library.explicitlyCreatingScreen)
+        XCTAssertNil(library.selected)
+        XCTAssertTrue(library.rotationIDs.allSatisfy { !library.isScreenShown($0) })
+
+        let reopened = try ScreenLibrary(accountID: "one", rootDirectory: root)
+        XCTAssertFalse(reopened.explicitlyCreatingScreen)
+        XCTAssertTrue(reopened.rotationIDs.allSatisfy { !reopened.isScreenShown($0) })
+    }
+
+    @MainActor func testHideCreationScreenCanHideOnlyVisibleInstruction() throws {
+        let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
+        let library = try ScreenLibrary(accountID: "one", rootDirectory: root)
+        try library.hideCreationScreen()
+        XCTAssertFalse(library.isScreenShown(ScreenLibrary.instructionsID))
+        XCTAssertFalse(library.explicitlyCreatingScreen)
+        try library.newScreen()
+        XCTAssertTrue(library.explicitlyCreatingScreen)
+        try install(["new"], in: library)
+        XCTAssertFalse(library.explicitlyCreatingScreen)
+        XCTAssertEqual(library.selected?.id, "new")
+        XCTAssertFalse(library.isScreenShown(ScreenLibrary.instructionsID))
+    }
+
     @MainActor func testSameScreenActivationSupersessionChangesNavigationIdentity() throws {
         let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
         let library = try ScreenLibrary(accountID: "one", rootDirectory: root)

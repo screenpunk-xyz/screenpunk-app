@@ -27,6 +27,7 @@ import ScreenpunkCore
     var temporaryActivationID: String? { temporary.activeActivationID }
     var hasTemporaryScreen: Bool { state.selectedID.map { temporary.isActiveTarget($0) } ?? false }
     var rotationIDs: [String] { needsAgentSetup ? [Self.instructionsID] : state.screens.map(\.id) + [Self.instructionsID] }
+    private(set) var explicitlyCreatingScreen = false
     var instructionsSelected: Bool { state.selectedID == Self.instructionsID || (state.selectedID == nil && isScreenShown(Self.instructionsID)) }
     func containsRotationScreen(_ id: String) -> Bool { id == Self.instructionsID || state.screens.contains { $0.id == id } }
 
@@ -1034,7 +1035,24 @@ import ScreenpunkCore
         pruneUnusedRevisions()
     }
 
-    func newScreen() throws { guard !needsAgentSetup else { return }; try temporary.manualSelection(); var next = state; next.selectedID = nil; try commit(next) }
+    func newScreen() throws {
+        guard !needsAgentSetup else { return }
+        try temporary.manualSelection()
+        var next = state
+        next.selectedID = nil
+        try commit(next)
+        explicitlyCreatingScreen = true
+    }
+
+    func hideCreationScreen() throws {
+        guard !needsAgentSetup, selected == nil, instructionsSelected || explicitlyCreatingScreen else { return }
+        if isScreenShown(Self.instructionsID) {
+            try setScreenShown(false, id: Self.instructionsID)
+        } else if explicitlyCreatingScreen, let next = nextVisible(after: Self.instructionsID, in: state) {
+            try selectVisible(next)
+        }
+        explicitlyCreatingScreen = false
+    }
 
     // Installed screen IDs are non-empty. The checkpoint stores this sentinel as
     // an explicit neutral selection, distinct from no pending selection.
@@ -1159,9 +1177,13 @@ import ScreenpunkCore
         do {
             try journal.commit(encoded, stagedDirectory: stagedDirectory)
             state = next
+            if next.selectedID != nil { explicitlyCreatingScreen = false }
         } catch {
             // A durable intent may already have committed. Refresh before another mutation.
-            if let recovered = try? journal.recover(), let decoded = try? Self.decodeState(recovered) { state = decoded }
+            if let recovered = try? journal.recover(), let decoded = try? Self.decodeState(recovered) {
+                state = decoded
+                if decoded.selectedID != nil { explicitlyCreatingScreen = false }
+            }
             throw error
         }
     }

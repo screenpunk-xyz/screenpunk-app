@@ -39,7 +39,7 @@ struct DeviceBillingOffer {
 
     var confirmationTitle: String {
         switch kind {
-        case .proAnnual: return "Subscribe for \(product.displayPrice) per year"
+        case .proAnnual: return "Upgrade for \(product.displayPrice) per year"
         case .credits1000: return "Buy 1,000 credits for \(product.displayPrice)"
         }
     }

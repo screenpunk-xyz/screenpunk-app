@@ -6,14 +6,15 @@ import ScreenpunkCore
 struct DeviceAccountSettings: View {
     @ObservedObject var device: DeviceModel
     @ObservedObject var model: LocalAgentSettingsModel
+    let addCloudAgent: () -> Void
     let showCloudSetup: () -> Void
+    let openPlan: () -> Void
     @State private var setup: SetupSheet?
     @State private var forgetting = false
     private enum SetupSheet: String, Identifiable { case pairing, address; var id: String { rawValue } }
     var body: some View {
         Form {
-            DeviceCloudAccountSection(device: device, showListenerSetup: showCloudSetup)
-            DeviceBillingSection(device: device)
+            DeviceCloudAccountSection(device: device, addCloudAgent: addCloudAgent, showListenerSetup: showCloudSetup, openPlan: openPlan)
             Section("Local agent") {
                 if let config = model.configuration {
                     Label(config.name, systemImage: "desktopcomputer")
@@ -40,21 +41,22 @@ struct DeviceAccountSettings: View {
                         }
                     }
                 } else {
-                    Text("Use Codex on your computer. A Screenpunk Cloud account is optional.")
                     Button("Add agent") { model.beginSetup(); setup = .pairing }.disabled(device.routeChangeBlocked)
                 }
-                Text("Mac supported in this prototype.").font(.caption).foregroundStyle(.secondary)
                 if let error = model.presentedError { DismissibleMessage(error.text, color: .red, onDismiss: { model.dismissError(id: error.id) }).id(error.id) }
+                Text("Advanced users can connect a local agent without a Screenpunk account using experimental support for Codex App Server on Mac.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
-            Section("Use for new requests") {
-                Picker("Agent", selection: Binding(get: { device.routePreference }, set: device.selectRoutePreference)) {
-                    Text("Automatic").tag(AuthoringRoutePreference.automatic)
-                    Text("Local").tag(AuthoringRoutePreference.local)
-                    Text("Cloud").tag(AuthoringRoutePreference.cloud).disabled(!device.canSelectCloudRoute)
-                }.disabled(device.routeChangeBlocked || model.testing)
-                Text(device.routeChangeBlocked ? "Finish or cancel the current request before changing agents." : "Automatic checks the paired computer first. If it is unavailable, a new request may go to your configured Cloud agent. A request keeps its chosen agent after delivery is prepared.").font(.caption).foregroundStyle(.secondary)
+            if model.configuration != nil {
+                Section("Use for new requests") {
+                    Picker("Agent", selection: Binding(get: { device.routePreference }, set: device.selectRoutePreference)) {
+                        Text("Automatic").tag(AuthoringRoutePreference.automatic)
+                        Text("Local").tag(AuthoringRoutePreference.local)
+                        Text("Cloud").tag(AuthoringRoutePreference.cloud).disabled(!device.canSelectCloudRoute)
+                    }.disabled(device.routeChangeBlocked || model.testing)
+                    Text(device.routeChangeBlocked ? "Finish or cancel the current request before changing agents." : "Automatic checks the paired computer first. If it is unavailable, a new request may go to your configured Cloud agent. A request keeps its chosen agent after delivery is prepared.").font(.caption).foregroundStyle(.secondary)
+                }
             }
-            DeviceAccountDeletionSection(device: device)
         }
         .sheet(item: $setup) { sheet in
             switch sheet {
@@ -71,43 +73,73 @@ struct DeviceAccountSettings: View {
     }
 }
 
+private enum DeletionConfirmation {
+    case account(String)
+    case externalCredentials(String)
+
+    var title: String {
+        switch self {
+        case .account: return "Delete this Screenpunk account?"
+        case .externalCredentials: return "Delete account while credential removal is unconfirmed?"
+        }
+    }
+}
+
+struct AccountFieldRow: View {
+    let title: String
+    let value: String
+
+    var body: some View {
+        HStack {
+            Text(title).foregroundStyle(.secondary)
+            Spacer(minLength: 12)
+            AccountFieldValue(value: value)
+        }
+        .contentShape(Rectangle())
+    }
+}
+
+private struct AccountFieldValue: View {
+    let value: String
+
+    var body: some View {
+        HStack {
+            Text(value).foregroundStyle(.primary).multilineTextAlignment(.trailing)
+            Image(systemName: "chevron.forward")
+                .font(.footnote.weight(.semibold)).foregroundStyle(.tertiary)
+                .accessibilityHidden(true)
+        }
+    }
+}
+
 /// Cloud identity and listener state are independent of the preferred request route.
 struct DeviceCloudAccountSection: View {
     @ObservedObject var device: DeviceModel
+    @State private var confirmation: DeletionConfirmation?
     @State private var confirmSignOut = false
     @State private var signOutAccountID: String?
+    let addCloudAgent: () -> Void
     let showListenerSetup: () -> Void
+    let openPlan: () -> Void
     private var accountActionsDisabled: Bool { device.routeChangeBlocked || device.accountOperationInProgress }
     var body: some View {
-        Section("Screenpunk Cloud") {
+        Section("Screenpunk") {
             if let email = device.email {
-                ViewThatFits(in: .horizontal) {
-                    HStack {
-                        Text(email).fixedSize().textSelection(.enabled)
-                        Spacer(minLength: 16)
-                        signOut.fixedSize()
-                    }
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text(email).textSelection(.enabled)
-                        HStack { Spacer(); signOut }
-                    }
-                }
-                Label(device.cloudListenerStatus.label, systemImage: device.cloudListenerStatus == .connected ? "checkmark.circle" : "clock")
-                    .foregroundStyle(.secondary)
-            } else {
-                Button("Sign in to Screenpunk Cloud") { Task { await device.signIn() } }
-                    .disabled(accountActionsDisabled)
-            }
-            ViewThatFits(in: .horizontal) {
                 HStack {
-                    listenerSetup.fixedSize()
-                    if device.email != nil { Spacer(minLength: 16); signInAgain.fixedSize() }
+                    Text("Account").foregroundStyle(.secondary)
+                    Spacer(minLength: 12)
+                    accountMenu(email: email)
                 }
-                VStack(alignment: .leading, spacing: 12) {
-                    listenerSetup
-                    if device.email != nil { HStack { Spacer(); signInAgain } }
+                if device.cloud.session != nil {
+                    DeviceBillingRow(device: device, billing: device.billing, openPlan: openPlan)
                 }
+            } else {
+                Button(screenpunkSignInTitle) { Task { await device.signIn() } }
+                    .disabled(accountActionsDisabled)
+                Text("You must be signed in to use Cloud agents with Screenpunk.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
+            DeviceAccountDeletionRows(device: device, confirmation: $confirmation)
         }
         .alert("Sign out of Screenpunk Cloud?", isPresented: $confirmSignOut, presenting: signOutAccountID) { accountID in
             Button("Keep on This iPad") { Task { await device.signOut(accountID: accountID, deleteScreens: false) } }
@@ -116,18 +148,89 @@ struct DeviceCloudAccountSection: View {
         } message: { _ in
             Text("Keep your screens here to see them when you sign in to this account again. Deleting them here leaves your Cloud backups available.")
         }
+        .alert(confirmation?.title ?? "", isPresented: Binding(
+            get: { confirmation != nil },
+            set: { if !$0 { confirmation = nil } }
+        ), presenting: confirmation) { requested in
+            switch requested {
+            case .account(let capturedAccountID):
+                Button("Delete", role: .destructive) {
+                    confirmation = nil
+                    Task { await device.deleteAccount(accountID: capturedAccountID, approvedAppleRevocation: true) }
+                }
+            case .externalCredentials(let capturedAccountID):
+                Button("Continue Deleting Account", role: .destructive) {
+                    confirmation = nil
+                    Task {
+                        guard device.accountDeletionTargetID == capturedAccountID,
+                              device.accountDeletionRequiresExternalCredentialConfirmation else { return }
+                        await device.deleteAccount(accountID: capturedAccountID, approvedExternalCredentialCleanup: true)
+                    }
+                }
+            }
+            Button("Cancel", role: .cancel) { confirmation = nil }
+        } message: { requested in
+            switch requested {
+            case .account:
+                Text("Your account, screens and settings will be permanently deleted. This cannot be undone.\n\n\(DeviceAccountDeletionTransaction.appleAuthorizationWarning)\n\nSome security and purchase records remain to prevent old requests or purchases restoring the account. Deleting your account does not cancel an Apple subscription.")
+            case .externalCredentials:
+                Text("\(DeviceAccountDeletionTransaction.externalCredentialCleanupWarning)\n\nEven if a provider is offline, Screenpunk removes saved credentials and access from this iPad.")
+            }
+        }
+        .onChange(of: device.accountDeletionTargetID) { _ in confirmation = nil }
+        if device.email != nil && device.cloud.session != nil {
+            Section("Cloud agent") {
+                Button("Add agent", action: addCloudAgent)
+                if device.cloudPluginConnected == true {
+                    Button(action: showListenerSetup) {
+                        HStack {
+                            Text("ChatGPT plugin").foregroundStyle(.secondary)
+                            Spacer(minLength: 16)
+                            if device.cloudListenerStatus == .waiting {
+                                ProgressView().controlSize(.small).accessibilityHidden(true)
+                            }
+                            Text(device.cloudListenerStatus == .connected ? "Connected" : device.cloudListenerStatus.label)
+                                .foregroundStyle(.primary)
+                            Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
     }
-    private var listenerSetup: some View {
-        Button("Set up cloud listener", action: showListenerSetup).buttonStyle(.borderless)
-    }
-    private var signInAgain: some View {
-        Button("Sign in again") { Task { await device.signIn() } }
-            .buttonStyle(.borderless).disabled(accountActionsDisabled)
+    private func accountMenu(email: String) -> some View {
+        Menu {
+            signOut
+            Button("Sign in again") { Task { await device.signIn() } }
+                .disabled(accountActionsDisabled)
+            if let accountID = device.accountDeletionTargetID,
+               !device.accountDeletionNeedsRetry && !device.accountDeletionInProgress {
+                Section {
+                    Button(role: .destructive) { confirmation = .account(accountID) } label: {
+                        Label("Delete This Account", systemImage: "trash")
+                    }
+                    .disabled(accountActionsDisabled)
+                }
+                Section {
+                    Text("Deleting your Screenpunk account does not cancel an App Store subscription.")
+                }
+            }
+        } label: {
+            AccountFieldValue(value: email)
+                .contentShape(Rectangle())
+                .tint(.primary)
+        }
+        .accessibilityLabel("Account actions, " + email)
+        .menuOrder(.fixed)
     }
     private var signOut: some View {
-        Button("Sign out", role: .destructive) {
+        Button {
             signOutAccountID = device.cloud.localAccountID
             confirmSignOut = signOutAccountID != nil
+        } label: {
+            Label("Sign out", systemImage: "rectangle.portrait.and.arrow.right")
         }
         .buttonStyle(.borderless).disabled(accountActionsDisabled)
     }
@@ -141,17 +244,23 @@ struct LocalAgentSetupView: View {
     @State private var step = 0
     @State private var sheet: SetupModal?
     @State private var importingFile = false
+    private var macGuide: URL {
+        let origin = CloudClient.origin
+        if origin.host == "api.screenpunk.xyz" {
+            return LocalAgentMacSetup.setupURL(baseURL: URL(string: "https://screenpunk.xyz")!)
+        }
+        return LocalAgentMacSetup.setupURL(baseURL: origin)
+    }
+    @State private var copiedGuide = false
     @State private var cameraError: String?
     @State private var advanced = false
     private enum SetupModal: Identifiable {
         case share(URL), scan
         var id: String { switch self { case .share: return "share"; case .scan: return "scan" } }
     }
-    private var titles: [String] { ["Prepare your computer", "Scan connection code", "Connected"] }
     var body: some View {
         NavigationStack {
             Form {
-                Section { Text("Step \(step + 1) of 3").font(.caption).foregroundStyle(.secondary) }
                 if step == 0 { prepare }
                 else if step == 1 { scan }
                 else { connected }
@@ -160,10 +269,20 @@ struct LocalAgentSetupView: View {
                 }
                 if let error = cameraError { Section { DismissibleMessage(error, color: .red, onDismiss: { cameraError = nil }) } }
             }
-            .navigationTitle(titles[step])
+            .navigationTitle("Set up local agent (\(step + 1) of 3)")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button(step == 2 ? "Done" : "Close") { dismiss() }.disabled(model.testing) }
+                ToolbarItem(placement: .cancellationAction) {
+                    Button { dismiss() } label: {
+                        if step == 2 {
+                            Text("Done")
+                        } else {
+                            Image(systemName: "xmark").font(.body.weight(.semibold))
+                        }
+                    }
+                    .accessibilityLabel(step == 2 ? "Done" : "Close")
+                    .disabled(model.testing)
+                }
                 ToolbarItem(placement: .confirmationAction) {
                     if step == 0 { Button("Next") { step = 1 }.disabled(model.pendingRequest == nil) }
                 }
@@ -194,39 +313,51 @@ struct LocalAgentSetupView: View {
     }
     private var prepare: some View {
         Group {
-            Section("Prepare a Mac") {
-                Text("Mac supported in this prototype. Your Mac runs Codex; keep it awake and reachable. No separate Screenpunk computer app is installed.")
-                Text("Mac setup offers background startup with your approval. When enabled, the agent starts after Mac sign-in and you can close the setup Terminal.").font(.caption).foregroundStyle(.secondary)
-                Link("Open Mac setup instructions", destination: LocalAgentMacSetup.setupURL(baseURL: CloudClient.origin))
-                Text(LocalAgentMacSetup.setupURL(baseURL: CloudClient.origin).absoluteString).font(.caption).textSelection(.enabled)
-                Text("On the Mac, open this address, review the versioned setup script, then follow its short command. Select the public setup request sent from this iPad when asked.")
-            }
-            Section("Send this iPad’s setup request") {
-                Button("Send setup request to computer") { if let url = model.shareURL { sheet = .share(url) } }.disabled(model.shareURL == nil)
-                Text("Choose AirDrop for the Mac, or save the file and transfer it locally. It contains a public key, a one-time request and its expiry. The private SSH key stays in this iPad’s Keychain.").font(.caption).foregroundStyle(.secondary)
+            Section("On this iPad") {
+                Button("Share setup request") {
+                    if model.pendingRequest.map({ date($0.expiresAt) <= Date() }) ?? true {
+                        model.refreshSetupRequest()
+                    }
+                    if let url = model.shareURL { sheet = .share(url) }
+                }
+                Text("AirDrop the request to your Mac, or save and transfer the file.").font(.caption).foregroundStyle(.secondary)
                 if let request = model.pendingRequest {
                     LabeledContent("Request valid until", value: date(request.expiresAt).formatted(date: .omitted, time: .shortened))
                 }
-                Button("Prepare a new request") { model.refreshSetupRequest() }
+            }
+            Section("On your Mac") {
+                HStack {
+                    Link(macGuide.absoluteString, destination: macGuide)
+                        .buttonStyle(.borderless)
+                    Spacer(minLength: 12)
+                    Button {
+                        UIPasteboard.general.string = macGuide.absoluteString
+                        copiedGuide = true
+                    } label: {
+                        Image(systemName: copiedGuide ? "checkmark" : "doc.on.doc")
+                            .frame(width: 44, height: 44)
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel(copiedGuide ? "Copied" : "Copy setup address")
+                }
+                Text("Open this address on your Mac. Follow the instructions and select the request file when prompted. When the connection code appears, tap Next on this iPad.")
             }
         }
     }
     private var scan: some View {
         Group {
-            Section("Return from your Mac") {
-                Text("After setup, scan the connection code displayed locally on your Mac. The private code contains its connection credential. Keep it on your devices.")
+            Section("Connection code") {
                 Button("Scan connection code") { cameraError = nil; sheet = .scan }.disabled(model.testing)
                 Button("Import private connection file") { importingFile = true }.disabled(model.testing)
-                Text("If the QR is too dense or the camera is unavailable, choose the private reply file saved by Mac setup. Never upload this file to the setup website.").font(.caption).foregroundStyle(.secondary)
+                Text("Scan the code on your Mac or import the file it saved. Both contain a private credential. Keep them on your devices.").font(.caption).foregroundStyle(.secondary)
             }
             if let candidate = model.candidate {
                 Section("Review connection") {
                     Label(candidate.configuration.name, systemImage: "desktopcomputer")
                     LabeledContent("Server startup", value: LocalAgentSettingsModel.startupLabel(for: candidate.configuration))
-                    Text(LocalAgentSettingsModel.lifecycleGuidance(for: candidate.configuration)).font(.caption)
-                    Label("Matches this iPad’s request and public key", systemImage: "checkmark.shield")
+                    Label("Matches this iPad’s setup request", systemImage: "checkmark.shield")
                     LabeledContent("Code valid until", value: date(candidate.expiresAt).formatted(date: .omitted, time: .shortened))
-                    Text("Connect verifies the live SSH host against this code, checks Codex sign-in, then uses one small structured-response test and reconnect check from your Codex allowance. No screen is created.").font(.caption)
+                    Text("Connect verifies your Mac and runs a small test using your Codex allowance.").font(.caption)
                     Button(model.testing ? "Connecting…" : "Connect") { Task { await model.testConnection(isSetup: true) } }.disabled(model.testing)
                     if model.testing { ProgressView() }
                     Text(model.connectionStatusLabel).foregroundStyle(.secondary)
@@ -238,8 +369,8 @@ struct LocalAgentSetupView: View {
                 }
             }
             DisclosureGroup("Advanced recovery", isExpanded: $advanced) {
-                Text("Use manual details only when recovering an existing Mac setup. The request’s public key must already be authorized there.").font(.caption)
-                Text("Manual entry keeps foreground startup. To confirm background startup, import its connection code from Mac setup.").font(.caption).foregroundStyle(.secondary)
+                Text("To recover an existing setup, use a Mac that already trusts this iPad’s public key.").font(.caption)
+                Text("For background startup, import the Mac’s connection code.").font(.caption).foregroundStyle(.secondary)
                 TextField("Computer name", text: $model.name)
                 TextField("Mac address", text: $model.host).textInputAutocapitalization(.never).autocorrectionDisabled()
                 Button(discovery.searching ? "Search again" : "Find nearby computers") { discovery.start() }
@@ -249,11 +380,10 @@ struct LocalAgentSetupView: View {
                         VStack(alignment: .leading) { Text(computer.name); Text(computer.host).font(.caption) }
                     }
                 }
-                Text("Discovery suggests addresses only. Screenpunk still verifies the Mac’s pinned SSH identity.").font(.caption)
                 TextField("SSH port", text: $model.sshPort).keyboardType(.numberPad)
                 TextField("Mac account short name", text: $model.username).textInputAutocapitalization(.never).autocorrectionDisabled()
                 TextField("Absolute Mac workspace", text: $model.workspace).textInputAutocapitalization(.never).autocorrectionDisabled()
-                Text("Paste the SHA256 value from this Mac here; Screenpunk checks it against the live SSH server when connecting.").font(.caption)
+                Text("Enter the SSH host fingerprint shown on your Mac.").font(.caption)
                 TextField("SHA256:…", text: $model.fingerprint).textInputAutocapitalization(.never).autocorrectionDisabled()
                 Toggle("This value came from my Mac", isOn: $model.verifiedFingerprint)
                 SecureField("App Server bearer token", text: $model.bearerToken).textInputAutocapitalization(.never).autocorrectionDisabled()
@@ -268,14 +398,12 @@ struct LocalAgentSetupView: View {
     private var connected: some View {
         Section {
             Label("Connected to \(model.configuration?.name ?? "your computer")", systemImage: "checkmark.circle.fill")
-            Text("Ready").foregroundStyle(.secondary)
             Text(LocalAgentSettingsModel.lifecycleGuidance(for: model.configuration))
-            Text("Choose when to use it in Account → Use for new requests.")
+            Text("Choose your preferred agent in Account → Use for new requests.")
             if model.configuration?.serverLifecycle == .foreground {
                 Link("Enable background startup on the Mac", destination: LocalAgentMacSetup.setupURL(baseURL: CloudClient.origin))
             }
             DisclosureGroup("Connection details") { Text(model.details ?? "Secure connection and reconnect verified.").font(.caption) }
-            Button("Done") { dismiss() }
         }
     }
     private func date(_ milliseconds: Int64) -> Date { Date(timeIntervalSince1970: Double(milliseconds) / 1000) }
@@ -347,25 +475,13 @@ private struct LocalAgentAddressRecoveryView: View {
     }
 }
 
-struct DeviceAccountDeletionSection: View {
+private struct DeviceAccountDeletionRows: View {
     @ObservedObject var device: DeviceModel
-    @State private var confirmation: DeletionConfirmation?
-
-    private enum DeletionConfirmation {
-        case account(String)
-        case externalCredentials(String)
-
-        var title: String {
-            switch self {
-            case .account: return "Delete this Screenpunk account?"
-            case .externalCredentials: return "Delete account while credential removal is unconfirmed?"
-            }
-        }
-    }
+    @Binding var confirmation: DeletionConfirmation?
 
     var body: some View {
         if let accountID = device.accountDeletionTargetID {
-            Section {
+            Group {
                 if device.accountDeletionInProgress {
                     ProgressView(device.accountDeletionStatus ?? "Deleting account…")
                 } else if device.accountDeletionNeedsRetry {
@@ -382,49 +498,14 @@ struct DeviceAccountDeletionSection: View {
                             Task { await device.deleteAccount(accountID: accountID) }
                         }
                     }
-                } else {
-                    Button("Delete This Account", role: .destructive) { confirmation = .account(accountID) }
-                        .disabled(device.accountOperationInProgress || device.routeChangeBlocked)
                 }
                 if let failure = device.presentedInlineMessage(.deletionError) {
                     let diagnostic = device.accountDeletionDiagnosticCode.map { "\nLast server report: \($0)" } ?? ""
                     DismissibleMessage(failure.text + diagnostic, color: .red,
                         onDismiss: { device.dismissInlineMessage(.deletionError, id: failure.id) }).id(failure.id).font(.callout)
                 }
-                Text("Deleting your Screenpunk account does not cancel an App Store subscription.")
-                    .font(.caption).foregroundStyle(.secondary)
-                Link("Manage App Store Subscriptions", destination: URL(string: "https://apps.apple.com/account/subscriptions")!)
             }
-            .alert(confirmation?.title ?? "", isPresented: Binding(
-                get: { confirmation != nil },
-                set: { if !$0 { confirmation = nil } }
-            ), presenting: confirmation) { requested in
-                switch requested {
-                case .account(let capturedAccountID):
-                    Button("Delete", role: .destructive) {
-                        confirmation = nil
-                        Task { await device.deleteAccount(accountID: capturedAccountID, approvedAppleRevocation: true) }
-                    }
-                case .externalCredentials(let capturedAccountID):
-                    Button("Continue Deleting Account", role: .destructive) {
-                        confirmation = nil
-                        Task {
-                            guard device.accountDeletionTargetID == capturedAccountID,
-                                  device.accountDeletionRequiresExternalCredentialConfirmation else { return }
-                            await device.deleteAccount(accountID: capturedAccountID, approvedExternalCredentialCleanup: true)
-                        }
-                    }
-                }
-                Button("Cancel", role: .cancel) { confirmation = nil }
-            } message: { requested in
-                switch requested {
-                case .account:
-                    Text("Your account, screens and settings will be permanently deleted. This cannot be undone.\n\n\(DeviceAccountDeletionTransaction.appleAuthorizationWarning)\n\nSome security and purchase records remain to prevent old requests or purchases restoring the account. Deleting your account does not cancel an Apple subscription.")
-                case .externalCredentials:
-                    Text("\(DeviceAccountDeletionTransaction.externalCredentialCleanupWarning)\n\nEven if a provider is offline, Screenpunk removes saved credentials and access from this iPad.")
-                }
-            }
-            .onChange(of: device.accountDeletionTargetID) { _ in confirmation = nil }
+
         }
     }
 
