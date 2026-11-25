@@ -8,7 +8,7 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/apple/swift-nio-ssh.git", exact: "0.15.1"),
         .package(url: "https://github.com/apple/swift-nio.git", exact: "2.104.0"),
-        .package(url: "https://github.com/apple/swift-crypto.git", exact: "5.0.3")
+        .package(url: "https://github.com/apple/swift-crypto.git", exact: "5.1.2")
     ],
     targets: [
         .target(name: "ScreenpunkLocalTransport", dependencies: [

@@ -12,6 +12,77 @@ final class CustomHTTPDeviceRuntimeTests: XCTestCase {
     private let screenID = "installed-one"
     private let owner = "owner"
 
+    func testNativeDiagnosticsClassifyHTTPWithoutChangingTheScreenContract() async throws {
+        let (vault, manifest, _) = try configured()
+        let body = Data("fixture-token private response".utf8)
+        let examples: [(Int, Data, CustomHTTPConnectionTestFailure, ConnectionFailure)] = [
+            (401, body, .unauthorized, .deviceOffline),
+            (403, body, .forbidden, .deviceOffline),
+            (404, body, .httpStatus(404), .deviceOffline),
+            (503, body, .httpStatus(503), .deviceOffline),
+            (302, body, .redirectBlocked, .deniedEgress),
+            (200, body, .invalidResponse, .validationFailed),
+            (200, Data(#"{"bearer":"fixture-token"}"#.utf8), .invalidResponse, .permissionRequired),
+        ]
+        for (status, response, nativeError, screenError) in examples {
+            let transport = ProbeTransport(.init(status: status, body: response))
+            let runtime = broker(vault: vault, manifest: manifest, transport: transport)
+            do {
+                try await runtime.test(alias: alias, operation: "telemetry")
+                XCTFail("Native test unexpectedly succeeded for HTTP \(status)")
+            } catch {
+                XCTAssertEqual(error as? CustomHTTPConnectionTestFailure, nativeError)
+                XCTAssertFalse(nativeError.message.contains("fixture-token"))
+                XCTAssertFalse(nativeError.message.contains("private response"))
+            }
+            do {
+                _ = try await runtime.request(alias: alias, operation: "telemetry", parameters: [:])
+                XCTFail("Screen request unexpectedly succeeded for HTTP \(status)")
+            } catch {
+                XCTAssertEqual(error as? ConnectionFailure, screenError)
+            }
+            let sends = await transport.sends
+            XCTAssertEqual(sends, 2)
+        }
+    }
+
+    func testNativeDiagnosticsUseExistingApprovalAndDestinationChecks() async throws {
+        let (vault, manifest, _) = try configured()
+        let transport = ProbeTransport(.init(status: 200, body: Data("{}".utf8)))
+        let unresolved = broker(vault: vault, manifest: manifest, transport: transport, addresses: [])
+        do {
+            try await unresolved.test(alias: alias, operation: "telemetry")
+            XCTFail("Unresolved destination was admitted")
+        } catch { XCTAssertEqual(error as? CustomHTTPConnectionTestFailure, .addressResolutionFailed) }
+
+        let blocked = broker(vault: vault, manifest: manifest, transport: transport, addresses: ["127.0.0.1"])
+        do {
+            try await blocked.test(alias: alias, operation: "telemetry")
+            XCTFail("Blocked destination was admitted")
+        } catch { XCTAssertEqual(error as? CustomHTTPConnectionTestFailure, .destinationBlocked) }
+
+        try vault.revoke(owner: owner, screenID: screenID, alias: alias)
+        let revoked = CustomHTTPDeviceRuntime(owner: owner, screenID: screenID, manifest: manifest,
+            vault: vault, transport: transport, resolver: TestResolver(addresses: []),
+            accessRequired: { _ in XCTFail("Settings test opened the on-screen permission prompt") })
+        do {
+            try await revoked.test(alias: alias, operation: "telemetry")
+            XCTFail("Revoked screen permission was bypassed")
+        } catch { XCTAssertEqual(error as? CustomHTTPConnectionTestFailure, .screenAccessRequired) }
+        let sends = await transport.sends
+        XCTAssertEqual(sends, 0)
+    }
+
+    func testNativeTransportDistinguishesObservedPinTrustAndNetworkFailures() {
+        XCTAssertEqual(URLSessionHTTPTransport.diagnosis(for: .cancelled, challengeRejection: .pinMismatch), .pinMismatch)
+        XCTAssertEqual(URLSessionHTTPTransport.diagnosis(for: .cancelled, challengeRejection: nil), .unreachable)
+        XCTAssertEqual(URLSessionHTTPTransport.diagnosis(for: .serverCertificateUntrusted, challengeRejection: nil), .certificateRejected)
+        XCTAssertEqual(URLSessionHTTPTransport.diagnosis(for: .secureConnectionFailed, challengeRejection: nil), .secureConnectionFailed)
+        XCTAssertEqual(URLSessionHTTPTransport.diagnosis(for: .userAuthenticationRequired, challengeRejection: nil), .authenticationRequired)
+        XCTAssertEqual(URLSessionHTTPTransport.diagnosis(for: .dnsLookupFailed, challengeRejection: nil), .addressResolutionFailed)
+        XCTAssertEqual(URLSessionHTTPTransport.diagnosis(for: .timedOut, challengeRejection: nil), .timedOut)
+    }
+
     func testOwnerConfiguresReusableRecordAndScreenApprovalsStaySeparate() throws {
         let (vault, manifest, declaration) = try configured()
         XCTAssertTrue(vault.isApproved(owner: owner, screenID: screenID, manifest: manifest, alias: alias))
@@ -310,7 +381,6 @@ final class CustomHTTPDeviceRuntimeTests: XCTestCase {
     }
 
     func testCertificateRotationRequiresFreshApprovalAndCannotMoveToAnotherOrigin() throws {
-        guard #available(macOS 15, iOS 18, *) else { throw XCTSkip("Pinning unavailable") }
         let origin = "https://192.168.1.23"
         let (vault, manifest, declaration) = try configured(origin: origin)
         let fields = ["server": origin, "tag": "weekly"]

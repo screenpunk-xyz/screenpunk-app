@@ -1,7 +1,9 @@
 import CryptoKit
+import Darwin
 import Foundation
 import Security
 import ScreenpunkCore
+import X509
 
 /// A device Settings decision, bound to the HTTPS origin the user reviewed.
 public struct ReviewedCertificatePin: Codable, Equatable, Sendable {
@@ -27,18 +29,52 @@ public struct ReviewedCertificatePin: Codable, Equatable, Sendable {
     }
 
     func accepts(_ trust: SecTrust, host: String, now: Date = Date()) -> Bool {
-        guard #available(iOS 18, macOS 15, *),
+        rejection(trust, host: host, now: now) == nil
+    }
+
+    func rejection(_ trust: SecTrust, host: String, now: Date = Date()) -> CustomHTTPConnectionTestFailure? {
+        guard SecTrustSetNetworkFetchAllowed(trust, false) == errSecSuccess,
               let chain = SecTrustCopyCertificateChain(trust) as? [SecCertificate],
-              let leaf = chain.first,
-              SHA256.hash(data: SecCertificateCopyData(leaf) as Data)
-                .map({ String(format: "%02x", $0) }).joined() == fingerprint,
-              let start = SecCertificateCopyNotValidBeforeDate(leaf) as Date?,
-              let end = SecCertificateCopyNotValidAfterDate(leaf) as Date?,
-              start <= now, now < end,
+              let leaf = chain.first else { return .certificateRejected }
+        let der = SecCertificateCopyData(leaf) as Data
+        let presentedFingerprint = SHA256.hash(data: der).map { String(format: "%02x", $0) }.joined()
+        guard presentedFingerprint == fingerprint else { return .pinMismatch }
+        let leafIsValid: Bool
+        if #available(iOS 18, macOS 15, *) {
+            guard let start = SecCertificateCopyNotValidBeforeDate(leaf) as Date?,
+                  let end = SecCertificateCopyNotValidAfterDate(leaf) as Date? else { return .certificateRejected }
+            leafIsValid = start <= now && now < end
+        } else {
+            leafIsValid = Self.legacyLeafIsValid(der, host: host, now: now)
+        }
+        guard leafIsValid,
               SecTrustSetPolicies(trust, SecPolicyCreateSSL(true, host as CFString)) == errSecSuccess,
-              SecTrustSetNetworkFetchAllowed(trust, false) == errSecSuccess,
               SecTrustSetAnchorCertificates(trust, [leaf] as CFArray) == errSecSuccess,
-              SecTrustSetAnchorCertificatesOnly(trust, true) == errSecSuccess else { return false }
-        return SecTrustEvaluateWithError(trust, nil)
+              SecTrustSetAnchorCertificatesOnly(trust, true) == errSecSuccess else { return .certificateRejected }
+        return SecTrustEvaluateWithError(trust, nil) ? nil : .certificateRejected
+    }
+
+    // Treating the leaf as a trust anchor can omit its date check. Parse the
+    // same DER on systems without public Security certificate date APIs.
+    static func legacyLeafIsValid(_ der: Data, host: String, now: Date) -> Bool {
+        guard let certificate = try? Certificate(derEncoded: Array(der)),
+              certificate.notValidBefore <= now, now < certificate.notValidAfter else { return false }
+        guard let address = ipAddressBytes(host) else { return true } // Security still checks DNS names.
+        guard let names = try? certificate.extensions.subjectAlternativeNames else { return false }
+        return names.contains { name in
+            guard case .ipAddress(let octets) = name else { return false }
+            return octets.bytes.elementsEqual(address)
+        }
+    }
+
+    private static func ipAddressBytes(_ host: String) -> [UInt8]? {
+        let literal = host.hasPrefix("[") && host.hasSuffix("]") ? String(host.dropFirst().dropLast()) : host
+        for (family, length) in [(AF_INET, 4), (AF_INET6, 16)] {
+            var address = [UInt8](repeating: 0, count: length)
+            if address.withUnsafeMutableBytes({ inet_pton(family, literal, $0.baseAddress) }) == 1 {
+                return address
+            }
+        }
+        return nil
     }
 }
