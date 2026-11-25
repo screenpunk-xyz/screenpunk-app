@@ -51,11 +51,16 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
   apple:
-    name: Unsigned Apple build and regressions
-    runs-on: macos-26
+    name: Apple / ${{ matrix.lane }}
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [setup, swift-core, swift-transport, iphoneos, iphonesimulator]
+    runs-on: xcode-27
     timeout-minutes: 45
     env:
-      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      APPLE_LANE: ${{ matrix.lane }}
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
     steps:
       - name: Select run-owned scratch root
         shell: bash
@@ -66,18 +71,29 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
-      - run: node tools/ci/storage.mjs init
+      - run: node tools/ci/storage.mjs init --hosted-apple
       - name: Swift regressions and unsigned device/Simulator builds
-        run: bash tools/ci/apple.sh
+        run: node tools/ci/storage.mjs run bash tools/ci/apple.sh "$APPLE_LANE"
       - name: Clean owned scratch output
         if: always()
         run: node tools/ci/storage.mjs cleanup
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
-          name: public-apple-evidence-${{ github.run_attempt }}
+          name: public-apple-evidence-${{ matrix.lane }}-${{ github.run_attempt }}
           path: |
             ${{ env.CI_SCRATCH_ROOT }}/evidence
             ${{ env.CI_SCRATCH_ROOT }}/ownership.json
           retention-days: 7
           if-no-files-found: warn
+  apple-required:
+    name: Unsigned Apple build and regressions
+    needs: [apple]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require all five Apple lanes to pass
+        env:
+          APPLE_RESULT: ${{ needs.apple.result }}
+        run: test "$APPLE_RESULT" = success
