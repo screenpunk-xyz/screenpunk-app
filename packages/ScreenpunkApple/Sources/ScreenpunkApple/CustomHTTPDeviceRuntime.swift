@@ -247,16 +247,16 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
     public func acceptCredentialRegistration(owner: String, declaration: CustomHTTPDeclaration, fields: [String: String],
                                              registrationID: String, fingerprint: String,
                                              certificatePin: ReviewedCertificatePin, now: Int64,
-                                             approveScreenRead: Bool = false) throws {
+                                             approveScreenRead: Bool = false, approvalScreenID: String? = nil) throws {
         guard #available(iOS 18, macOS 15, *), declaration.auth?.mode == "bearer",
               fingerprint == certificatePin.fingerprint else { throw ConnectionFailure.certificateRejected }
         try save(owner: owner, declaration: declaration, fields: fields, secret: nil, allowInsecureHTTP: false,
-                 certificatePin: certificatePin, registration: (registrationID, now, approveScreenRead))
+                 certificatePin: certificatePin, registration: (registrationID, now, approveScreenRead, approvalScreenID))
     }
 
     private func save(owner: String, declaration: CustomHTTPDeclaration, fields: [String: String],
                       secret: String?, allowInsecureHTTP: Bool, certificatePin: ReviewedCertificatePin?,
-                      registration: (id: String, now: Int64, approveScreenRead: Bool)?) throws {
+                      registration: (id: String, now: Int64, approveScreenRead: Bool, approvalScreenID: String?)?) throws {
         guard !owner.isEmpty else { throw ConnectionFailure.permissionRequired }
         try declaration.validate(alias: "customConnection")
         let visible = declaration.fields.filter { $0.type != "secret" }
@@ -331,17 +331,34 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
                                                  origin: origin,
                                                  allowInsecureHTTP: allowsHTTP, generation: generation)
         if let reviewedRead {
-            guard !reviewedRead.screenID.isEmpty else { throw ConnectionFailure.permissionRequired }
+            let approvalScreenID = registration?.approvalScreenID ?? reviewedRead.screenID
+            guard !approvalScreenID.isEmpty else { throw ConnectionFailure.permissionRequired }
             try declaration.validate(alias: reviewedRead.alias)
             let declarationDigest = try Self.digest(declaration)
             // A denial at the generation shown by the modal cannot be bypassed by setup.
             let priorScope = declarationDigest + "/" + (previous?.generation.uuidString ?? "unconfigured")
-            guard account.denials?[reviewedRead.screenID]?[reviewedRead.alias] != priorScope else {
+            guard account.denials?[approvalScreenID]?[reviewedRead.alias] != priorScope else {
                 throw ConnectionFailure.permissionRequired
             }
-            try Self.recordApproval(screenID: reviewedRead.screenID, alias: reviewedRead.alias, serviceID: declaration.id,
+            try Self.recordApproval(screenID: approvalScreenID, alias: reviewedRead.alias, serviceID: declaration.id,
                                     declarationDigest: declarationDigest, generation: generation, in: &account)
         }
+        accounts[owner] = account
+        try persist(accounts)
+    }
+
+    /// Replaces executable-code consent while leaving the shared service and its token intact.
+    /// Existing explicit denials remain in force for the same declaration and service generation.
+    public func rotateScreenApprovalScope(owner: String, priorScope: String, nextScope: String) throws {
+        guard !owner.isEmpty, !priorScope.isEmpty, !nextScope.isEmpty,
+              priorScope != nextScope else { throw ConnectionFailure.permissionRequired }
+        Self.lock.lock(); defer { Self.lock.unlock() }
+        var accounts = try load()
+        guard var account = accounts[owner] else { return }
+        let priorApproval = account.approvals.removeValue(forKey: priorScope)
+        let priorDenial = account.denials?.removeValue(forKey: priorScope)
+        if let priorDenial { account.denials?[nextScope] = priorDenial }
+        guard priorApproval != nil || priorDenial != nil else { return }
         accounts[owner] = account
         try persist(accounts)
     }

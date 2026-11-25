@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+import ScreenpunkApple
 import ScreenpunkCore
 @testable import DeviceAuthoring
 
@@ -22,6 +23,116 @@ final class ScreenLibraryAuthoringTests: XCTestCase {
               screen: artifact("Updated fixture"), preferenceMutations: [.init(kind: "upsert", id: "large-text", expectedRevision: nil,
                 record: .init(id: "large-text", scope: "device", targetID: "fixture-device", category: "typography", value: .string("large"), revision: 1, originRequestID: request.requestID))],
               durablePreferenceAuthorization: .init(requestID: request.requestID, quote: request.context.userRequest))
+    }
+
+    @MainActor func testRemoteCreateKeepsTheCurrentScreenAndNormalPendingWork() throws {
+        let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
+        let library = try ScreenLibrary(accountID: "fixture-account", rootDirectory: root)
+        try library.install(artifact("Current"), requestID: "current", replacing: "current")
+        try library.selectVisible("current")
+        var input = try request(library, id: UUID().uuidString.lowercased())
+        input.delivery.route = "cloud"
+        input.context.baseRevision = nil
+        input.context.currentScreen = nil
+        let snapshot = try library.makeAuthoringRequestV2(from: input)
+        try library.saveRemoteAuthoringRequest(snapshot)
+        try library.savePending(id: "normal-pending", screenID: "current", consumedID: nil)
+        let result = AuthoringResultV2(requestID: snapshot.requestID, inputDigest: snapshot.delivery.snapshotDigest,
+            preferenceRevisions: [:], operationID: UUID().uuidString,
+            screen: .init(title: "Remote", files: [.write(path: "index.html", content: "<html><body>Remote</body></html>")]))
+        let receipt = try library.applyAuthoringResult(result, remoteApprovalRotation: { _, _ in }, now: 2_000)
+        XCTAssertEqual(receipt.status, "applied", String(describing: receipt))
+        XCTAssertEqual(library.selected?.id, "current")
+        XCTAssertEqual(library.state.pendingID, "normal-pending")
+        XCTAssertEqual(library.state.screens.first { $0.id == snapshot.context.screenID }?.artifact.title, "Remote")
+    }
+
+    @MainActor func testRemoteEditWithUnchangedConnectionRequiresFreshApproval() async throws {
+        let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
+        let library = try ScreenLibrary(accountID: "fixture-account", rootDirectory: root)
+        let owner = "fixture-owner"
+        let screenID = "fixture-screen"
+        let alias = "synthetic"
+        let declaration = CustomHTTPDeclaration(id: "synthetic", version: 1, label: "Synthetic service",
+            fields: [.init(id: "origin", label: "Server", type: "url"), .init(id: "credential", label: "Token", type: "secret")],
+            originField: "origin", auth: .init(field: "credential"), operations: [.init(name: "status", path: "/status")])
+        let html = "<!doctype html><html><body>Original</body></html>"
+        let manifest = DashboardManifest(schemaVersion: 1, dashboardId: screenID, name: "Synthetic", revision: "1", entrypoint: "index.html", sdkVersion: "1",
+            target: .init(profileId: "fixture-profile", width: 1024, height: 768, scale: 1, orientation: "landscape"),
+            connections: [.init(alias: alias, required: true, customHTTP: declaration)],
+            files: [.init(path: "index.html", bytes: html.utf8.count, sha256: AuthoringContract.contentDigest(Data(html.utf8)))])
+        let manifestJSON = String(decoding: try JSONEncoder().encode(manifest), as: UTF8.self)
+        try library.install(.init(title: "Synthetic", files: [.init(path: "index.html", content: html), .init(path: "manifest.json", content: manifestJSON)]),
+                            requestID: "install-synthetic", replacing: screenID)
+        let original = try XCTUnwrap(library.state.screens.first { $0.id == screenID })
+        XCTAssertTrue(library.supportsRemoteAuthoringEdit(original))
+        let vault = CustomHTTPDeviceVault(store: MemoryCredentialStore())
+        try vault.save(owner: owner, declaration: declaration, fields: ["origin": "https://10.0.0.40"],
+                       secret: "synthetic-bearer", allowInsecureHTTP: false)
+        let generation = try XCTUnwrap(vault.status(owner: owner, declaration: declaration)?.generation)
+        try vault.approve(owner: owner, screenID: screenID, manifest: manifest, alias: alias, expectedGeneration: generation)
+        var input = try request(library, id: UUID().uuidString.lowercased())
+        input.delivery.route = "cloud"
+        input.context.baseRevision = original.revision
+        input.context.currentScreen = original.artifact
+        let snapshot = try library.makeAuthoringRequestV2(from: input)
+        try library.saveRemoteAuthoringRequest(snapshot)
+        XCTAssertNil(library.recoverableCloudCompletion([snapshot.requestID], profileID: snapshot.context.profileID, deviceID: snapshot.context.deviceID))
+        let revisedHTML = "<!doctype html><html><body><script>void 0;</script>Updated</body></html>"
+        var revisedManifest = manifest
+        revisedManifest.files = [.init(path: "index.html", bytes: revisedHTML.utf8.count,
+            sha256: AuthoringContract.contentDigest(Data(revisedHTML.utf8)))]
+        let revisedJSON = String(decoding: try JSONEncoder().encode(revisedManifest), as: UTF8.self)
+        let result = AuthoringResultV2(requestID: snapshot.requestID, inputDigest: snapshot.delivery.snapshotDigest,
+            baseRevision: original.revision, preferenceRevisions: [:], operationID: UUID().uuidString,
+            screen: .init(title: "Updated", files: [
+                .write(path: "index.html", content: revisedHTML), .write(path: "manifest.json", content: revisedJSON)]))
+        XCTAssertThrowsError(try library.applyAuthoringResult(result, now: 2_000))
+        try library.install(artifact("Unrelated"), requestID: "unrelated", replacing: "other-screen")
+        try library.selectVisible("other-screen")
+        let rotateApproval = { (prior: String, next: String) in
+            try vault.rotateScreenApprovalScope(owner: owner, priorScope: prior, nextScope: next)
+        }
+        let receipt = try library.applyAuthoringResult(result, remoteApprovalRotation: rotateApproval, now: 2_000)
+        XCTAssertEqual(receipt.status, "applied", String(describing: receipt))
+        guard receipt.status == "applied" else { return }
+        XCTAssertEqual(library.selected?.id, "other-screen")
+        let reopened = try ScreenLibrary(accountID: "fixture-account", rootDirectory: root)
+        let installed = try XCTUnwrap(reopened.state.screens.first { $0.id == screenID })
+        XCTAssertNotEqual(installed.revision, original.revision)
+        let scope = reopened.customHTTPApprovalScope(screenID: screenID)
+        XCTAssertNotEqual(scope, screenID)
+        XCTAssertFalse(vault.isApproved(owner: owner, screenID: screenID, manifest: manifest, alias: alias))
+        XCTAssertEqual(vault.status(owner: owner, declaration: declaration)?.generation, generation)
+        let transport = RemoteApprovalTransport()
+        let runtime = CustomHTTPDeviceRuntime(owner: owner, screenID: scope, manifest: manifest, vault: vault, transport: transport)
+        do {
+            _ = try await runtime.request(alias: alias, operation: "status", parameters: [:])
+            XCTFail("The revised script inherited connection access")
+        } catch { XCTAssertEqual(error as? ConnectionFailure, .permissionRequired) }
+        let before = await transport.sends
+        XCTAssertEqual(before, 0)
+        try vault.approve(owner: owner, screenID: scope, manifest: manifest, alias: alias, expectedGeneration: generation)
+        _ = try await runtime.request(alias: alias, operation: "status", parameters: [:])
+        let after = await transport.sends
+        XCTAssertEqual(after, 1)
+        XCTAssertEqual(try reopened.applyAuthoringResult(result, remoteApprovalRotation: rotateApproval, now: 2_000), receipt)
+        XCTAssertEqual(reopened.customHTTPApprovalScope(screenID: screenID), scope)
+    }
+
+    @MainActor func testRemoteEditsRejectExistingWriteManifest() throws {
+        let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
+        let library = try ScreenLibrary(accountID: "fixture-account", rootDirectory: root)
+        let html = "<html><body>Home</body></html>"
+        let manifest = DashboardManifest(schemaVersion: 1, dashboardId: "fixture-screen", name: "Home", revision: "1", entrypoint: "index.html", sdkVersion: "1",
+            target: .init(profileId: "fixture-profile", width: 1024, height: 768, scale: 1, orientation: "landscape"),
+            connections: [.init(alias: "home", required: true)],
+            files: [.init(path: "index.html", bytes: html.utf8.count, sha256: AuthoringContract.contentDigest(Data(html.utf8)))])
+        let manifestJSON = String(decoding: try JSONEncoder().encode(manifest), as: UTF8.self)
+        try library.install(.init(title: "Home", files: [.init(path: "index.html", content: html), .init(path: "manifest.json", content: manifestJSON)]),
+                            requestID: "install-home", replacing: "fixture-screen")
+        let installed = try XCTUnwrap(library.state.screens.first { $0.id == "fixture-screen" })
+        XCTAssertFalse(library.supportsRemoteAuthoringEdit(installed))
     }
 
     @MainActor func testAppliedConnectionProposalRetainsExactSetupAcrossReopenWithoutAgentAnnouncement() throws {
@@ -338,5 +449,15 @@ final class ScreenLibraryAuthoringTests: XCTestCase {
             try restarted.saveSubmission(key: "next-request", text: "Different instructions", screen: restarted.selected?.artifact)
             XCTAssertEqual(restarted.state.submissionKey, "next-request")
         }
+    }
+}
+
+
+private actor RemoteApprovalTransport: HTTPTransport {
+    private(set) var sends = 0
+
+    func send(_ request: AuthorizedHTTPRequest) async throws -> HTTPTransportResponse {
+        sends += 1
+        return .init(status: 200, body: Data(#"{"ok":true}"#.utf8))
     }
 }

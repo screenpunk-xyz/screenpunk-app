@@ -181,6 +181,14 @@ struct DeviceCloudAccountSection: View {
         if device.email != nil && device.cloud.session != nil {
             Section("Cloud agent") {
                 Button("Add agent", action: addCloudAgent)
+                if device.supportsRemoteAuthoring {
+                    NavigationLink {
+                        RemoteAuthoringAccessView(device: device)
+                    } label: {
+                        Text("Remote screen authoring")
+                    }
+                    .accessibilityIdentifier("account.remote-authoring")
+                }
                 if device.cloudPluginConnected == true {
                     Button(action: showListenerSetup) {
                         HStack {
@@ -233,6 +241,176 @@ struct DeviceCloudAccountSection: View {
             Label("Sign out", systemImage: "rectangle.portrait.and.arrow.right")
         }
         .buttonStyle(.borderless).disabled(accountActionsDisabled)
+    }
+}
+
+private struct RemoteAuthoringAccessView: View {
+    @ObservedObject var device: DeviceModel
+    @State private var grants: [RemoteAuthoringGrant]?
+    @State private var loadedScope: Scope?
+    @State private var pendingConfirmation: Change?
+    @State private var operation: UUID?
+    @State private var retry = UUID()
+    @State private var failure: String?
+
+    private struct Scope: Equatable {
+        let accountID: String
+        let deviceID: String
+    }
+
+    private struct Change {
+        let grant: RemoteAuthoringGrant
+        let label: String
+        let scope: Scope
+        let action: Action
+        let enabled: Bool
+    }
+
+    private enum Action: String {
+        case create, edit
+
+        var title: String {
+            switch self {
+            case .create: return "Create screens"
+            case .edit: return "Edit screens"
+            }
+        }
+
+        var explanation: String {
+            switch self {
+            case .create: return "create and install new screens"
+            case .edit: return "change screens already installed"
+            }
+        }
+
+        func value(in grant: RemoteAuthoringGrant) -> Bool {
+            switch self {
+            case .create: return grant.allowCreate
+            case .edit: return grant.allowEdit
+            }
+        }
+    }
+
+    private var scope: Scope? {
+        guard device.supportsRemoteAuthoring, let accountID = device.cloud.localAccountID,
+              let deviceID = device.cloud.session?.deviceId else { return nil }
+        return .init(accountID: accountID, deviceID: deviceID)
+    }
+
+    private struct LoadID: Equatable {
+        let scope: Scope?
+        let retry: UUID
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                Text("Choose which Cloud agents can create or edit screens on this iPad. Enabled actions can apply without another prompt while Screenpunk is active.")
+                Text("Editing lets the agent read the screen’s installed source to make changes. Connection setup and a screen’s access to its connections still require your approval.")
+                    .foregroundStyle(.secondary)
+            }
+            if let scope {
+                if loadedScope == scope, let grants {
+                    if grants.isEmpty {
+                        Section { Text("No authorized Cloud agents are available for this iPad.").foregroundStyle(.secondary) }
+                    }
+                    ForEach(grants) { grant in
+                        let label = grantLabel(grant, in: grants)
+                        Section(label) {
+                            permissionToggle(.create, grant: grant, label: label, scope: scope)
+                            permissionToggle(.edit, grant: grant, label: label, scope: scope)
+                        }
+                    }
+                } else if failure == nil {
+                    Section { ProgressView("Checking agent permissions…") }
+                }
+            } else {
+                Section { Text("Remote screen authoring is unavailable for this iPad.").foregroundStyle(.secondary) }
+            }
+            if operation != nil {
+                Section { ProgressView("Updating access…") }
+            }
+            if let failure {
+                Section {
+                    Text(failure).foregroundStyle(.secondary)
+                    Button("Check access again") { retry = UUID() }
+                        .disabled(operation != nil)
+                }
+            }
+        }
+        .navigationTitle("Remote screen authoring")
+        .task(id: LoadID(scope: scope, retry: retry)) { await loadPermissions() }
+        .onChange(of: scope) { _ in
+            pendingConfirmation = nil
+            operation = nil
+            failure = nil
+        }
+        .alert("Allow remote screen authoring?", isPresented: Binding(
+            get: { pendingConfirmation != nil },
+            set: { if !$0 { pendingConfirmation = nil } }
+        ), presenting: pendingConfirmation) { change in
+            Button("Allow") {
+                pendingConfirmation = nil
+                apply(change)
+            }
+            Button("Cancel", role: .cancel) { pendingConfirmation = nil }
+        } message: { change in
+            Text("\(change.label) can \(change.action.explanation) on this iPad without waiting for a request from you. You can turn this access off here.")
+        }
+    }
+
+    private func grantLabel(_ grant: RemoteAuthoringGrant, in grants: [RemoteAuthoringGrant]) -> String {
+        let duplicate = grants.contains { $0.grantID != grant.grantID && $0.name.caseInsensitiveCompare(grant.name) == .orderedSame }
+        return duplicate ? grant.name + " · " + String(grant.grantID.suffix(8)) : grant.name
+    }
+
+    private func permissionToggle(_ action: Action, grant: RemoteAuthoringGrant, label: String, scope: Scope) -> some View {
+        Toggle(action.title, isOn: Binding(get: { action.value(in: grant) }, set: { enabled in
+            let change = Change(grant: grant, label: label, scope: scope, action: action, enabled: enabled)
+            if enabled { pendingConfirmation = change }
+            else { apply(change) }
+        }))
+        .disabled(operation != nil || failure != nil)
+        .accessibilityIdentifier("remote-authoring." + action.rawValue + "." + grant.grantID)
+    }
+
+    private func loadPermissions() async {
+        grants = nil
+        loadedScope = nil
+        failure = nil
+        guard let scope else { return }
+        do {
+            let current = try await device.remoteAuthoringPermissions()
+            guard !Task.isCancelled, self.scope == scope else { return }
+            loadedScope = scope
+            grants = current
+        } catch {
+            guard !Task.isCancelled, self.scope == scope else { return }
+            failure = "Couldn’t check agent permissions. Try again."
+        }
+    }
+
+    private func apply(_ change: Change) {
+        guard change.scope == scope, loadedScope == scope, operation == nil,
+              grants?.first(where: { $0.id == change.grant.id }) == change.grant else { return }
+        let operationID = UUID()
+        operation = operationID
+        failure = nil
+        Task {
+            defer { if operation == operationID { operation = nil } }
+            guard scope == change.scope, operation == operationID else { return }
+            let create = change.action == .create ? change.enabled : change.grant.allowCreate
+            let edit = change.action == .edit ? change.enabled : change.grant.allowEdit
+            do {
+                let current = try await device.setRemoteAuthoringPermission(change.grant, allowCreate: create, allowEdit: edit)
+                guard scope == change.scope, operation == operationID else { return }
+                grants = current
+            } catch {
+                guard scope == change.scope, operation == operationID else { return }
+                grants = nil
+                failure = "Couldn’t confirm this change. Check the current access before trying again."
+            }
+        }
     }
 }
 

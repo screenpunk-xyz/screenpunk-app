@@ -274,7 +274,8 @@ struct AgentRequest: Decodable {
     let authoringResultV2: AuthoringResultV2?
     let applicationReceipt: ApplicationReceiptV1?
     let canonicalUnsupported: Unsupported?
-    private enum CodingKeys: String, CodingKey { case id,status,result,failure,text,createdAt,deadlineAt,progress,snapshot,authoringResult,applicationReceipt,canonicalUnsupported }
+    let remoteOperationID: String?
+    private enum CodingKeys: String, CodingKey { case id,status,result,failure,text,createdAt,deadlineAt,progress,snapshot,authoringResult,applicationReceipt,canonicalUnsupported,remoteOperationID }
     private struct Version: Decodable { let schemaVersion: Int }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -294,6 +295,7 @@ struct AgentRequest: Decodable {
         } else { authoringResult = try values.decodeIfPresent(AuthoringResultV1.self, forKey: .authoringResult); authoringResultV2 = nil }
         applicationReceipt = try values.decodeIfPresent(ApplicationReceiptV1.self, forKey: .applicationReceipt)
         canonicalUnsupported = try values.decodeIfPresent(Unsupported.self, forKey: .canonicalUnsupported)
+        remoteOperationID = try values.decodeIfPresent(String.self, forKey: .remoteOperationID)
     }
     struct Unsupported: Decodable { let code: String; let message: String }
     struct ProgressValue: Decodable { let caption: String; let updatedAt: Double }
@@ -310,6 +312,55 @@ struct AgentRequestV2: Decodable {
     let authoringResult: AuthoringResultV2?
     let applicationReceipt: ApplicationReceiptV1?
     let canonicalUnsupported: AgentRequest.Unsupported?
+    let remoteOperationID: String?
+}
+
+struct RemoteAuthoringGrant: Codable, Equatable, Identifiable {
+    let grantID: String
+    let name: String
+    let allowCreate: Bool
+    let allowEdit: Bool
+    var id: String { grantID }
+}
+
+struct RemoteAuthoringPermissions: Decodable {
+    let grants: [RemoteAuthoringGrant]
+}
+
+struct RemoteAuthoringIntent: Decodable {
+    enum Kind: String, Decodable { case create, edit }
+    enum Status: String, Decodable { case queued, prepared, completed, applied, conflict, rejected, expired, cancelled }
+    let operationID: String
+    let kind: Kind
+    let deviceID: String
+    let grantID: String
+    let prompt: String
+    let expiresAt: Int64
+    let status: Status
+    let screenID: String?
+    let baseRevision: String?
+    let requestID: String?
+    let applyClaimed: Bool?
+
+    var isValid: Bool {
+        guard UUID(uuidString: operationID) != nil, operationID.lowercased() == operationID, !grantID.isEmpty, !deviceID.isEmpty,
+              !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              requestID == nil || requestID == operationID else { return false }
+        switch kind {
+        case .create: return baseRevision == nil && (status != .queued || screenID == nil)
+        case .edit: return screenID?.isEmpty == false && baseRevision?.isEmpty == false
+        }
+    }
+
+    func matches(_ snapshot: AuthoringRequestV2) -> Bool {
+        isValid && snapshot.requestID == operationID && snapshot.deadlineAt == expiresAt &&
+            snapshot.context.deviceID == deviceID && snapshot.context.userRequest == prompt &&
+            snapshot.context.baseRevision == baseRevision &&
+            (screenID == nil || snapshot.context.screenID == screenID)
+    }
+}
+struct RemoteAuthoringInbox: Decodable {
+    let intents: [RemoteAuthoringIntent]
 }
 
 
@@ -324,7 +375,7 @@ enum CloudRequestRecovery {
         guard status == "pending", id != consumedID, id != lastAppliedRequestID else { return nil }
         let response = try await load(id)
         guard response.id == id else { throw DeviceError.message("Cloud returned a different request.") }
-        guard response.status == "pending", response.applicationReceipt == nil else { return nil }
+        guard response.status == "pending", response.applicationReceipt == nil, response.remoteOperationID == nil else { return nil }
         return response
     }
 
