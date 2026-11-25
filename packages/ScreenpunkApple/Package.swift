@@ -11,12 +11,16 @@ let package = Package(
         .library(name: "ScreenpunkApple", targets: ["ScreenpunkApple"])
     ],
     dependencies: [
-        .package(path: "../ScreenpunkCore")
+        .package(path: "../ScreenpunkCore"),
+        .package(url: "https://github.com/apple/swift-certificates.git", exact: "1.21.2")
     ],
     targets: [
         .target(
             name: "ScreenpunkApple",
-            dependencies: ["ScreenpunkCore"],
+            dependencies: [
+                "ScreenpunkCore",
+                .product(name: "X509", package: "swift-certificates")
+            ],
             exclude: ["Resources/README.md"],
             resources: [
                 .copy("Resources/offline-fixture"),

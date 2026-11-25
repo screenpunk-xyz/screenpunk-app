@@ -209,7 +209,7 @@ struct DeviceCustomConnectionSettings: View {
         if fields[declaration.originField]?.lowercased().hasPrefix("http://") == true {
             Toggle("Allow unencrypted access on this local network", isOn: $allowInsecureHTTP)
         }
-        if #available(iOS 18, *), fields[declaration.originField]?.lowercased().hasPrefix("https://") == true {
+        if fields[declaration.originField]?.lowercased().hasPrefix("https://") == true {
             Toggle("Pin server certificate", isOn: $pinEnabled)
             if pinEnabled {
                 TextField("Leaf certificate SHA-256 fingerprint", text: $fingerprint)
@@ -462,10 +462,10 @@ struct DeviceCustomConnectionSettings: View {
         do {
             try await model.testCustomConnection(use, owner: owner)
             if !Task.isCancelled { testResult = "Connection succeeded." }
-        } catch ConnectionFailure.certificateRejected {
-            testResult = "Certificate verification failed. Confirm the certificate fingerprint with the server administrator before replacing the pin."
+        } catch let failure as CustomHTTPConnectionTestFailure {
+            if !Task.isCancelled { testResult = failure.message }
         } catch {
-            if !Task.isCancelled { testResult = "Connection failed. Check the server address, credentials, and network." }
+            if !Task.isCancelled { testResult = "The connection test couldn’t finish. Review the current connection and try again." }
         }
     }
 

@@ -2066,7 +2066,7 @@ import ScreenpunkLocalTransport
             throw DeviceError.message("This connection does not have a simple read to test.")
         }
         let runtime = CustomHTTPDeviceRuntime(owner: owner, screenID: use.screen.id, manifest: use.manifest, vault: customHTTPVault)
-        _ = try await runtime.request(alias: use.alias, operation: operation.name, parameters: [:])
+        try await runtime.test(alias: use.alias, operation: operation.name)
         try requireCurrentCustomConnection(use, owner: owner)
     }
 

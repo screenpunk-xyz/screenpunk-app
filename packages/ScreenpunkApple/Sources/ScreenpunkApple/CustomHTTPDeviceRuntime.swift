@@ -268,10 +268,8 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
         }
         let origin = try CustomHTTPDestination.origin(originValue, allowInsecureHTTP: allowInsecureHTTP)
 
-        if let certificatePin {
-            guard #available(iOS 18, macOS 15, *), certificatePin.origin == origin else {
-                throw ConnectionFailure.validationFailed
-            }
+        if let certificatePin, certificatePin.origin != origin {
+            throw ConnectionFailure.validationFailed
         }
 
         Self.lock.lock(); defer { Self.lock.unlock() }
@@ -509,11 +507,18 @@ enum CustomHTTPDestination {
         return canonical
     }
 
-    static func url(origin: String, path: String, query: [URLQueryItem], resolver: any DestinationResolver) throws -> URL {
+    static func url(origin: String, path: String, query: [URLQueryItem], resolver: any DestinationResolver,
+                    diagnose: Bool = false) throws -> URL {
         guard var parts = URLComponents(string: origin), let host = parts.host, let scheme = parts.scheme else {
             throw ConnectionFailure.validationFailed
         }
-        let addresses = try resolver.addresses(for: host)
+        let addresses: [String]
+        do { addresses = try resolver.addresses(for: host) }
+        catch {
+            if diagnose { throw CustomHTTPConnectionTestFailure.addressResolutionFailed }
+            throw error
+        }
+        if diagnose && addresses.isEmpty { throw CustomHTTPConnectionTestFailure.addressResolutionFailed }
         let classes = Set(addresses.map { AddressClassifier.classify(host: $0) })
         guard classes == [.publicUnicast] || classes == [.privateLAN],
               scheme == "https" || classes == [.privateLAN] else { throw ConnectionFailure.deniedEgress }
@@ -556,20 +561,41 @@ public struct CustomHTTPDeviceRuntime: Sendable {
     }
 
     public func request(alias: String, operation: String, parameters: [String: String]) async throws -> Data {
+        try await performRequest(alias: alias, operation: operation, parameters: parameters, diagnose: false)
+    }
+
+    /// Runs the same approved operation as the screen. Only the native test receives diagnostics.
+    public func test(alias: String, operation: String) async throws {
+        do { _ = try await performRequest(alias: alias, operation: operation, parameters: [:], diagnose: true) }
+        catch let failure as ConnectionFailure {
+            switch failure {
+            case .permissionRequired: throw CustomHTTPConnectionTestFailure.screenAccessRequired
+            case .deniedEgress: throw CustomHTTPConnectionTestFailure.destinationBlocked
+            case .validationFailed: throw CustomHTTPConnectionTestFailure.invalidConfiguration
+            case .sizeLimit: throw CustomHTTPConnectionTestFailure.responseTooLarge
+            case .timeout: throw CustomHTTPConnectionTestFailure.timedOut
+            case .certificateRejected: throw CustomHTTPConnectionTestFailure.certificateRejected
+            case .deviceOffline: throw CustomHTTPConnectionTestFailure.unreachable
+            }
+        }
+    }
+
+    private func performRequest(alias: String, operation: String, parameters: [String: String], diagnose: Bool) async throws -> Data {
         guard let declaration = manifest.connections.first(where: { $0.alias == alias })?.customHTTP,
               let operation = declaration.operations.first(where: { $0.name == operation }) else {
             throw ConnectionFailure.permissionRequired
         }
         try declaration.validate(alias: alias)
         guard vault.isApproved(owner: owner, screenID: screenID, manifest: manifest, alias: alias) else {
-            if vault.shouldOfferAccess(owner: owner, screenID: screenID, alias: alias, declaration: declaration) {
+            if !diagnose, vault.shouldOfferAccess(owner: owner, screenID: screenID, alias: alias, declaration: declaration) {
                 await accessRequired?(alias)
             }
             throw ConnectionFailure.permissionRequired
         }
         let approval = try vault.authorized(owner: owner, screenID: screenID, alias: alias, declaration: declaration)
         let query = try Self.query(operation: operation, fields: approval.fields, parameters: parameters)
-        let url = try CustomHTTPDestination.url(origin: approval.origin, path: operation.path, query: query, resolver: resolver)
+        let url = try CustomHTTPDestination.url(origin: approval.origin, path: operation.path, query: query,
+                                                resolver: resolver, diagnose: diagnose)
         try Task.checkCancellation()
         try checkApproval(alias: alias, declaration: declaration, generation: approval.generation)
         var headers = ["Accept": "application/json"]
@@ -578,18 +604,37 @@ public struct CustomHTTPDeviceRuntime: Sendable {
         let requestTransport: any HTTPTransport = approval.certificatePin.map {
             URLSessionHTTPTransport(privateRequests: true, certificatePin: $0)
         } ?? transport
-        let result = try await requestTransport.send(.init(url: url, method: "GET", headers: headers, body: nil,
-                                                    timeout: TimeInterval(ConnectionBounds.httpTimeoutSeconds),
-                                                    maxBytes: ConnectionBounds.httpResponseBytes))
+        let request = AuthorizedHTTPRequest(url: url, method: "GET", headers: headers, body: nil,
+                                            timeout: TimeInterval(ConnectionBounds.httpTimeoutSeconds),
+                                            maxBytes: ConnectionBounds.httpResponseBytes)
+        let result: HTTPTransportResponse
+        if diagnose, let native = requestTransport as? URLSessionHTTPTransport {
+            result = try await native.send(request, diagnose: true)
+        } else {
+            result = try await requestTransport.send(request)
+        }
         try Task.checkCancellation()
         try checkApproval(alias: alias, declaration: declaration, generation: approval.generation)
+        if diagnose && !(200...299).contains(result.status) {
+            switch result.status {
+            case 300...399: throw CustomHTTPConnectionTestFailure.redirectBlocked
+            case 401: throw CustomHTTPConnectionTestFailure.unauthorized
+            case 403: throw CustomHTTPConnectionTestFailure.forbidden
+            case 100...599: throw CustomHTTPConnectionTestFailure.httpStatus(result.status)
+            default: throw CustomHTTPConnectionTestFailure.invalidResponse
+            }
+        }
         guard !(300...399).contains(result.status) else { throw ConnectionFailure.deniedEgress }
         guard (200...299).contains(result.status) else { throw ConnectionFailure.deviceOffline }
         guard result.body.count <= ConnectionBounds.httpResponseBytes else { throw ConnectionFailure.sizeLimit }
         guard let json = try? JSONSerialization.jsonObject(with: result.body, options: .fragmentsAllowed) else {
+            if diagnose { throw CustomHTTPConnectionTestFailure.invalidResponse }
             throw ConnectionFailure.validationFailed
         }
-        if let token = approval.secret, Self.contains(token, in: json) { throw ConnectionFailure.permissionRequired }
+        if let token = approval.secret, Self.contains(token, in: json) {
+            if diagnose { throw CustomHTTPConnectionTestFailure.invalidResponse }
+            throw ConnectionFailure.permissionRequired
+        }
         return result.body
     }
 
