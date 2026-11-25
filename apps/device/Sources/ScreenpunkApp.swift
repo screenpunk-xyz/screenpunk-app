@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import MetalKit
 #if DEBUG
 import os
@@ -1499,12 +1500,84 @@ private struct ScreenNameField: View {
     }
 }
 
+/// Measure live UIKit row positions. Form can rehost a row during a move, so
+/// an old row must only unregister its own view.
+@MainActor private final class InstalledScreenRowAnchors: ObservableObject {
+    private let views = NSMapTable<NSString, UIView>.strongToWeakObjects()
+
+    func register(_ view: UIView, for screenID: String) {
+        views.setObject(view, forKey: screenID as NSString)
+    }
+
+    func unregister(_ view: UIView, for screenID: String) {
+        guard views.object(forKey: screenID as NSString) === view else { return }
+        views.removeObject(forKey: screenID as NSString)
+    }
+
+    func frame(for screenID: String) -> CGRect? {
+        guard let view = views.object(forKey: screenID as NSString),
+              let window = view.window, !view.bounds.isEmpty else { return nil }
+        return view.convert(view.bounds, to: window)
+    }
+}
+
+private struct InstalledScreenRowAnchor: UIViewRepresentable {
+    let screenID: String
+    let anchors: InstalledScreenRowAnchors
+
+    func makeUIView(context: Context) -> AnchorView {
+        let view = AnchorView()
+        view.isUserInteractionEnabled = false
+        view.accessibilityElementsHidden = true
+        return view
+    }
+
+    func updateUIView(_ view: AnchorView, context: Context) {
+        view.bind(screenID: screenID, anchors: anchors)
+    }
+
+    static func dismantleUIView(_ view: AnchorView, coordinator: ()) {
+        view.unbind()
+    }
+
+    final class AnchorView: UIView {
+        private var screenID: String?
+        private weak var anchors: InstalledScreenRowAnchors?
+
+        func bind(screenID: String, anchors: InstalledScreenRowAnchors) {
+            if self.screenID != screenID || self.anchors !== anchors {
+                unbind()
+                self.screenID = screenID
+                self.anchors = anchors
+            }
+            updateRegistration()
+        }
+
+        func unbind() {
+            if let screenID { anchors?.unregister(self, for: screenID) }
+            screenID = nil
+            anchors = nil
+        }
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            updateRegistration()
+        }
+
+        private func updateRegistration() {
+            guard let screenID else { return }
+            if window != nil { anchors?.register(self, for: screenID) }
+            else { anchors?.unregister(self, for: screenID) }
+        }
+    }
+}
+
 struct DeviceSettingsView: View {
     @State private var path: [ScreenSettingsRoute] = []
     @State private var renameError: String?
     @State private var screenDrag: InstalledScreenDrag?
     @State private var screenDropTarget: String?
-    @State private var screenRowFrames: [String: CGRect] = [:]
+    @StateObject private var screenRowAnchors = InstalledScreenRowAnchors()
     @State private var reorderError: String?
 
     private struct InstalledScreenDrag: Equatable {
@@ -1852,14 +1925,8 @@ struct DeviceSettingsView: View {
             .buttonStyle(.borderless).accessibilityHidden(true)
         }
         .background {
-            GeometryReader { geometry in
-                let frame = geometry.frame(in: .global)
-                Color.clear
-                    .onAppear { screenRowFrames[id] = frame }
-                    .onChange(of: frame) { screenRowFrames[id] = $0 }
-                    .onDisappear { screenRowFrames[id] = nil }
-            }
-            .allowsHitTesting(false)
+            InstalledScreenRowAnchor(screenID: id, anchors: screenRowAnchors)
+                .allowsHitTesting(false)
         }
         .overlay(alignment: dropGoesAfter(id) ? .bottom : .top) {
             if screenDropTarget == id {
@@ -1927,7 +1994,7 @@ struct DeviceSettingsView: View {
 
     private func dropTarget(near point: CGPoint, excluding source: String) -> String? {
         model.installedScreens.first { screen in
-            guard screen.id != source, let frame = screenRowFrames[screen.id] else { return false }
+            guard screen.id != source, let frame = screenRowAnchors.frame(for: screen.id) else { return false }
             return frame.insetBy(dx: -12, dy: -4).contains(point)
         }?.id
     }
