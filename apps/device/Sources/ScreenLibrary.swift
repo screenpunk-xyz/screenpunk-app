@@ -51,7 +51,7 @@ import ScreenpunkCore
         var credentialRegistration: CredentialRegistrationSource?
         var proposals: [CustomHTTPSetupProposal]
     }
-    struct State: Codable { var connectionSetupDrafts: [String: ConnectionSetupDraft]?; var screens: [Saved] = []; var selectedID: String?; var previous: Saved?; var lastRequest: String?; var pendingID: String?; var pendingScreenID: String?; var consumedID: String?; var cancelledRequests: [String]?; var cancelIntents: [String]?; var lastInstruction: String?; var keyboardDrafts: [String: String]?; var submissionKey: String?; var submissionText: String?; var submissionScreen: ScreenArtifact?; var requestDeadline: Double?; var authoring: AuthoringStoreState?; var linkedProfile: LocalProfileDescriptor?; var localRequestIDs: Set<String>?; var bundledScreenSeeds: Set<String>?; var catalog: CatalogQueue?; var hiddenScreenIDs: Set<String>?; var onboarding: Onboarding?; var publicDataRevocations: Set<String>?; var screenDataGenerations: [String: String]?; var catalogScreenIDs: [String: Set<String>]?; var catalogLinks: [String: LinkedCatalogInstall]?; var catalogUnlinks: [LinkedCatalogInstall]?; var catalogLinkLibraryID: String?; var linkedEdits: [String: LinkedCatalogEdit]?; var linkedRollback: [String: Saved]?; var catalogForks: [String: CatalogForkPublication]?; var linkedConflictPins: [String: [String]]? }
+    struct State: Codable { var connectionSetupDrafts: [String: ConnectionSetupDraft]?; var screens: [Saved] = []; var selectedID: String?; var previous: Saved?; var lastRequest: String?; var pendingID: String?; var pendingScreenID: String?; var consumedID: String?; var cancelledRequests: [String]?; var cancelIntents: [String]?; var lastInstruction: String?; var keyboardDrafts: [String: String]?; var submissionKey: String?; var submissionText: String?; var submissionScreen: ScreenArtifact?; var requestDeadline: Double?; var authoring: AuthoringStoreState?; var linkedProfile: LocalProfileDescriptor?; var localRequestIDs: Set<String>?; var remoteRequestIDs: Set<String>?; var remoteApprovalScopes: [String: String]?; var bundledScreenSeeds: Set<String>?; var catalog: CatalogQueue?; var hiddenScreenIDs: Set<String>?; var onboarding: Onboarding?; var publicDataRevocations: Set<String>?; var screenDataGenerations: [String: String]?; var catalogScreenIDs: [String: Set<String>]?; var catalogLinks: [String: LinkedCatalogInstall]?; var catalogUnlinks: [LinkedCatalogInstall]?; var catalogLinkLibraryID: String?; var linkedEdits: [String: LinkedCatalogEdit]?; var linkedRollback: [String: Saved]?; var catalogForks: [String: CatalogForkPublication]?; var linkedConflictPins: [String: [String]]? }
     private(set) var state = State()
     var onCatalogRevisionCommitted: (() -> Void)?
     var onCatalogLinksChanged: (() -> Void)?
@@ -960,6 +960,22 @@ import ScreenpunkCore
         try commit(next, captureCatalog: false)
     }
 
+    /// Move by stable installed IDs, keeping unrelated screens in their relative order.
+    func moveScreen(_ id: String, relativeTo anchorID: String, after: Bool) throws {
+        guard !needsAgentSetup,
+              let source = state.screens.firstIndex(where: { $0.id == id }),
+              let anchor = state.screens.firstIndex(where: { $0.id == anchorID }) else {
+            throw DeviceError.message("One of these screens is no longer installed.")
+        }
+        guard source != anchor else { return }
+        let insertion = anchor + (after ? 1 : 0) - (source < anchor ? 1 : 0)
+        guard insertion != source else { return }
+        var next = state
+        let screen = next.screens.remove(at: source)
+        next.screens.insert(screen, at: insertion)
+        try commit(next, captureCatalog: false)
+    }
+
     func isScreenShown(_ id: String) -> Bool { state.hiddenScreenIDs?.contains(id) != true }
 
     private func selectsInstalledRevision(_ id: String) -> Bool {
@@ -1020,6 +1036,7 @@ import ScreenpunkCore
         var next = state
         var authoring = next.authoring ?? .init(); var knownScreens = authoring.knownScreenIDs ?? []; knownScreens.insert(id); authoring.knownScreenIDs = knownScreens; next.authoring = authoring
         next.screens.removeAll { $0.id == id }
+        next.remoteApprovalScopes?.removeValue(forKey: id)
         detachCatalogLink(id, in: &next)
         next.hiddenScreenIDs?.remove(id)
         if next.hiddenScreenIDs?.isEmpty == true { next.hiddenScreenIDs = nil }
@@ -1303,7 +1320,7 @@ import ScreenpunkCore
     func recoverableCloudCompletion(_ ids: [String], profileID: String, deviceID: String) -> String? {
         guard state.pendingID == nil, state.submissionKey == nil, let authoring = state.authoring else { return nil }
         return ids.first { id in
-            guard id != state.consumedID, id != state.lastRequest,
+            guard id != state.consumedID, id != state.lastRequest, !isRemoteAuthoringRequest(id),
                   !(state.cancelledRequests ?? []).contains(id),
                   !(authoring.cancelledRequestIDs ?? []).contains(id),
                   !(authoring.retiredRequestIDs ?? []).contains(id),
@@ -1372,6 +1389,46 @@ import ScreenpunkCore
     func saveAuthoringRequest(_ request: AuthoringRequestV2) throws {
         try saveAuthoringRequestV2(request, text: nil, screen: nil)
     }
+    /// Remote edits swap this scope atomically with the executable files.
+    func customHTTPApprovalScope(screenID: String) -> String {
+        state.remoteApprovalScopes?[screenID] ?? screenID
+    }
+
+    func supportsRemoteAuthoringEdit(_ saved: Saved) -> Bool {
+        guard linkedCatalogScreen(id: saved.id) == nil, legacyGeneratorDescriptor(for: saved) == nil else { return false }
+        guard saved.packagePaths.contains("manifest.json") else { return true }
+        return Self.remoteAuthoringManifestIsSafe(saved.artifact.files.first { $0.path == "manifest.json" }?.content)
+    }
+
+    private static func remoteAuthoringManifestIsSafe(_ content: String?) -> Bool {
+        guard let content, let manifest = try? JSONDecoder().decode(DashboardManifest.self, from: Data(content.utf8)),
+              manifest.screenData == nil, manifest.eventRules?.isEmpty != false, manifest.deviceBehavior == nil else { return false }
+        return manifest.connections.allSatisfy { connection in
+            guard let custom = connection.customHTTP, connection.publicHTTP == nil,
+                  connection.operations == nil, connection.serviceCalls == nil, connection.cameraEntities == nil else { return false }
+            return custom.operations.allSatisfy { $0.method == "GET" }
+        }
+    }
+
+    private func permitsRemoteAuthoringResult(_ result: AuthoringResultV2, request: AuthoringRequestV2) -> Bool {
+        guard let screen = result.screen, result.preferenceMutations?.isEmpty != false,
+              result.connectionSetupProposals?.isEmpty != false else { return false }
+        let current = state.screens.first { $0.id == request.context.screenID }
+        if let current, !supportsRemoteAuthoringEdit(current) { return false }
+        guard let manifest = screen.files.first(where: { $0.path.lowercased() == "manifest.json" }) else { return true }
+        guard manifest.path == "manifest.json" else { return false }
+        if manifest.kind == "write" { return Self.remoteAuthoringManifestIsSafe(manifest.content) }
+        return manifest.sourcePath == "manifest.json" && current != nil
+    }
+
+    func isRemoteAuthoringRequest(_ id: String) -> Bool {
+        state.remoteRequestIDs?.contains(id) == true
+    }
+
+    func saveRemoteAuthoringRequest(_ request: AuthoringRequestV2) throws {
+        try saveAuthoringRequestV2(request, text: nil, screen: nil, remote: true)
+    }
+
     /// Preparation is one durable transaction: no orphan pin can exist without visible pending work.
     func prepareAuthoringRequest(_ request: AuthoringRequestV2, text: String, screen: ScreenArtifact?,
                                  linkedEdit: LinkedCatalogEditScope? = nil, forkName: String? = nil) throws {
@@ -1379,11 +1436,11 @@ import ScreenpunkCore
         try saveAuthoringRequestV2(request, text: text, screen: screen, linkedEdit: linkedEdit, forkName: forkName)
     }
     private func saveAuthoringRequestV2(_ request: AuthoringRequestV2, text: String?, screen: ScreenArtifact?,
-                                        linkedEdit: LinkedCatalogEditScope? = nil, forkName: String? = nil) throws {
+                                        linkedEdit: LinkedCatalogEditScope? = nil, forkName: String? = nil, remote: Bool = false) throws {
         _ = try AuthoringV2Contract.validateRequest(JSONEncoder().encode(request))
         guard request.context.libraryID == libraryOwner else { throw DeviceError.message("The request belongs to another library.") }
         if let existing = state.authoring?.requestDigests[request.requestID] {
-            guard existing == AuthoringContract.contentDigest(try AuthoringContract.encodedCanonical(request)) else { throw DeviceError.message("This request ID is already bound to another snapshot.") }
+            guard remote == isRemoteAuthoringRequest(request.requestID), existing == AuthoringContract.contentDigest(try AuthoringContract.encodedCanonical(request)) else { throw DeviceError.message("This request ID is already bound to another snapshot.") }
             guard let text else { return }
             guard state.authoring?.requestsV2?[request.requestID] != nil,
                   state.authoring?.receipts.values.contains(where: { $0.requestID == request.requestID }) != true,
@@ -1417,6 +1474,7 @@ import ScreenpunkCore
         var next = state; var authoring = next.authoring ?? .init()
         try AuthoringStore.saveRequest(request, pin: pin, in: &authoring)
         if request.delivery.route == "local" { next.localRequestIDs = (next.localRequestIDs ?? []).union([request.requestID]) }
+        if remote { next.remoteRequestIDs = (next.remoteRequestIDs ?? []).union([request.requestID]) }
         next.authoring = authoring
         if let text {
             try recordLinkedEdit(request, scope: linkedEdit, forkName: forkName, in: &next)
@@ -1617,7 +1675,9 @@ import ScreenpunkCore
         if stagedRevision != nil { pruneUnusedRevisions() }
         return receipt
     }
-    func applyAuthoringResult(_ result: AuthoringResultV2, now: Int64 = Int64(Date().timeIntervalSince1970 * 1000)) throws -> ApplicationReceiptV1 {
+    func applyAuthoringResult(_ result: AuthoringResultV2, remoteApprovalRotation: ((String, String) throws -> Void)? = nil, now: Int64 = Int64(Date().timeIntervalSince1970 * 1000)) throws -> ApplicationReceiptV1 {
+        let remote = remoteApprovalRotation != nil
+        guard remote == isRemoteAuthoringRequest(result.requestID) else { throw ConnectionFailure.validationFailed }
         if let old = state.authoring?.receipts[result.operationID] {
             guard state.authoring?.operationDigests[result.operationID] == AuthoringContract.contentDigest(try AuthoringContract.encodedCanonical(result)) else { throw DeviceError.message("This operation ID was reused with different content.") }
             if state.pendingID == result.requestID || state.submissionKey == result.requestID {
@@ -1626,6 +1686,9 @@ import ScreenpunkCore
             return old
         }
         guard let request = state.authoring?.requestsV2?[result.requestID], request.context.libraryID == libraryOwner else { throw DeviceError.message("The original authoring snapshot is missing or belongs to another library.") }
+        if remote, !permitsRemoteAuthoringResult(result, request: request) {
+            return try rejectAuthoringResult(result, reason: "Edit this screen on the iPad to review its existing services or device access.", now: now)
+        }
         var next = state; var authoring = next.authoring ?? .init()
         let current = next.screens.first { $0.id == request.context.screenID }
         let linkedEdit = state.linkedEdits?[result.requestID]
@@ -1684,6 +1747,13 @@ import ScreenpunkCore
                     saved = Saved(id: request.context.screenID, revision: revision, artifact: artifact)
                 }
                 stagedRevision = revision
+                if let remoteApprovalRotation {
+                    let priorScope = customHTTPApprovalScope(screenID: saved.id)
+                    let nextScope = "remote-approval/" + UUID().uuidString
+                    try remoteApprovalRotation(priorScope, nextScope)
+                    if next.remoteApprovalScopes == nil { next.remoteApprovalScopes = [:] }
+                    next.remoteApprovalScopes?[saved.id] = nextScope
+                }
                 if next.connectionSetupDrafts == nil { next.connectionSetupDrafts = [:] }
                 next.connectionSetupDrafts?[saved.id] = result.connectionSetupProposals.map {
                     ConnectionSetupDraft(revision: revision, credentialRegistration: request.delivery.route == "cloud" && request.runtime.features.contains(AuthoringContract.credentialRegistrationFeature) ? .init(
@@ -1703,7 +1773,7 @@ import ScreenpunkCore
                         next.catalogLinks?[saved.id]?.operationID = UUID().uuidString
                         next.catalogLinks?[saved.id]?.pendingAppliedAt = now
                     }
-                    if selectsInstalledRevision(saved.id) { next.selectedID = saved.id }
+                    if !remote, selectsInstalledRevision(saved.id) { next.selectedID = saved.id }
                 }
                 next.lastRequest = result.requestID
             } catch {
@@ -1711,7 +1781,7 @@ import ScreenpunkCore
                 return try rejectAuthoringResult(result, reason: "The screen package could not be installed: " + error.localizedDescription, now: now)
             }
         }
-        next.consumedID = result.requestID; clearTerminalDelivery(result.requestID, in: &next)
+        if !remote { next.consumedID = result.requestID; clearTerminalDelivery(result.requestID, in: &next) }
         try commit(next, stagedDirectory: stagedRevision)
         pruneUnusedRevisions()
         return receipt
@@ -1784,7 +1854,8 @@ import ScreenpunkCore
     func rejectAuthoringResult(_ result: AuthoringResultV2, reason: String, now: Int64 = Int64(Date().timeIntervalSince1970 * 1000)) throws -> ApplicationReceiptV1 {
         var next = state; var authoring = next.authoring ?? .init()
         let receipt = try AuthoringStore.reject(result, reason: reason, in: &authoring, now: now)
-        next.authoring = authoring; next.consumedID = result.requestID; clearTerminalDelivery(result.requestID, in: &next)
+        next.authoring = authoring
+        if !isRemoteAuthoringRequest(result.requestID) { next.consumedID = result.requestID; clearTerminalDelivery(result.requestID, in: &next) }
         try commit(next); pruneUnusedRevisions(); return receipt
     }
     func rejectAuthoringResult(_ result: AuthoringResultV1, reason: String, now: Int64 = Int64(Date().timeIntervalSince1970 * 1000)) throws -> ApplicationReceiptV1 {

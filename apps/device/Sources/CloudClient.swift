@@ -21,6 +21,7 @@ struct AgentStatus: Decodable {
     let profileID: String?
     let authoringCapabilities: CloudAuthoringCapabilities?
     let credentialRegistrationVersion: Int?
+    let remoteAuthoringVersion: Int?
     let latestRequest: Summary?
     let awaitingApplicationRequestIDs: [String]?
     let command: Command?
@@ -807,6 +808,7 @@ struct PreferenceSyncResponse: Decodable {
     }
     func reconcile(requestID: String) async throws -> AuthoringDeliveryStateV2 {
         let response: AgentRequestV2 = try await cloud.call("api/device/requests/\(requestID)", authoringVersion: 2)
+        guard response.remoteOperationID == nil else { throw ConnectionFailure.validationFailed }
         return try response.deliveryState(requestID: requestID)
     }
     func cancel(requestID: String) async throws {

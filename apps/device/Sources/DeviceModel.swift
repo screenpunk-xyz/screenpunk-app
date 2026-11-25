@@ -150,8 +150,10 @@ import ScreenpunkLocalTransport
         cloudSetupStatusTask = Task { [weak self, cloud] in
             guard !Task.isCancelled else { return }
             let observation: CloudListenerObservation
+            var observedStatus: AgentStatus?
             do {
                 let status: AgentStatus = try await cloud.call("api/device/status", authorizationToken: session.accessToken)
+                observedStatus = status
                 observation = .init(accountID: accountID, deviceID: session.deviceId,
                     profileID: status.profileID, ready: status.agentReady, pluginConnected: status.pluginConnected)
             } catch {
@@ -173,6 +175,7 @@ import ScreenpunkLocalTransport
                                    profileID: session.profileID ?? binding?.profileID) {
                 try? self.reconcileCloudProfile(observation.profileID)
             }
+            if let observedStatus { self.observeRemoteAuthoringCapability(observedStatus) }
         }
     }
     /// A status invalidation while Local is selected only reads listener state.
@@ -189,6 +192,7 @@ import ScreenpunkLocalTransport
                       self.cloud.session?.accessToken == session.accessToken else { return true }
                 self.observeCloudListener(status, read: read)
                 if !self.routeChangeBlocked { try self.reconcileCloudProfile(status.profileID) }
+                self.observeRemoteAuthoringCapability(status)
                 return true
             } catch {
                 guard !Task.isCancelled, self.cloudSocketEpoch == epoch,
@@ -206,6 +210,7 @@ import ScreenpunkLocalTransport
         }
     }
     private func observeCloudListener(_ status: AgentStatus, read: UInt64) {
+        observeRemoteAuthoringCapability(status)
         guard cloudSocketEpoch != nil, let session = cloud.session, let accountID = cloud.localAccountID else { return }
         cloudListenerObservations.publish(.init(accountID: accountID, deviceID: session.deviceId,
             profileID: status.profileID, ready: status.agentReady, pluginConnected: status.pluginConnected), source: .socket, read: read)
@@ -268,12 +273,21 @@ import ScreenpunkLocalTransport
         do { try library.dismissGalleryIntro() }
         catch { message = error.localizedDescription }
         onboarding = library.state.onboarding
+        wakeRemoteAuthoring()
     }
 
     @Published private(set) var resolvedAgentName: String?
     private var cloudSupportsV2 = false
     private var cloudSupportsConnectionPrefill = false
     @Published private var cloudSupportsCredentialRegistration = false
+    @Published private var cloudSupportsRemoteAuthoring = false
+    private let remoteAuthoringPump = CatalogWorkPump()
+    private var remoteAuthoringPermissionWrite: UUID?
+    private var remoteAuthoringConsentGeneration = UUID()
+    private var remoteAuthoringFailures = 0
+    private static let remoteAuthoringPath = "api/device/remote-authoring"
+    var supportsRemoteAuthoring: Bool { cloudSupportsRemoteAuthoring && cloudBindingMatches && !cloudAuthorizationRejected }
+
     private var cloudSupportsCustomHTTP = false
     @Published private(set) var localAgent: LocalAgentConfiguration?
     @Published private(set) var localSettings: LocalAgentSettingsModel?
@@ -900,6 +914,7 @@ import ScreenpunkLocalTransport
             cloudSupportsV2 = status.authoringCapabilities?.supportsV2 == true
             cloudSupportsCredentialRegistration = status.credentialRegistrationVersion == 1 &&
                 status.authoringCapabilities?.features.contains(AuthoringContract.credentialRegistrationFeature) == true
+            observeRemoteAuthoringCapability(status)
             requestCredentialRegistrationRemovalSync()
             agentReady = routePreference == .automatic ? (localAgent != nil || cloudAgentReady) : cloudAgentReady
             if let command = status.command { await applyCommand(command) }
@@ -924,6 +939,7 @@ import ScreenpunkLocalTransport
                 }
             }
             if let id = pendingID {
+                guard library?.isRemoteAuthoringRequest(id) != true else { throw ConnectionFailure.validationFailed }
                 if library?.authoringRequestV2(id: id) != nil { return await pollAuthoringV2(generation: generation) }
                 guard let authoring else { throw DeviceError.message("Local authoring storage is unavailable.") }
                 if library?.authoringRequest(id: id) == nil {
@@ -1346,13 +1362,18 @@ import ScreenpunkLocalTransport
             busy = false; requestPending = false; canRetry = true; canCancelRequest = library.state.submissionKey != nil; message = error.localizedDescription; requestRefresh()
         }
     }
-    private func makeAuthoringRequest(text: String, session: DeviceSession? = nil, library: ScreenLibrary, route: AuthoringRoute? = nil, preparingV2: Bool = false) throws -> AuthoringRequestV1 {
+    private func makeAuthoringRequest(text: String, session: DeviceSession? = nil, library: ScreenLibrary, route: AuthoringRoute? = nil, preparingV2: Bool = false, remoteIntent: RemoteAuthoringIntent? = nil) throws -> AuthoringRequestV1 {
         guard let profile = activeProfile else { throw DeviceError.message("Your profile is unavailable.") }
         let route = route ?? selectedRoute
         if route == .cloud, !cloudBindingMatches { throw DeviceError.message("Cloud is still confirming your profile. Try again shortly.") }
         let profileID = profile.authoringProfileID
         let deviceID = profile.authoringDeviceID
         let now = Int64(Date().timeIntervalSince1970 * 1000)
+        let screen: ScreenLibrary.Saved?
+        if let remoteIntent {
+            screen = remoteIntent.kind == .edit ? library.state.screens.first { $0.id == remoteIntent.screenID } : nil
+        } else { screen = self.screen }
+        let manifest = remoteIntent == nil ? self.manifest : nil
         let screenID = screen?.id ?? UUID().uuidString
         let window = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap(\.windows).first(where: \.isKeyWindow)
         let size = window?.bounds.size ?? UIScreen.main.bounds.size
@@ -1360,6 +1381,10 @@ import ScreenpunkLocalTransport
         let services = AuthoringContract.serviceCatalog.map { definition in
             let unknown = AuthoringCapabilityStateV1(state: "unknown", observedAt: now)
             var service = AuthoringServiceV1(id: definition.id, provider: definition.provider, operations: definition.operations, supported: .init(state: "yes", observedAt: now), configured: unknown, authorized: unknown, entitled: unknown, reachable: unknown)
+            if remoteIntent != nil {
+                if definition.provider == "googleCalendar" { service.configured = .init(state: "no", observedAt: now) }
+                return service
+            }
             switch definition.provider {
             case "home":
                 let vault = HomeAssistantDeviceVault()
@@ -1384,14 +1409,14 @@ import ScreenpunkLocalTransport
         }
         guard preparingV2 || screen?.hasNativeAssets != true else { throw DeviceError.message("This screen requires an agent that supports package assets.") }
         let source = preparingV2 ? nil : screen.map { AuthoringScreen(title: $0.artifact.title, entry: $0.artifact.entry, files: $0.artifact.files.map { .init(path: $0.path, content: $0.content) }) }
-        let supportsScreenData = route == .local || screenDataSocketID != nil
-        let supportsCustomHTTP = preparingV2 && (route == .local || cloudSupportsCustomHTTP)
+        let supportsScreenData = remoteIntent == nil && (route == .local || screenDataSocketID != nil)
+        let supportsCustomHTTP = remoteIntent == nil && preparingV2 && (route == .local || cloudSupportsCustomHTTP)
         let supportsConnectionPrefill = supportsCustomHTTP && route == .cloud && cloudSupportsConnectionPrefill
         let supportsCredentialRegistration: Bool
         if #available(iOS 18, *) {
             supportsCredentialRegistration = supportsConnectionPrefill && preparingV2 && cloudSupportsCredentialRegistration
         } else { supportsCredentialRegistration = false }
-        let request = AuthoringRequestV1(requestID: UUID().uuidString, createdAt: now, deadlineAt: now + 10 * 60 * 1000, designGuidance: AuthoringContract.designGuidance(supportsScreenData: supportsScreenData, supportsCustomHTTP: supportsCustomHTTP, supportsConnectionPrefill: supportsConnectionPrefill, supportsCredentialRegistration: supportsCredentialRegistration), runtime: AuthoringContract.runtime(supportsScreenData: supportsScreenData, supportsCustomHTTP: supportsCustomHTTP, supportsConnectionPrefill: supportsConnectionPrefill, supportsCredentialRegistration: supportsCredentialRegistration), services: services, preferences: library.preferences(profileID: profileID, deviceID: deviceID, screenID: screenID), context: .init(profileID: profileID, deviceID: deviceID, screenID: screenID, baseRevision: screen?.revision, userRequest: text, currentScreen: source, viewport: .init(width: size.width, height: size.height, scale: scale, orientation: size.width > size.height ? "landscape" : "portrait")), delivery: .init(route: route.rawValue))
+        let request = AuthoringRequestV1(requestID: remoteIntent?.operationID ?? UUID().uuidString, createdAt: now, deadlineAt: remoteIntent?.expiresAt ?? now + 10 * 60 * 1000, designGuidance: AuthoringContract.designGuidance(supportsScreenData: supportsScreenData, supportsCustomHTTP: supportsCustomHTTP, supportsConnectionPrefill: supportsConnectionPrefill, supportsCredentialRegistration: supportsCredentialRegistration), runtime: AuthoringContract.runtime(supportsScreenData: supportsScreenData, supportsCustomHTTP: supportsCustomHTTP, supportsConnectionPrefill: supportsConnectionPrefill, supportsCredentialRegistration: supportsCredentialRegistration), services: services, preferences: remoteIntent == nil ? library.preferences(profileID: profileID, deviceID: deviceID, screenID: screenID) : [], context: .init(profileID: profileID, deviceID: deviceID, screenID: screenID, baseRevision: screen?.revision, userRequest: text, currentScreen: source, viewport: .init(width: size.width, height: size.height, scale: scale, orientation: size.width > size.height ? "landscape" : "portrait")), delivery: .init(route: route.rawValue))
         return preparingV2 ? request : try AuthoringContract.seal(request)
     }
     private func measureRequestApply(_ requestID: String, _ apply: () throws -> ApplicationReceiptV1) rethrows -> ApplicationReceiptV1 {
@@ -1652,6 +1677,15 @@ import ScreenpunkLocalTransport
         } catch { message = error.localizedDescription }
     }
 
+    func moveInstalledScreen(_ id: String, relativeTo anchorID: String, after: Bool, owner: String) throws {
+        guard !needsAgentSetup, !accountOperationInProgress, let library,
+              !owner.isEmpty, owner == permissionOwner else {
+            throw DeviceError.message("This screen’s library is unavailable.")
+        }
+        try library.moveScreen(id, relativeTo: anchorID, after: after)
+        installedScreens = library.state.screens
+    }
+
     func renameScreen(_ id: String, to name: String, owner: String) throws {
         guard !needsAgentSetup, !accountOperationInProgress, let library,
               !owner.isEmpty, owner == permissionOwner else {
@@ -1694,7 +1728,7 @@ import ScreenpunkLocalTransport
               customConnectionPrompt == nil,
               let use = customConnectionUses().first(where: { $0.alias == alias && $0.screen.revision == revision }),
               !customConnectionApproved(use),
-              customHTTPVault.shouldOfferAccess(owner: owner, screenID: use.screen.id, alias: alias, declaration: use.declaration) else { return }
+              customHTTPVault.shouldOfferAccess(owner: owner, screenID: customHTTPApprovalScope(use.screen.id), alias: alias, declaration: use.declaration) else { return }
         let status = customConnectionStatus(use.declaration)
         let setupOrigin = status == nil && savedCustomConnections.allSatisfy({ $0.id != use.declaration.id })
             ? suggestedCredentialRegistrationOrigin(use, owner: owner) : nil
@@ -1709,7 +1743,7 @@ import ScreenpunkLocalTransport
         guard !settingsOpen, customConnectionPrompt?.id == prompt.id, screen?.id == prompt.use.screen.id,
               screen?.revision == prompt.use.screen.revision,
               try customHTTPVault.serviceGeneration(owner: prompt.owner, serviceID: prompt.use.declaration.id) == prompt.status?.generation,
-              customHTTPVault.shouldOfferAccess(owner: prompt.owner, screenID: prompt.use.screen.id,
+              customHTTPVault.shouldOfferAccess(owner: prompt.owner, screenID: customHTTPApprovalScope(prompt.use.screen.id),
                                                alias: prompt.use.alias, declaration: prompt.use.declaration) else {
             throw ConnectionFailure.permissionRequired
         }
@@ -1719,7 +1753,7 @@ import ScreenpunkLocalTransport
     func approveCustomConnectionPrompt(_ prompt: CustomConnectionPrompt) throws {
         try requireCurrentCustomConnectionPrompt(prompt)
         guard let status = prompt.status else { throw ConnectionFailure.permissionRequired }
-        try customHTTPVault.approve(owner: prompt.owner, screenID: prompt.use.screen.id,
+        try customHTTPVault.approve(owner: prompt.owner, screenID: customHTTPApprovalScope(prompt.use.screen.id),
                                    manifest: prompt.use.manifest, alias: prompt.use.alias,
                                    expectedGeneration: status.generation, requireOfferedAccess: true)
         // The denied read has already returned. Keep its renderer mounted and wait for the screen's next read.
@@ -1870,7 +1904,8 @@ import ScreenpunkLocalTransport
               reply.fingerprint == nil || reply.fingerprint == fingerprint else { throw ConnectionFailure.permissionRequired }
         try customHTTPVault.acceptCredentialRegistration(owner: owner, declaration: use.declaration, fields: fields,
             registrationID: pending.registrationID, fingerprint: fingerprint, certificatePin: certificatePin,
-            now: Self.credentialRegistrationNow, approveScreenRead: approvalPrompt != nil)
+            now: Self.credentialRegistrationNow, approveScreenRead: approvalPrompt != nil,
+            approvalScreenID: customHTTPApprovalScope(use.screen.id))
         if approvalPrompt == nil { refreshCustomConnections() }
         requestCredentialRegistrationRemovalSync()
     }
@@ -2034,9 +2069,13 @@ import ScreenpunkLocalTransport
         return customHTTPVault.status(owner: permissionOwner, declaration: declaration)
     }
 
+    private func customHTTPApprovalScope(_ screenID: String) -> String {
+        library?.customHTTPApprovalScope(screenID: screenID) ?? screenID
+    }
+
     func customConnectionApproved(_ use: CustomConnectionUse) -> Bool {
         guard !permissionOwner.isEmpty else { return false }
-        return customHTTPVault.isApproved(owner: permissionOwner, screenID: use.screen.id, manifest: use.manifest, alias: use.alias)
+        return customHTTPVault.isApproved(owner: permissionOwner, screenID: customHTTPApprovalScope(use.screen.id), manifest: use.manifest, alias: use.alias)
     }
 
     func saveCustomConnection(_ use: CustomConnectionUse, owner: String, fields: [String: String],
@@ -2052,10 +2091,10 @@ import ScreenpunkLocalTransport
         try requireCurrentCustomConnection(use, owner: owner)
         if approved {
             guard let expectedGeneration else { throw ConnectionFailure.permissionRequired }
-            try customHTTPVault.approve(owner: owner, screenID: use.screen.id, manifest: use.manifest, alias: use.alias,
+            try customHTTPVault.approve(owner: owner, screenID: customHTTPApprovalScope(use.screen.id), manifest: use.manifest, alias: use.alias,
                                         expectedGeneration: expectedGeneration)
         } else {
-            try customHTTPVault.deny(owner: owner, screenID: use.screen.id, alias: use.alias, declaration: use.declaration)
+            try customHTTPVault.deny(owner: owner, screenID: customHTTPApprovalScope(use.screen.id), alias: use.alias, declaration: use.declaration)
         }
         refreshCustomConnections()
     }
@@ -2065,7 +2104,7 @@ import ScreenpunkLocalTransport
         guard let operation = use.declaration.operations.first(where: { $0.parameters.isEmpty }) else {
             throw DeviceError.message("This connection does not have a simple read to test.")
         }
-        let runtime = CustomHTTPDeviceRuntime(owner: owner, screenID: use.screen.id, manifest: use.manifest, vault: customHTTPVault)
+        let runtime = CustomHTTPDeviceRuntime(owner: owner, screenID: customHTTPApprovalScope(use.screen.id), manifest: use.manifest, vault: customHTTPVault)
         try await runtime.test(alias: use.alias, operation: operation.name)
         try requireCurrentCustomConnection(use, owner: owner)
     }
@@ -2228,11 +2267,13 @@ import ScreenpunkLocalTransport
               cloud.session?.accessToken == token, screenDataSocketID == nil, !Task.isCancelled else { return }
         let screens = library.state.screens.map { screen -> [String: Any] in
             var row = library.catalogInventoryRow(for: screen, includeCatalogIDs: includeCatalogIDs)
-            if cloudSupportsCredentialRegistration { row["revision"] = screen.revision }
+            if cloudSupportsCredentialRegistration || supportsRemoteAuthoring { row["revision"] = screen.revision }
+            if supportsRemoteAuthoring { row["remoteEditable"] = library.supportsRemoteAuthoringEdit(screen) }
             return row
         }
         var body: [String: Any] = ["screens": screens]
         if cloudSupportsCredentialRegistration { body["credentialRegistrationVersion"] = 1 }
+        if supportsRemoteAuthoring { body["remoteAuthoringVersion"] = 1 }
         if let id = library.selected?.id { body["selectedID"] = id }
         let signature = String(data: try JSONSerialization.data(withJSONObject: body, options: .sortedKeys), encoding: .utf8)!
         guard signature != inventorySignature else { return }
@@ -2330,7 +2371,7 @@ import ScreenpunkLocalTransport
                   self.cloud.session?.accessToken == session.accessToken else { return }
             RequestTimeline.record(.socketDisconnected, requestID: self.pendingID)
             if authorizationRejected { self.rejectCloudAuthorization() }
-            else { self.clearCloudSocketObservation() }
+            else { self.clearCloudSocketObservation(releaseRemoteCapability: false) }
         }, billingUpdated: { [weak self] notice in
             guard let self, self.foreground, self.cloudSocketToken == session.accessToken,
                   self.cloud.session?.accessToken == session.accessToken else { return }
@@ -2377,6 +2418,7 @@ import ScreenpunkLocalTransport
         startConnection()
     }
     private func requestCloudStatusReconciliation() {
+        wakeRemoteAuthoring()
         if shouldCheckCloudSetup {
             refreshCloudSetupStatus(reconcileProfile: true)
         } else if pollsLocalAuthoring || !cloudAccountMatches || library == nil {
@@ -2385,18 +2427,185 @@ import ScreenpunkLocalTransport
             requestRefresh()
         }
     }
+    private func observeRemoteAuthoringCapability(_ status: AgentStatus) {
+        guard status.profileID == cloud.session?.profileID else { return }
+        let supported = status.remoteAuthoringVersion == 1 && status.authoringCapabilities?.supportsV2 == true
+        let changed = cloudSupportsRemoteAuthoring != supported
+        if changed {
+            cloudSupportsRemoteAuthoring = supported
+            if !supported { remoteAuthoringPump.cancel() }
+        }
+        if supported { wakeRemoteAuthoring() }
+    }
+
+    func remoteAuthoringPermissions() async throws -> [RemoteAuthoringGrant] {
+        guard supportsRemoteAuthoring, let token = cloud.session?.accessToken else { throw ConnectionFailure.validationFailed }
+        let response: RemoteAuthoringPermissions = try await cloud.call(Self.remoteAuthoringPath + "/permissions", authorizationToken: token)
+        guard supportsRemoteAuthoring, cloud.session?.accessToken == token, !Task.isCancelled else { throw CancellationError() }
+        return response.grants
+    }
+
+    func setRemoteAuthoringPermission(_ grant: RemoteAuthoringGrant, allowCreate: Bool, allowEdit: Bool) async throws -> [RemoteAuthoringGrant] {
+        guard supportsRemoteAuthoring, let token = cloud.session?.accessToken, remoteAuthoringPermissionWrite == nil,
+              (allowCreate != grant.allowCreate) != (allowEdit != grant.allowEdit) else { throw ConnectionFailure.validationFailed }
+        let write = UUID()
+        remoteAuthoringPermissionWrite = write
+        remoteAuthoringConsentGeneration = UUID()
+        let kind = allowCreate != grant.allowCreate ? "create" : "edit"
+        defer {
+            if remoteAuthoringPermissionWrite == write { remoteAuthoringPermissionWrite = nil; wakeRemoteAuthoring() }
+        }
+        let response: RemoteAuthoringPermissions = try await cloud.call(Self.remoteAuthoringPath + "/permissions", method: "PUT",
+            body: ["grantID": grant.grantID, "kind": kind, "allowed": kind == "create" ? allowCreate : allowEdit], authorizationToken: token)
+        guard supportsRemoteAuthoring, cloud.session?.accessToken == token, remoteAuthoringPermissionWrite == write,
+              !Task.isCancelled else { throw CancellationError() }
+        return response.grants
+    }
+
+    private var canProcessRemoteAuthoring: Bool {
+        foreground && connectionActive && supportsRemoteAuthoring && !accountOperationInProgress &&
+            accountDeletionIntent == nil && remoteAuthoringPermissionWrite == nil && (onboarding == nil || onboarding == .complete)
+    }
+
+    private func wakeRemoteAuthoring() {
+        guard canProcessRemoteAuthoring, let library, let session = cloud.session else { return }
+        let generation = connectionGeneration
+        remoteAuthoringPump.request { [weak self, weak library] in
+            guard let self, let library, self.isCurrentRemoteAuthoring(library, session: session, generation: generation) else { return .idle }
+            do {
+                let consent = self.remoteAuthoringConsentGeneration
+                try await self.syncInventory()
+                guard self.isCurrentRemoteAuthoring(library, session: session, generation: generation),
+                      consent == self.remoteAuthoringConsentGeneration else { return .idle }
+                let response: RemoteAuthoringInbox = try await self.cloud.call(Self.remoteAuthoringPath + "/intents", authorizationToken: session.accessToken)
+                let actionable = response.intents.filter { intent in
+                    intent.status == .queued || intent.status == .completed ||
+                        (intent.applyClaimed == true && library.hasApplicationReceipt(requestID: intent.operationID))
+                }
+                for intent in actionable.prefix(4) {
+                    guard self.isCurrentRemoteAuthoring(library, session: session, generation: generation),
+                          consent == self.remoteAuthoringConsentGeneration else { return .idle }
+                    do {
+                        try await self.processRemoteAuthoring(intent, library: library, session: session, generation: generation, consent: consent)
+                    } catch DeviceError.http(let status, _) where [403, 404, 409, 410].contains(status) {
+                        // A removed or changed intent cannot block unrelated authorized work.
+                        continue
+                    }
+                }
+                self.remoteAuthoringFailures = 0
+                let delay: TimeInterval = response.intents.isEmpty ? 30 : 5
+                return .retry(Date().addingTimeInterval(delay))
+            } catch {
+                guard self.isCurrentRemoteAuthoring(library, session: session, generation: generation) else { return .idle }
+                self.remoteAuthoringFailures = min(self.remoteAuthoringFailures + 1, 6)
+                return .retry(Date().addingTimeInterval(min(60, pow(2, Double(self.remoteAuthoringFailures)))))
+            }
+        }
+    }
+
+    private func isCurrentRemoteAuthoring(_ library: ScreenLibrary, session: DeviceSession, generation: UUID) -> Bool {
+        canProcessRemoteAuthoring && self.library === library && generation == connectionGeneration &&
+        cloud.session?.accessToken == session.accessToken && cloud.session?.deviceId == session.deviceId &&
+        cloud.session?.profileID == session.profileID && !Task.isCancelled
+    }
+
+    private func processRemoteAuthoring(_ intent: RemoteAuthoringIntent, library: ScreenLibrary, session: DeviceSession,
+                                        generation: UUID, consent: UUID) async throws {
+        let now = { Int64(Date().timeIntervalSince1970 * 1_000) }
+        guard intent.isValid, intent.deviceID == session.deviceId, let coordinator = cloudAuthoringV2,
+              let profileID = session.profileID else { return }
+        let path = Self.remoteAuthoringPath + "/intents/" + intent.operationID
+        let token = session.accessToken
+        func current() -> Bool {
+            isCurrentRemoteAuthoring(library, session: session, generation: generation) &&
+            remoteAuthoringConsentGeneration == consent && intent.expiresAt > now()
+        }
+
+        if intent.applyClaimed == true,
+           let receipt = library.state.authoring?.receipts.values.first(where: { $0.requestID == intent.operationID }),
+           library.isRemoteAuthoringRequest(intent.operationID) {
+            try await coordinator.acknowledge(receipt)
+            return
+        }
+        // Keep an iPad-started request or unsent instruction independent of Cloud work.
+        guard current(), !busy, !requestPending, pendingID == nil, library.state.submissionKey == nil else { return }
+        func targetRejection() -> String? {
+            guard intent.kind == .edit, let screenID = intent.screenID else { return nil }
+            guard let saved = library.state.screens.first(where: { $0.id == screenID }) else { return "screen_missing" }
+            guard saved.revision == intent.baseRevision else { return "revision_conflict" }
+            if !library.supportsRemoteAuthoringEdit(saved) { return "unsupported_target" }
+            return nil
+        }
+        if let reason = targetRejection() {
+            let _: RemoteAuthoringIntent = try await cloud.call(path + "/reject", method: "POST",
+                body: ["reason": reason], authorizationToken: token)
+            return
+        }
+        if intent.status == .queued {
+            let snapshot: AuthoringRequestV2
+            if let existing = library.authoringRequestV2(id: intent.operationID) {
+                guard library.isRemoteAuthoringRequest(intent.operationID) else { throw ConnectionFailure.validationFailed }
+                snapshot = existing
+            } else {
+                let input = try makeAuthoringRequest(text: intent.prompt, session: session, library: library,
+                                                     route: .cloud, preparingV2: true, remoteIntent: intent)
+                snapshot = try library.makeAuthoringRequestV2(from: input)
+            }
+            if snapshot.context.currentScreen?.files.contains(where: { CatalogContract.containsCredentials(path: $0.path, content: $0.content ?? "") }) == true {
+                let _: RemoteAuthoringIntent = try await cloud.call(path + "/reject", method: "POST",
+                    body: ["reason": "unsupported_target"], authorizationToken: token)
+                return
+            }
+            guard intent.matches(snapshot), snapshot.context.profileID == profileID, snapshot.context.deviceID == session.deviceId else {
+                throw ConnectionFailure.validationFailed
+            }
+            try library.saveRemoteAuthoringRequest(snapshot)
+            let prepared: RemoteAuthoringIntent = try await cloud.call(path + "/prepare", method: "POST",
+                body: ["snapshot": try CloudAuthoringTransport.object(snapshot)], authorizationToken: token, authoringVersion: 2)
+            guard prepared.requestID == snapshot.requestID, prepared.matches(snapshot), prepared.grantID == intent.grantID else {
+                throw ConnectionFailure.validationFailed
+            }
+            return
+        }
+        guard intent.status == .completed, let requestID = intent.requestID,
+              library.isRemoteAuthoringRequest(requestID), let snapshot = library.authoringRequestV2(id: requestID),
+              intent.matches(snapshot), snapshot.context.profileID == profileID, snapshot.context.deviceID == session.deviceId else { return }
+        let request: AgentRequestV2 = try await cloud.call("api/device/requests/" + requestID, authorizationToken: token, authoringVersion: 2)
+        guard current(), request.remoteOperationID == intent.operationID, request.snapshot == snapshot,
+              case .completed(let result) = try request.deliveryState(requestID: requestID) else { return }
+        let approved: RemoteAuthoringIntent = try await cloud.call(path + "/apply", method: "POST",
+            body: ["requestID": requestID, "resultOperationID": result.operationID], authorizationToken: token, authoringVersion: 2)
+        guard current(), !busy, !requestPending, pendingID == nil, library.state.submissionKey == nil,
+              targetRejection() == nil, approved.status == .completed, approved.applyClaimed == true, approved.requestID == requestID,
+              approved.grantID == intent.grantID, approved.matches(snapshot) else { return }
+        let owner = permissionOwner
+        let receipt = try measureRequestApply(requestID) {
+            try library.applyAuthoringResult(result, remoteApprovalRotation: { prior, next in
+                try self.customHTTPVault.rotateScreenApprovalScope(owner: owner, priorScope: prior, nextScope: next)
+            })
+        }
+        refreshScreen()
+        requestScreenDataInventory()
+        try await coordinator.acknowledge(receipt)
+        if current() { try? await syncInventory() }
+    }
+
     private func clearCloudStatusReads() {
         cloudSetupStatusTask?.cancel()
         cloudSetupStatusTask = nil
         cloudListenerObservations.clear()
     }
-    private func clearCloudSocketObservation() {
+    private func clearCloudSocketObservation(releaseRemoteCapability: Bool = true) {
         resetScreenDataWork(disconnectSocket: true)
         inventorySignature = nil
         cloudSocketEpoch = nil
         listenerStatusPump.cancel()
         cloudListenerObservations.clearSocket()
         cloudAgentReady = false; cloudSupportsV2 = false
+        if releaseRemoteCapability {
+            cloudSupportsRemoteAuthoring = false
+            remoteAuthoringPump.cancel()
+        }
         if !pollsLocalAuthoring { agentReady = routePreference == .automatic && localAgent != nil }
     }
     private func refreshAuthoringRoute() {
@@ -2412,6 +2621,9 @@ import ScreenpunkLocalTransport
     private func stopConnection(releaseCloudSocket: Bool = true) {
         agentWorkingRequestID = nil
         connectionActive = false
+        remoteAuthoringPump.cancel()
+        remoteAuthoringPermissionWrite = nil
+        remoteAuthoringConsentGeneration = UUID()
         stopTemporaryHomeAssistant()
         connectionGeneration = UUID()
         resetScreenDataWork(disconnectSocket: false)
@@ -2765,6 +2977,8 @@ import ScreenpunkLocalTransport
         homeAssistant = nil; customHTTP = nil; customHTTPRendererKey = ""; manifest = nil; assets = nil; screen = nil; activeProfile = nil
         cloudSupportsConnectionPrefill = false
         cloudSupportsCredentialRegistration = false
+        cloudSupportsRemoteAuthoring = false
+        remoteAuthoringPump.cancel()
         credentialRegistrationRemovalTask?.cancel()
         cloudSupportsCustomHTTP = false
         library = nil; cloudAuthoring = nil; localAuthoring = nil; localTransport = nil; cloudAuthoringV2 = nil; localAuthoringV2 = nil; localTransportV2 = nil; localTransportAuthoringProfileID = nil; cloudAgentReady = false; cloudSupportsV2 = false; pendingID = nil; pendingScreenID = nil; consumedID = nil
@@ -2834,7 +3048,7 @@ import ScreenpunkLocalTransport
                 let scope = HomeAssistantDeviceRuntime.Scope(owner: owner, revision: screen.revision, dashboardId: parsed.dashboardId)
                 homeAssistant = HomeAssistantDeviceRuntime(vault: HomeAssistantDeviceVault(), scope: { scope })
                 if parsed.connections.contains(where: { $0.customHTTP != nil }) {
-                    customHTTP = CustomHTTPDeviceRuntime(owner: owner, screenID: screen.id, manifest: parsed, vault: customHTTPVault,
+                    customHTTP = CustomHTTPDeviceRuntime(owner: owner, screenID: customHTTPApprovalScope(screen.id), manifest: parsed, vault: customHTTPVault,
                         accessRequired: { [weak self] alias in
                             await self?.offerCustomConnectionAccess(alias: alias, owner: owner, revision: screen.revision)
                         })
@@ -2965,7 +3179,8 @@ extension DeviceModel {
         var generations: [String: String] = [:]
         for screen in library.state.screens {
             var record = library.catalogInventoryRow(for: screen, includeCatalogIDs: includeCatalogIDs)
-            if cloudSupportsCredentialRegistration { record["revision"] = screen.revision }
+            if cloudSupportsCredentialRegistration || supportsRemoteAuthoring { record["revision"] = screen.revision }
+            if supportsRemoteAuthoring { record["remoteEditable"] = library.supportsRemoteAuthoringEdit(screen) }
             if let installed = library.screenDataInstallation(screen.id) {
                 record["revision"] = screen.revision
                 record["screenDataGeneration"] = installed.generation
@@ -2976,6 +3191,7 @@ extension DeviceModel {
         }
         var body: [String: Any] = ["screens": screens, "screenDataProtocol": 1, "screenDataSocketId": scope.socketID]
         if cloudSupportsCredentialRegistration { body["credentialRegistrationVersion"] = 1 }
+        if supportsRemoteAuthoring { body["remoteAuthoringVersion"] = 1 }
         let selectedID = library.selected?.id
         if let selectedID { body["selectedID"] = selectedID }
         let signature = Data(SHA256.hash(data: try JSONSerialization.data(withJSONObject: body, options: .sortedKeys)))

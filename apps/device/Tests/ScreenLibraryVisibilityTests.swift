@@ -16,6 +16,73 @@ final class ScreenLibraryVisibilityTests: XCTestCase {
         }
     }
 
+    @MainActor func testReorderCommitsInstalledOrderAndPreservesSelectionVisibilityAndPlaceholder() throws {
+        let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
+        var library = try ScreenLibrary(accountID: "one", rootDirectory: root)
+        try install(["one", "hidden", "three", "four"], in: library)
+        try library.selectVisible("one")
+        try library.setScreenShown(false, id: "hidden")
+        try library.setScreenShown(false, id: ScreenLibrary.instructionsID)
+        let generations = library.state.screenDataGenerations
+
+        try library.moveScreen("four", relativeTo: "one", after: false)
+        try library.moveScreen("one", relativeTo: "three", after: true)
+        XCTAssertEqual(library.state.screens.map(\.id), ["four", "hidden", "three", "one"])
+        XCTAssertEqual(library.rotationIDs.filter(library.isScreenShown), ["four", "three", "one"])
+        XCTAssertEqual(library.selected?.id, "one")
+        XCTAssertEqual(library.state.screenDataGenerations, generations)
+        XCTAssertEqual(library.rotationIDs.last, ScreenLibrary.instructionsID)
+        XCTAssertThrowsError(try library.moveScreen(ScreenLibrary.instructionsID, relativeTo: "four", after: false))
+        XCTAssertThrowsError(try library.moveScreen("one", relativeTo: "stale", after: true))
+        XCTAssertEqual(library.state.screens.map(\.id), ["four", "hidden", "three", "one"])
+
+        library = try ScreenLibrary(accountID: "one", rootDirectory: root)
+        XCTAssertEqual(library.selected?.id, "one")
+        XCTAssertFalse(library.isScreenShown("hidden"))
+        XCTAssertFalse(library.isScreenShown(ScreenLibrary.instructionsID))
+        try library.select(offset: 1)
+        XCTAssertEqual(library.selected?.id, "four")
+        try library.newScreen()
+        try library.moveScreen("hidden", relativeTo: "four", after: false)
+        XCTAssertEqual(library.state.screens.map(\.id), ["hidden", "four", "three", "one"])
+        XCTAssertTrue(library.explicitlyCreatingScreen)
+        XCTAssertNil(library.selected)
+        XCTAssertFalse(library.isScreenShown(ScreenLibrary.instructionsID))
+    }
+
+    @MainActor func testAgentAppliedEditAndCreationHonorReorderedSlotsAcrossRelaunch() throws {
+        let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
+        var library = try ScreenLibrary(accountID: "one", rootDirectory: root)
+        try install(["one", "two", "three"], in: library)
+        try library.moveScreen("three", relativeTo: "one", after: false)
+        try library.selectVisible("one")
+
+        func apply(_ screenID: String, current: ScreenLibrary.Saved?, title: String) throws {
+            let input = try AuthoringContract.seal(.init(requestID: UUID().uuidString.lowercased(),
+                createdAt: 1_000, deadlineAt: 601_000, designGuidance: AuthoringContract.designGuidance,
+                runtime: AuthoringContract.runtime, services: [], preferences: [],
+                context: .init(profileID: "fixture-profile", deviceID: "fixture-device", screenID: screenID,
+                               baseRevision: current?.revision, userRequest: "Update screen", currentScreen: current?.artifact,
+                               viewport: .init(width: 1024, height: 768, orientation: "landscape")), delivery: .init(route: "cloud")))
+            let snapshot = try library.makeAuthoringRequestV2(from: input)
+            try library.saveRemoteAuthoringRequest(snapshot)
+            let result = AuthoringResultV2(requestID: snapshot.requestID, inputDigest: snapshot.delivery.snapshotDigest,
+                baseRevision: snapshot.context.baseRevision, preferenceRevisions: [:], operationID: UUID().uuidString,
+                screen: .init(title: title, files: [.write(path: "index.html", content: "<html><body>\(title)</body></html>")]))
+            XCTAssertEqual(try library.applyAuthoringResult(result, remoteApprovalRotation: { _, _ in }, now: 2_000).status, "applied")
+        }
+
+        let existing = try XCTUnwrap(library.state.screens.first { $0.id == "three" })
+        try apply("three", current: existing, title: "Edited")
+        try apply("four", current: nil, title: "Created")
+        XCTAssertEqual(library.state.screens.map(\.id), ["three", "one", "two", "four"])
+        XCTAssertEqual(library.selected?.id, "one")
+        library = try ScreenLibrary(accountID: "one", rootDirectory: root)
+        XCTAssertEqual(library.rotationIDs, ["three", "one", "two", "four", ScreenLibrary.instructionsID])
+        XCTAssertEqual(library.state.screens.first?.artifact.title, "Edited")
+        XCTAssertEqual(library.selected?.id, "one")
+    }
+
     @MainActor func testDisplayNamePersistsThroughPackageEditsRollbackAndReopen() throws {
         let root = directory(); defer { try? FileManager.default.removeItem(at: root) }
         var library = try ScreenLibrary(accountID: "one", rootDirectory: root)

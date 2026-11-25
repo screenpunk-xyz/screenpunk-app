@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import MetalKit
 #if DEBUG
 import os
@@ -1499,9 +1500,90 @@ private struct ScreenNameField: View {
     }
 }
 
+/// Measure live UIKit row positions. Form can rehost a row during a move, so
+/// an old row must only unregister its own view.
+@MainActor private final class InstalledScreenRowAnchors: ObservableObject {
+    private let views = NSMapTable<NSString, UIView>.strongToWeakObjects()
+
+    func register(_ view: UIView, for screenID: String) {
+        views.setObject(view, forKey: screenID as NSString)
+    }
+
+    func unregister(_ view: UIView, for screenID: String) {
+        guard views.object(forKey: screenID as NSString) === view else { return }
+        views.removeObject(forKey: screenID as NSString)
+    }
+
+    func frame(for screenID: String) -> CGRect? {
+        guard let view = views.object(forKey: screenID as NSString),
+              let window = view.window, !view.bounds.isEmpty else { return nil }
+        return view.convert(view.bounds, to: window)
+    }
+}
+
+private struct InstalledScreenRowAnchor: UIViewRepresentable {
+    let screenID: String
+    let anchors: InstalledScreenRowAnchors
+
+    func makeUIView(context: Context) -> AnchorView {
+        let view = AnchorView()
+        view.isUserInteractionEnabled = false
+        view.accessibilityElementsHidden = true
+        return view
+    }
+
+    func updateUIView(_ view: AnchorView, context: Context) {
+        view.bind(screenID: screenID, anchors: anchors)
+    }
+
+    static func dismantleUIView(_ view: AnchorView, coordinator: ()) {
+        view.unbind()
+    }
+
+    final class AnchorView: UIView {
+        private var screenID: String?
+        private weak var anchors: InstalledScreenRowAnchors?
+
+        func bind(screenID: String, anchors: InstalledScreenRowAnchors) {
+            if self.screenID != screenID || self.anchors !== anchors {
+                unbind()
+                self.screenID = screenID
+                self.anchors = anchors
+            }
+            updateRegistration()
+        }
+
+        func unbind() {
+            if let screenID { anchors?.unregister(self, for: screenID) }
+            screenID = nil
+            anchors = nil
+        }
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            updateRegistration()
+        }
+
+        private func updateRegistration() {
+            guard let screenID else { return }
+            if window != nil { anchors?.register(self, for: screenID) }
+            else { anchors?.unregister(self, for: screenID) }
+        }
+    }
+}
+
 struct DeviceSettingsView: View {
     @State private var path: [ScreenSettingsRoute] = []
     @State private var renameError: String?
+    @State private var screenDrag: InstalledScreenDrag?
+    @State private var screenDropTarget: String?
+    @StateObject private var screenRowAnchors = InstalledScreenRowAnchors()
+    @State private var reorderError: String?
+
+    private struct InstalledScreenDrag: Equatable {
+        let screenID: String
+        let owner: String
+    }
     @State private var customConnectionToRemove: ScreenSettingsRoute?
     @State private var customConnectionError: String?
     @ObservedObject var model: DeviceModel
@@ -1563,8 +1645,11 @@ struct DeviceSettingsView: View {
         .onChange(of: selection) {
             if let page = $0 { model.settingsPage = page }
             if $0 != .account { showBilling = false }
+            if $0 != .screens { clearScreenDrag() }
         }
         .onChange(of: model.permissionOwner) { _ in
+            clearScreenDrag()
+            reorderError = nil
             path.removeAll(); screenToRemove = nil
             linkedConflictToDiscard = nil; linkedConflictError = nil
             customConnectionToRemove = nil; customConnectionError = nil
@@ -1798,6 +1883,9 @@ struct DeviceSettingsView: View {
                     showBilling = true
                 }
                 Section("On this device") {
+                    if let reorderError {
+                        Text(reorderError).foregroundStyle(.red)
+                    }
                     ForEach(model.needsAgentSetup ? [] : model.installedScreens) { saved in
                         let owner = model.permissionOwner
                         screenSettingsRow(saved.displayName, id: saved.id, owner: owner,
@@ -1817,6 +1905,7 @@ struct DeviceSettingsView: View {
 
     private func screenSettingsRow(_ title: String, id: String, owner: String, route: ScreenSettingsRoute) -> some View {
         HStack {
+            screenReorderHandle(title, id: id, owner: owner)
             Button {
                 path.append(route)
             } label: {
@@ -1834,6 +1923,88 @@ struct DeviceSettingsView: View {
                     .frame(width: 32, height: 44, alignment: .trailing).contentShape(Rectangle())
             }
             .buttonStyle(.borderless).accessibilityHidden(true)
+        }
+        .background {
+            InstalledScreenRowAnchor(screenID: id, anchors: screenRowAnchors)
+                .allowsHitTesting(false)
+        }
+        .overlay(alignment: dropGoesAfter(id) ? .bottom : .top) {
+            if screenDropTarget == id {
+                Capsule().fill(Color.accentColor).frame(height: 2).allowsHitTesting(false)
+            }
+        }
+    }
+
+    @ViewBuilder private func screenReorderHandle(_ title: String, id: String, owner: String) -> some View {
+        let screens = model.installedScreens
+        let position = screens.firstIndex { $0.id == id }
+        let handle = Image(systemName: "line.3.horizontal")
+            .font(.body.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .frame(width: 44, height: 44, alignment: .leading)
+            .contentShape(Rectangle())
+        if !owner.isEmpty, !model.accountOperationInProgress, screens.count > 1, let position {
+            handle
+                .highPriorityGesture(
+                    DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                        .onChanged { value in
+                            let drag = InstalledScreenDrag(screenID: id, owner: owner)
+                            if screenDrag != drag {
+                                screenDrag = drag
+                                reorderError = nil
+                            }
+                            screenDropTarget = dropTarget(near: value.location, excluding: id)
+                        }
+                        .onEnded { value in
+                            let active = screenDrag == .init(screenID: id, owner: owner)
+                            let target = dropTarget(near: value.location, excluding: id)
+                            let after = target.map(dropGoesAfter) ?? false
+                            clearScreenDrag()
+                            if active, let target { moveInstalledScreen(id, to: target, after: after, owner: owner) }
+                        }
+                )
+                .accessibilityElement()
+                .accessibilityLabel("Reorder " + title)
+                .accessibilityHint("Drag to reorder, or use the move actions.")
+                .accessibilityIdentifier("screen.reorder." + id)
+                .accessibilityActions {
+                    if position > 0 {
+                        Button("Move up") { moveInstalledScreen(id, to: screens[position - 1].id, after: false, owner: owner) }
+                    }
+                    if position + 1 < screens.count {
+                        Button("Move down") { moveInstalledScreen(id, to: screens[position + 1].id, after: true, owner: owner) }
+                    }
+                }
+        } else {
+            handle.opacity(0.45).accessibilityHidden(true)
+        }
+    }
+
+    private func clearScreenDrag() {
+        screenDrag = nil
+        screenDropTarget = nil
+    }
+
+    private func dropGoesAfter(_ targetID: String) -> Bool {
+        guard let sourceID = screenDrag?.screenID,
+              let source = model.installedScreens.firstIndex(where: { $0.id == sourceID }),
+              let target = model.installedScreens.firstIndex(where: { $0.id == targetID }) else { return false }
+        return source < target
+    }
+
+    private func dropTarget(near point: CGPoint, excluding source: String) -> String? {
+        model.installedScreens.first { screen in
+            guard screen.id != source, let frame = screenRowAnchors.frame(for: screen.id) else { return false }
+            return frame.insetBy(dx: -12, dy: -4).contains(point)
+        }?.id
+    }
+
+    private func moveInstalledScreen(_ id: String, to anchorID: String, after: Bool, owner: String) {
+        do {
+            try model.moveInstalledScreen(id, relativeTo: anchorID, after: after, owner: owner)
+            reorderError = nil
+        } catch {
+            reorderError = "Couldn’t move this screen. Check the current order and try again."
         }
     }
 
