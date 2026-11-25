@@ -86,3 +86,14 @@ jobs:
             ${{ env.CI_SCRATCH_ROOT }}/ownership.json
           retention-days: 7
           if-no-files-found: warn
+  apple-required:
+    name: Unsigned Apple build and regressions
+    needs: [apple]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require all five Apple lanes to pass
+        env:
+          APPLE_RESULT: ${{ needs.apple.result }}
+        run: test "$APPLE_RESULT" = success
