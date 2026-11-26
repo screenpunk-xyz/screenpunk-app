@@ -289,6 +289,7 @@ import ScreenpunkLocalTransport
     var supportsRemoteAuthoring: Bool { cloudSupportsRemoteAuthoring && cloudBindingMatches && !cloudAuthorizationRejected }
 
     private var cloudSupportsCustomHTTP = false
+    private var cloudSupportsPublicPageText = false
     @Published private(set) var localAgent: LocalAgentConfiguration?
     @Published private(set) var localSettings: LocalAgentSettingsModel?
     private var profileRepository: LocalProfileRepository?
@@ -912,6 +913,7 @@ import ScreenpunkLocalTransport
             }
             cloudAgentReady = status.agentReady && cloudBindingMatches
             cloudSupportsV2 = status.authoringCapabilities?.supportsV2 == true
+            cloudSupportsPublicPageText = status.authoringCapabilities?.features.contains(AuthoringContract.publicPageTextFeature) == true
             cloudSupportsCredentialRegistration = status.credentialRegistrationVersion == 1 &&
                 status.authoringCapabilities?.features.contains(AuthoringContract.credentialRegistrationFeature) == true
             observeRemoteAuthoringCapability(status)
@@ -1142,6 +1144,7 @@ import ScreenpunkLocalTransport
         cloudSupportsCredentialRegistration = status.credentialRegistrationVersion == 1 &&
             status.authoringCapabilities?.features.contains(AuthoringContract.credentialRegistrationFeature) == true
         cloudSupportsCustomHTTP = status.authoringCapabilities?.features.contains("custom-http-v1") == true
+        cloudSupportsPublicPageText = status.authoringCapabilities?.features.contains(AuthoringContract.publicPageTextFeature) == true
         if cloudAgentReady { agentReady = true }
         let supportsSelectedPackage = cloudSupportsV2 && (!requiresPackageAssets || status.authoringCapabilities?.supportsPackageAssets == true)
         return try resolved(NewRequestRoutePolicy.resolve(preference: routePreference, local: local, cloud: status.agentReady ? .ready(supportsV2: supportsSelectedPackage) : .notReady, requiresV2: requiresV2))
@@ -1413,7 +1416,8 @@ import ScreenpunkLocalTransport
         let supportsCustomHTTP = remoteIntent == nil && preparingV2 && (route == .local || cloudSupportsCustomHTTP)
         let supportsConnectionPrefill = supportsCustomHTTP && route == .cloud && cloudSupportsConnectionPrefill
         let supportsCredentialRegistration = supportsConnectionPrefill && cloudSupportsCredentialRegistration
-        let request = AuthoringRequestV1(requestID: remoteIntent?.operationID ?? UUID().uuidString, createdAt: now, deadlineAt: remoteIntent?.expiresAt ?? now + 10 * 60 * 1000, designGuidance: AuthoringContract.designGuidance(supportsScreenData: supportsScreenData, supportsCustomHTTP: supportsCustomHTTP, supportsConnectionPrefill: supportsConnectionPrefill, supportsCredentialRegistration: supportsCredentialRegistration), runtime: AuthoringContract.runtime(supportsScreenData: supportsScreenData, supportsCustomHTTP: supportsCustomHTTP, supportsConnectionPrefill: supportsConnectionPrefill, supportsCredentialRegistration: supportsCredentialRegistration), services: services, preferences: remoteIntent == nil ? library.preferences(profileID: profileID, deviceID: deviceID, screenID: screenID) : [], context: .init(profileID: profileID, deviceID: deviceID, screenID: screenID, baseRevision: screen?.revision, userRequest: text, currentScreen: source, viewport: .init(width: size.width, height: size.height, scale: scale, orientation: size.width > size.height ? "landscape" : "portrait")), delivery: .init(route: route.rawValue))
+        let supportsPublicPageText = route == .local || (preparingV2 && cloudSupportsPublicPageText)
+        let request = AuthoringRequestV1(requestID: remoteIntent?.operationID ?? UUID().uuidString, createdAt: now, deadlineAt: remoteIntent?.expiresAt ?? now + 10 * 60 * 1000, designGuidance: AuthoringContract.designGuidance(supportsScreenData: supportsScreenData, supportsCustomHTTP: supportsCustomHTTP, supportsConnectionPrefill: supportsConnectionPrefill, supportsCredentialRegistration: supportsCredentialRegistration, supportsPublicPageText: supportsPublicPageText), runtime: AuthoringContract.runtime(supportsScreenData: supportsScreenData, supportsCustomHTTP: supportsCustomHTTP, supportsConnectionPrefill: supportsConnectionPrefill, supportsCredentialRegistration: supportsCredentialRegistration, supportsPublicPageText: supportsPublicPageText), services: services, preferences: remoteIntent == nil ? library.preferences(profileID: profileID, deviceID: deviceID, screenID: screenID) : [], context: .init(profileID: profileID, deviceID: deviceID, screenID: screenID, baseRevision: screen?.revision, userRequest: text, currentScreen: source, viewport: .init(width: size.width, height: size.height, scale: scale, orientation: size.width > size.height ? "landscape" : "portrait")), delivery: .init(route: route.rawValue))
         return preparingV2 ? request : try AuthoringContract.seal(request)
     }
     private func measureRequestApply(_ requestID: String, _ apply: () throws -> ApplicationReceiptV1) rethrows -> ApplicationReceiptV1 {
@@ -2279,8 +2283,16 @@ import ScreenpunkLocalTransport
         let gate = missingConnections.filter { $0.customAlias == nil }
         return !gate.isEmpty && gate.allSatisfy { $0.kind == .publicData }
     }
-    var currentPublicDataOrigins: [String] {
-        Array(Set(manifest?.connections.compactMap { $0.publicHTTP?.origin } ?? [])).sorted()
+    var currentPublicDataScopes: [String] {
+        let scopes = manifest?.connections.compactMap(\.publicHTTP).flatMap { declaration in
+            declaration.operations.map { operation in
+                operation.response == "text" ? "GET " + declaration.origin + operation.scopeDescription : declaration.origin
+            }
+        } ?? []
+        return Array(Set(scopes)).sorted()
+    }
+    var currentPublicDataIncludesPages: Bool {
+        manifest?.connections.contains { $0.publicHTTP?.operations.contains { $0.response == "text" } == true } == true
     }
     func allowCurrentPublicData() {
         guard canAllowCurrentPublicData, let manifest else { return }
@@ -2333,7 +2345,7 @@ import ScreenpunkLocalTransport
 
     private func publicApprovalKey(_ manifest: DashboardManifest) -> String? {
         guard let owner = activeProfile?.permissionOwner else { return nil }
-        return PublicDataApprovalStore.key(owner: owner, dashboardID: manifest.dashboardId, connections: manifest.connections)
+        return PublicDataApprovalStore.key(owner: owner, dashboardID: manifest.dashboardId, connections: manifest.connections, revision: manifest.revision)
     }
     func publicDataAllowed(_ manifest: DashboardManifest) -> Bool {
         publicApprovalKey(manifest).map { UserDefaults.standard.bool(forKey: $0) } ?? false
@@ -2349,7 +2361,7 @@ import ScreenpunkLocalTransport
         guard key != publicReadSessionKey else { return }
         publicReads?.cancel(); publicReads = nil; publicReadSessionKey = key
         if let approved {
-            do { publicReads = try PublicReadSession(provisioning: PublicReadProvisioning(manifest: approved)) }
+            do { publicReads = try PublicReadSession(provisioning: PublicReadProvisioning(manifest: approved), allowsPageText: true) }
             catch { message = "This screen’s public data configuration is invalid." }
         }
     }
@@ -2714,6 +2726,7 @@ import ScreenpunkLocalTransport
         listenerStatusPump.cancel()
         cloudListenerObservations.clearSocket()
         cloudAgentReady = false; cloudSupportsV2 = false
+        cloudSupportsPublicPageText = false
         if releaseRemoteCapability {
             cloudSupportsRemoteAuthoring = false
             remoteAuthoringPump.cancel()
@@ -3094,6 +3107,7 @@ import ScreenpunkLocalTransport
         remoteAuthoringPump.cancel()
         credentialRegistrationRemovalTask?.cancel()
         cloudSupportsCustomHTTP = false
+        cloudSupportsPublicPageText = false
         library = nil; cloudAuthoring = nil; localAuthoring = nil; localTransport = nil; cloudAuthoringV2 = nil; localAuthoringV2 = nil; localTransportV2 = nil; localTransportAuthoringProfileID = nil; cloudAgentReady = false; cloudSupportsV2 = false; pendingID = nil; pendingScreenID = nil; consumedID = nil
         cancelledLocally = []; inventorySignature = nil
         installedManifests = []; installedScreens = []; hiddenScreenIDs = []; manifestIssues = [:]; onboarding = nil

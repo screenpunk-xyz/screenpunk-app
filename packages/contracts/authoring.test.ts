@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import {
   AUTHORING_DEFINITION, AUTHORING_REQUEST_SCHEMA, AUTHORING_RESULT_SCHEMA, AUTHORING_RESULT_LIMITS,
   canonicalJSON, authoringSnapshotDigest, sealAuthoringRequest, verifyAuthoringRequestDigest,
+  authoringDesignGuidance, authoringRuntime, PUBLIC_PAGE_TEXT_FEATURE,
   validateAuthoringRequest, validateAuthoringResult, validatePreferenceRecord, validateApplicationReceipt, validateAuthoringScreen,
 } from "./authoring";
 import { makeAuthoringRequestV2, validateAuthoringRequestV2, validateAuthoringResultV2, verifyAuthoringRequestDigestV2 } from "./authoring-v2";
@@ -15,6 +16,18 @@ function changed(value: any, change: any) {
   return copy;
 }
 describe("canonical authoring v1 shared conformance", () => {
+  it("seals opted-in page text guidance for native v1 and v2 requests", async () => {
+    const runtime = authoringRuntime(false, false, false, false, false, true);
+    const designGuidance = authoringDesignGuidance(false, false, false, false, false, true);
+    const request = await sealAuthoringRequest({ ...fixtures.request, context: { ...fixtures.request.context, baseRevision: null }, runtime, designGuidance });
+    expect(request.runtime.features).toContain(PUBLIC_PAGE_TEXT_FEATURE);
+    expect(request.designGuidance.rules.at(-1)).toContain("result.text");
+    expect(await verifyAuthoringRequestDigest(request)).toBe(true);
+    const v2 = await makeAuthoringRequestV2(request, "page-text-library");
+    expect(validateAuthoringRequestV2(v2)).toEqual(v2);
+    expect(() => validateAuthoringRequest({ ...request, designGuidance: fixtures.request.designGuidance }))
+      .toThrow("unsupported guidance/runtime definition");
+  });
   it("round-trips Calendar configuration facts through local and Cloud v1/v2 edits", async () => {
     for (const route of ["local", "cloud"] as const) for (const state of ["yes", "no", "unknown"] as const) {
       const input = structuredClone(fixtures.request);

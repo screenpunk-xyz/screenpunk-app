@@ -38,6 +38,70 @@ final class PublicReadRuntimeTests: XCTestCase {
         XCTAssertTrue(CGImageDestinationFinalize(destination))
         return data as Data
     }
+    func testApprovedPageReturnsOriginalUTF8SourceAndOnlyDeclaredQuery() async throws {
+        let transport = Transport()
+        var config = try provisioning()
+        let page = PublicReadOperation(name: "calendar", path: "/calendar/", response: "text",
+                                       parameters: ["cal_date": .init(location: "query", minimum: 20260101, maximum: 20991201)])
+        config.connections[0].publicHTTP?.operations = [page]
+        let html = Data(("<!DOCTYPE html><time datetime=\"2026-12-14\">Winter &amp; Concert</time>" +
+                         "<script>throw new Error('source only')</script>" + String(repeating: "é", count: 75_000)).utf8)
+        await transport.set(.init(status: 200, body: html, headers: ["content-type": "text/html; charset=utf-8"]))
+        let resolver = FixedResolver(["203.0.113.10"])
+        let disabled = try PublicReadRuntime(provisioning: config, transport: transport, resolver: resolver)
+        let parameters = ["cal_date": "20261201"]
+        do {
+            _ = try await disabled.request(alias: "publicData", operation: "calendar", parameters: parameters)
+            XCTFail("Preview requested a public page")
+        } catch { XCTAssertEqual(error as? ConnectionFailure, .permissionRequired) }
+        let runtime = try PublicReadRuntime(provisioning: config, transport: transport, resolver: resolver, allowsPageText: true)
+        for invalid in [["cal_date": "20261201&other=1"], ["cal_date": "20551201", "other": "1"], [:]] {
+            do {
+                _ = try await runtime.request(alias: "publicData", operation: "calendar", parameters: invalid)
+                XCTFail("Accepted undeclared query")
+            } catch { XCTAssertEqual(error as? ConnectionFailure, .permissionRequired) }
+        }
+        let result = try await runtime.request(alias: "publicData", operation: "calendar", parameters: parameters)
+        XCTAssertEqual(result.state, "fresh")
+        XCTAssertEqual(result.mime, "text/plain")
+        XCTAssertEqual(result.body, html)
+        let requests = await transport.requests
+        let sent = try XCTUnwrap(requests.first)
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(sent.url.absoluteString, "https://data.example.org/calendar/?cal_date=20261201")
+        XCTAssertEqual(sent.method, "GET")
+        XCTAssertNil(sent.body)
+        XCTAssertEqual(Set(sent.headers.keys), ["Accept", "User-Agent"])
+        XCTAssertEqual(sent.maxBytes, 256 * 1024)
+
+        config.connections[0].publicHTTP?.operations = [
+            .init(name: "bad", path: "/pages/{section}", response: "text",
+                  parameters: ["section": .init(location: "path", values: ["calendar"])])
+        ]
+        XCTAssertThrowsError(try config.validate())
+    }
+
+    func testPageRejectsBinaryInvalidUTF8RedirectAndOversize() async throws {
+        var config = try provisioning()
+        config.connections[0].publicHTTP?.operations = [.init(name: "page", path: "/", response: "text")]
+        let cases: [(HTTPTransportResponse, ConnectionFailure)] = [
+            (.init(status: 200, body: Data("text".utf8), headers: ["content-type": "application/json"]), .validationFailed),
+            (.init(status: 200, body: Data([0xff]), headers: ["content-type": "text/plain"]), .validationFailed),
+            (.init(status: 302, body: Data(), headers: ["location": "https://elsewhere.example/"]), .deniedEgress),
+            (.init(status: 200, body: Data(repeating: 65, count: 256 * 1024 + 1), headers: ["content-type": "text/html"]), .sizeLimit)
+        ]
+        for (response, expected) in cases {
+            let transport = Transport()
+            await transport.set(response)
+            let runtime = try PublicReadRuntime(provisioning: config, transport: transport,
+                                                resolver: FixedResolver(["203.0.113.10"]), allowsPageText: true)
+            let result = try await runtime.request(alias: "publicData", operation: "page", parameters: [:])
+            XCTAssertEqual(result.state, "error")
+            XCTAssertEqual(result.code, expected.rawValue)
+            XCTAssertNil(result.body)
+        }
+    }
+
     func testChangingDynamicRasterNamesUseNativeResourcesAndRejectURLInjection() async throws {
         let transport = Transport(); let clock = Clock()
         var config = try provisioning()

@@ -100,7 +100,7 @@ struct DevicePublicDataDetails: View {
                         Section {
                             Text(declaration.origin).font(.headline).textSelection(.enabled)
                             ForEach(declaration.operations, id: \.name) { operation in
-                                LabeledContent(operation.name, value: operation.path).font(.caption)
+                                LabeledContent(operation.name, value: operation.scopeDescription).font(.caption)
                             }
                         }
                     }

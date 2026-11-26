@@ -18,6 +18,7 @@ public struct PublicReadResult: Sendable {
 public actor PublicReadRuntime {
     public static let cacheBytes = 24 * 1024 * 1024
     public nonisolated let aliases: Set<String>
+    public nonisolated let allowsPageText: Bool
     private let provisioning: PublicReadProvisioning
     private let runtime: ConnectionRuntime
     private let isCurrent: @Sendable () -> Bool
@@ -30,8 +31,9 @@ public actor PublicReadRuntime {
     private var epoch = 0
     private struct Entry { var result: PublicReadResult; var used: Date }
     public init(provisioning: PublicReadProvisioning, transport: any HTTPTransport = HomeAssistantHTTPTransport(),
-                resolver: any DestinationResolver = LiteralOrResolvedDestinationResolver(), clock: any PairingClock = SystemClock(), isCurrent: @escaping @Sendable () -> Bool = { true }) throws {
+                resolver: any DestinationResolver = LiteralOrResolvedDestinationResolver(), clock: any PairingClock = SystemClock(), allowsPageText: Bool = false, isCurrent: @escaping @Sendable () -> Bool = { true }) throws {
         try provisioning.validate()
+        self.allowsPageText = allowsPageText
         self.aliases = Set(provisioning.connections.map(\.alias))
         self.provisioning = provisioning; self.isCurrent = isCurrent; self.clock = clock
         runtime = ConnectionRuntime(dashboardId: provisioning.dashboardId, store: MemoryCredentialStore(), http: transport,
@@ -44,7 +46,8 @@ public actor PublicReadRuntime {
     }
     public func request(alias: String, operation: String, parameters: [String: String]) async throws -> PublicReadResult {
         guard isCurrent(), let declaration = provisioning.connections.first(where: { $0.alias == alias })?.publicHTTP,
-              let spec = declaration.operations.first(where: { $0.name == operation }) else { throw ConnectionFailure.permissionRequired }
+              let spec = declaration.operations.first(where: { $0.name == operation }),
+              allowsPageText || spec.response != "text" else { throw ConnectionFailure.permissionRequired }
         let (grant, query) = try declaration.grant(alias: alias, operation: spec, parameters: parameters)
         let key = alias + ":" + operation + ":" + ConnectionPolicy.canonicalParameters(parameters)
         let now = clock.now
@@ -62,9 +65,15 @@ public actor PublicReadRuntime {
             guard pending.count < 4 else { return fallback(key: key, spec: spec, status: 0, code: "busy", retryAfter: 0.25) }
             nextOrigin[declaration.origin] = now.addingTimeInterval(0.1)
             task = Task { [runtime, clock] in
+                let accept: String
+                let maxBytes: Int
+                switch spec.response {
+                case "raster": (accept, maxBytes) = ("image/png,image/jpeg", 4 * 1024 * 1024)
+                case "text": (accept, maxBytes) = ("text/html,text/plain", 256 * 1024)
+                default: (accept, maxBytes) = ("application/geo+json,application/json", 1024 * 1024)
+                }
                 let response = try await runtime.publicRead(grant: grant, parameters: query, userAgent: declaration.userAgent,
-                    accept: spec.response == "raster" ? "image/png,image/jpeg" : "application/geo+json,application/json",
-                    maxBytes: spec.response == "raster" ? 4 * 1024 * 1024 : 1024 * 1024)
+                                                            accept: accept, maxBytes: maxBytes)
                 try Task.checkCancellation()
                 let headers = Dictionary(response.headers.map { ($0.key.lowercased(), $0.value) }, uniquingKeysWith: { _, rhs in rhs })
                 let retry = Self.retryAfter(headers["retry-after"], now: clock.now)
@@ -75,6 +84,11 @@ public actor PublicReadRuntime {
                     return .init(state: "error", status: response.status, retryAfter: retry, code: "http_error")
                 }
                 let mime = (headers["content-type"] ?? "").split(separator: ";").first.map(String.init)?.lowercased() ?? ""
+                if spec.response == "text" {
+                    guard ["text/html", "text/plain"].contains(mime),
+                          String(data: response.body, encoding: .utf8) != nil else { throw ConnectionFailure.validationFailed }
+                    return .init(state: "fresh", body: response.body, mime: "text/plain", fetchedAt: clock.now, status: response.status)
+                }
                 if spec.response == "raster" { try PublicRasterValidator.validate(response.body, mime: mime) }
                 else {
                     guard mime == "application/json" || mime == "application/geo+json" else { throw ConnectionFailure.validationFailed }

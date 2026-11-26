@@ -9,10 +9,16 @@ struct PublicDataApprovalStore {
         self.defaults = defaults
     }
 
-    static func key(owner: String, dashboardID: String, connections: [ManifestConnection]) -> String? {
+    static func key(owner: String, dashboardID: String, connections: [ManifestConnection], revision: String? = nil) -> String? {
         let encoder = JSONEncoder()
         encoder.outputFormatting = .sortedKeys
-        guard let data = try? encoder.encode(connections.filter { $0.publicHTTP != nil }) else { return nil }
+        let declarations = connections.filter { $0.publicHTTP != nil }
+        guard var data = try? encoder.encode(declarations) else { return nil }
+        if declarations.contains(where: { $0.publicHTTP?.operations.contains(where: { $0.response == "text" }) == true }) {
+            guard let revision, !revision.isEmpty else { return nil }
+            data.append(0)
+            data.append(contentsOf: revision.utf8)
+        }
         let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
         return prefix(owner: owner, dashboardID: dashboardID) + digest
     }

@@ -35,6 +35,8 @@ public enum AuthoringContract {
     public static let resultMetadataBytes = 131072
     public static let resultBytes = 393216
 
+    public static let publicPageTextFeature = "public-page-text-v1"
+    public static let publicPageTextRule = "Prefer a documented structured feed when it provides the same information. With public-page-text-v1, a server-rendered public HTTPS page can use publicHTTP with an operation such as {\"name\":\"status\",\"path\":\"/status\",\"response\":\"text\",\"parameters\":{},\"maxAgeSeconds\":900,\"staleSeconds\":3600}. Use the actual fixed path without query or fragment and mark the connection required for an inline approval prompt. If a documented month-paged calendar requires cal_date, declare it as a bounded integer query parameter and pass the documented date value as a string. Call await screenpunk.connections.read(alias, operation, parameters, {signal}) with {} for unparameterized pages and read result.text. The native host fetches UTF-8 HTML or plain text directly and returns the decoded response as text, up to 256 KiB. Website scripts, subresources, forms, sign-in and redirects are unavailable. Parse expected labels or values as inert data. Render only the extracted values with textContent. Never insert response markup into a document. Keep private data in supported native integrations or documented custom HTTP JSON operations whose origin and credentials the user configures in Settings. Refresh on open and when visible on the requested cadence, honor retryAfterSeconds, keep one read in flight, and stop while inactive. After a stale result or transient error, show the timestamped last valid reading, or an unavailable state if there is none. Ask the user to approve the source when permission is required."
     public static let credentialRegistrationFeature = "credential-registration-v1"
     public static let credentialRegistrationRule: String = {
         guard case .object(let config) = AuthoringV2Contract.definition["credentialRegistration"],
@@ -52,23 +54,25 @@ public enum AuthoringContract {
     public static let connectionPrefillRule = "When runtime.features includes custom-http-prefill-v1 and schemaVersion is 2, complete_request may include connectionSetupProposals: [{version:1,alias,declaration,fields}]. Write manifest.json in the same result; declaration must exactly equal that alias’s customHTTP declaration. fields contains only nonsecret declared field IDs and string values validated by their types; include the origin URL. Never include credentials, credential references, tokens, headers, or private-network approvals. These are device-local form suggestions for this request’s device and screen, never saved settings or permission. Existing settings remain unchanged. The user reviews setup and access in native UI before any request."
     public static let customHTTPFeature = "custom-http-v1"
 
-    public static func designGuidance(supportsScreenData: Bool, supportsCustomHTTP: Bool = false, supportsConnectionPrefill: Bool = false, supportsCredentialHandoff: Bool = false, supportsCredentialRegistration: Bool = false) -> AuthoringDesignGuidanceV1 {
+    public static func designGuidance(supportsScreenData: Bool, supportsCustomHTTP: Bool = false, supportsConnectionPrefill: Bool = false, supportsCredentialHandoff: Bool = false, supportsCredentialRegistration: Bool = false, supportsPublicPageText: Bool = false) -> AuthoringDesignGuidanceV1 {
         var guidance = designGuidance
         if supportsScreenData { guidance.rules += definition.screenData?.rules ?? [] }
         if supportsCustomHTTP { guidance.rules += definition.customHTTP?.rules ?? [] }
         if supportsConnectionPrefill { guidance.rules.append(connectionPrefillRule) }
         if supportsCredentialHandoff { guidance.rules.append(credentialHandoffRule) }
         if supportsCredentialRegistration { guidance.rules.append(credentialRegistrationRule) }
+        if supportsPublicPageText { guidance.rules.append(publicPageTextRule) }
         return guidance
     }
 
-    public static func runtime(supportsScreenData: Bool, supportsCustomHTTP: Bool = false, supportsConnectionPrefill: Bool = false, supportsCredentialHandoff: Bool = false, supportsCredentialRegistration: Bool = false) -> AuthoringRuntimeV1 {
+    public static func runtime(supportsScreenData: Bool, supportsCustomHTTP: Bool = false, supportsConnectionPrefill: Bool = false, supportsCredentialHandoff: Bool = false, supportsCredentialRegistration: Bool = false, supportsPublicPageText: Bool = false) -> AuthoringRuntimeV1 {
         var runtime = runtime
         if supportsScreenData { runtime.features += definition.screenData?.features ?? [] }
         if supportsCustomHTTP { runtime.features.append(customHTTPFeature) }
         if supportsConnectionPrefill { runtime.features.append(connectionPrefillFeature) }
         if supportsCredentialHandoff { runtime.features.append(credentialHandoffFeature) }
         if supportsCredentialRegistration { runtime.features.append(credentialRegistrationFeature) }
+        if supportsPublicPageText { runtime.features.append(publicPageTextFeature) }
         return runtime
     }
 
@@ -107,6 +111,7 @@ public enum AuthoringContract {
         let prefill = request.runtime.features.contains(connectionPrefillFeature)
         let handoff = request.runtime.features.contains(credentialHandoffFeature)
         let registration = request.runtime.features.contains(credentialRegistrationFeature)
+        let pageText = request.runtime.features.contains(publicPageTextFeature)
         guard !(handoff || registration) || (prefill && request.delivery.route == "cloud") else {
             throw AuthoringContractError("credential handoff requires Cloud connection prefill")
         }
@@ -114,15 +119,15 @@ public enum AuthoringContract {
         let browser = request.runtime == browserRuntime
         let guidance = browser ? browserDesignGuidance : designGuidance(supportsScreenData: screenData,
             supportsCustomHTTP: customHTTP, supportsConnectionPrefill: prefill,
-            supportsCredentialHandoff: handoff, supportsCredentialRegistration: registration)
+            supportsCredentialHandoff: handoff, supportsCredentialRegistration: registration, supportsPublicPageText: pageText)
         var legacyGuidance: AuthoringDesignGuidanceV1?
-        if !browser, registration, let legacyRule = legacyCredentialRegistrationRule {
+        if !browser, registration, let legacyRule = legacyCredentialRegistrationRule,
+           let index = guidance.rules.firstIndex(of: credentialRegistrationRule) {
             var previous = guidance
-            // The registration rule is appended last. Preserve the exact sealed prior guidance only.
-            previous.rules[previous.rules.count - 1] = legacyRule
+            previous.rules[index] = legacyRule
             legacyGuidance = previous
         }
-        guard request.runtime == (browser ? browserRuntime : runtime(supportsScreenData: screenData, supportsCustomHTTP: customHTTP, supportsConnectionPrefill: prefill, supportsCredentialHandoff: handoff, supportsCredentialRegistration: registration)),
+        guard request.runtime == (browser ? browserRuntime : runtime(supportsScreenData: screenData, supportsCustomHTTP: customHTTP, supportsConnectionPrefill: prefill, supportsCredentialHandoff: handoff, supportsCredentialRegistration: registration, supportsPublicPageText: pageText)),
               request.designGuidance == guidance || request.designGuidance == legacyGuidance else {
             throw AuthoringContractError("unsupported guidance/runtime definition")
         }
