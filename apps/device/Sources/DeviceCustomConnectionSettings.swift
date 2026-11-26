@@ -85,7 +85,14 @@ struct DeviceCustomConnectionSettings: View {
         .onChange(of: editingName) { focused in
             if !focused { saveName() }
         }
-        .task(id: use.screen.revision) { loadSettings() }
+        .task(id: use.screen.revision) {
+            loadSettings()
+            await model.discoverCatalogConnectionSetup(use, owner: owner)
+            if !Task.isCancelled, server.isEmpty, status == nil,
+               let origin = model.customConnectionProposal(use)?.fields[declaration.originField] {
+                fields[declaration.originField] = origin
+            }
+        }
         .task(id: testInProgress) { await testConnection() }
         .onChange(of: model.customHTTPRendererKey) { _ in
             if !editing || model.customConnectionStatus(declaration)?.generation != status?.generation {
