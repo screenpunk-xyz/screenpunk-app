@@ -12,10 +12,10 @@ public final class PublicReadSession: @unchecked Sendable {
     }
     private let lease: Lease
     public init(provisioning: PublicReadProvisioning, transport: any HTTPTransport = HomeAssistantHTTPTransport(),
-                resolver: any DestinationResolver = LiteralOrResolvedDestinationResolver(), isCurrent: @escaping @Sendable () -> Bool = { true }) throws {
+                resolver: any DestinationResolver = LiteralOrResolvedDestinationResolver(), allowsPageText: Bool = false, isCurrent: @escaping @Sendable () -> Bool = { true }) throws {
         let lease = Lease(); self.lease = lease
         let current: @Sendable () -> Bool = { lease.valid() && isCurrent() }
-        runtime = try PublicReadRuntime(provisioning: provisioning, transport: transport, resolver: resolver, isCurrent: current)
+        runtime = try PublicReadRuntime(provisioning: provisioning, transport: transport, resolver: resolver, allowsPageText: allowsPageText, isCurrent: current)
         resources = PublicRasterResources(isCurrent: current)
     }
     public func cancel() { lease.close(); resources.clear(); let runtime = runtime; Task { await runtime.cancel() } }

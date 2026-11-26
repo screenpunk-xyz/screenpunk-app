@@ -83,7 +83,7 @@ final class HomeAssistantWebBridge: NSObject, WKScriptMessageHandler {
 
     func status(_ value: [String: Any]) {
         dispatch(["protocolVersion": 1, "id": "runtime-status", "kind": "event", "method": "runtime.onStatus",
-                  "value": ["active": active, "navigation": value, "homeAssistantTransport": "websocket-with-http", "homeAssistantServiceCalls": 1, "cameraPlayback": 1, "publicReadHTTP": 1, "customHTTP": customHTTP == nil ? 0 : 1, "googleCalendar": 1, "appleMaps": 1, "appleMapsInteractive": 1, "appleMapsTap": 1, "appleMapsLocation": 1, "persistentState": 1, "persistentStateWritable": stateReadOnly ? 0 : 1, "screenData": screenData == nil ? 0 : 1, "googleTVRemote": 1, "googleTVVoice": 1, "googleTVDirectChannels": 1, "googleTVDirectPower": 1, "macIsRuntimeProxy": false]])
+                  "value": ["active": active, "navigation": value, "homeAssistantTransport": "websocket-with-http", "homeAssistantServiceCalls": 1, "cameraPlayback": 1, "publicReadHTTP": 1, "publicPageText": publicReads?.allowsPageText == true ? 1 : 0, "customHTTP": customHTTP == nil ? 0 : 1, "googleCalendar": 1, "appleMaps": 1, "appleMapsInteractive": 1, "appleMapsTap": 1, "appleMapsLocation": 1, "persistentState": 1, "persistentStateWritable": stateReadOnly ? 0 : 1, "screenData": screenData == nil ? 0 : 1, "googleTVRemote": 1, "googleTVVoice": 1, "googleTVDirectChannels": 1, "googleTVDirectPower": 1, "macIsRuntimeProxy": false]])
     }
 
     deinit { let cameras = cameras; let interactiveMaps = interactiveMaps; Task { @MainActor in cameras?.cancel(); interactiveMaps.cancel() } }
@@ -106,7 +106,7 @@ final class HomeAssistantWebBridge: NSObject, WKScriptMessageHandler {
         switch method {
         case "runtime.ready": reply(id: id, value: NSNull())
         case "runtime.onStatus":
-            reply(id: id, value: ["publicReadHTTP": 1, "customHTTP": customHTTP == nil ? 0 : 1, "appleMaps": 1, "appleMapsInteractive": 1, "appleMapsTap": 1, "appleMapsLocation": 1, "persistentState": 1, "persistentStateWritable": stateReadOnly ? 0 : 1, "screenData": screenData == nil ? 0 : 1]); status(navigation?.status ?? [:])
+            reply(id: id, value: ["publicReadHTTP": 1, "publicPageText": publicReads?.allowsPageText == true ? 1 : 0, "customHTTP": customHTTP == nil ? 0 : 1, "appleMaps": 1, "appleMapsInteractive": 1, "appleMapsTap": 1, "appleMapsLocation": 1, "persistentState": 1, "persistentStateWritable": stateReadOnly ? 0 : 1, "screenData": screenData == nil ? 0 : 1]); status(navigation?.status ?? [:])
         case "navigation.get": reply(id: id, value: navigation?.status ?? ["pageId": "default"])
         case "navigation.open":
             guard let parameters = body["parameters"] as? [String: String], parameters.count == 1,
@@ -264,7 +264,9 @@ final class HomeAssistantWebBridge: NSObject, WKScriptMessageHandler {
                         if let retry = result.retryAfter { value["retryAfterSeconds"] = retry }
                         if let code = result.code { value["code"] = code }
                         if let data = result.body {
-                            if result.mime == "image/png" || result.mime == "image/jpeg" {
+                            if result.mime == "text/plain" {
+                                value["text"] = String(decoding: data, as: UTF8.self)
+                            } else if result.mime == "image/png" || result.mime == "image/jpeg" {
                                 value["resourceURL"] = try self.resources?.put(result)
                             } else { value["data"] = try JSONSerialization.jsonObject(with: data, options: .fragmentsAllowed) }
                         }

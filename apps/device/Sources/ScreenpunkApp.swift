@@ -481,12 +481,17 @@ struct DeviceRootView: View {
                 VStack(spacing: 16) {
                     Image(systemName: "link.badge.plus").font(.largeTitle)
                     if model.canAllowCurrentPublicData {
-                        Text("Allow public data?").font(.title2.bold())
+                        Text(model.currentPublicDataIncludesPages ? "Allow public page reads?" : "Allow public data?").font(.title2.bold())
                         Text("This screen reads from these public sources. No account or credentials are sent.")
                             .multilineTextAlignment(.center)
-                        Text(model.currentPublicDataOrigins.joined(separator: "\n"))
-                            .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                        Button("Allow public data", action: model.allowCurrentPublicData).buttonStyle(.borderedProminent)
+                        ScrollView {
+                            Text(model.currentPublicDataScopes.joined(separator: "\n"))
+                                .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                                .frame(maxWidth: .infinity)
+                        }
+                        .frame(maxHeight: 140)
+                        .fixedSize(horizontal: false, vertical: true)
+                        Button(model.currentPublicDataIncludesPages ? "Allow page reads" : "Allow public data", action: model.allowCurrentPublicData).buttonStyle(.borderedProminent)
                         Button("Review sources", action: model.openConnectionSettings)
                     } else if let unsupported = missing.first(where: { $0.unsupportedAlias != nil })?.unsupportedAlias {
                         Text("Connection unavailable").font(.title2.bold())

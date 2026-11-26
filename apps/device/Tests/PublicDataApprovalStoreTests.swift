@@ -4,6 +4,24 @@ import XCTest
 @testable import DeviceAuthoring
 
 final class PublicDataApprovalStoreTests: XCTestCase {
+    func testPageApprovalBindsOwnerDashboardRevisionAndDeclaredOperations() throws {
+        var connection = ManifestConnection(alias: "publicPage", required: true)
+        connection.publicHTTP = .init(origin: "https://public.example.org",
+                                      operations: [.init(name: "page", path: "/calendar", response: "text")])
+        let key = try XCTUnwrap(PublicDataApprovalStore.key(owner: "owner", dashboardID: "dashboard",
+                                                           connections: [connection], revision: "revision-one"))
+        XCTAssertNil(PublicDataApprovalStore.key(owner: "owner", dashboardID: "dashboard", connections: [connection]))
+        for (owner, dashboard, revision) in [("owner-two", "dashboard", "revision-one"),
+                                             ("owner", "dashboard-two", "revision-one"),
+                                             ("owner", "dashboard", "revision-two")] {
+            XCTAssertNotEqual(key, PublicDataApprovalStore.key(owner: owner, dashboardID: dashboard,
+                                                               connections: [connection], revision: revision))
+        }
+        connection.publicHTTP?.operations[0].path = "/another"
+        XCTAssertNotEqual(key, PublicDataApprovalStore.key(owner: "owner", dashboardID: "dashboard",
+                                                           connections: [connection], revision: "revision-one"))
+    }
+
     func testForgettingDeletedScreensRemovesAllDeclarationVariantsForOnlyThoseScreens() throws {
         let suite = "screenpunk-public-approval-tests-" + UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))

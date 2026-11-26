@@ -47,13 +47,27 @@ public struct PublicReadParameter: Codable, Equatable, Sendable {
 public struct PublicReadOperation: Codable, Equatable, Sendable {
     public var name: String
     public var path: String
-    public var response: String // json or raster
+    public var response: String // json, raster, or text
     public var parameters: [String: PublicReadParameter]
     public var maxAgeSeconds: Int
     public var staleSeconds: Int
     public init(name: String, path: String, response: String, parameters: [String: PublicReadParameter] = [:], maxAgeSeconds: Int = 300, staleSeconds: Int = 3600) {
         self.name = name; self.path = path; self.response = response; self.parameters = parameters
         self.maxAgeSeconds = maxAgeSeconds; self.staleSeconds = staleSeconds
+    }
+    public var scopeDescription: String {
+        let query = parameters.keys.sorted().compactMap { key -> String? in
+            guard let rule = parameters[key], rule.location == "query" else { return nil }
+            if let minimum = rule.minimum, let maximum = rule.maximum {
+                return "\(key)=\(minimum)…\(maximum)"
+            }
+            guard let values = rule.values else { return nil }
+            let encoded = values.map { value in
+                String(reflecting: value)
+            }
+            return "\(key)={\(encoded.joined(separator: ", "))}"
+        }
+        return query.isEmpty ? path : path + "?" + query.joined(separator: "&")
     }
     public func resolve(_ supplied: [String: String]) throws -> (path: String, query: [String: String]) {
         guard Set(supplied.keys) == Set(parameters.keys) else { throw ConnectionFailure.permissionRequired }
@@ -63,7 +77,11 @@ public struct PublicReadOperation: Codable, Equatable, Sendable {
             if rule.location == "path" { resolved = resolved.replacingOccurrences(of: "{" + key + "}", with: value) }
             else { query[key] = value }
         }
-        guard resolved.utf8.count <= 512, PublicReadDeclaration.safePath(resolved) else { throw ConnectionFailure.deniedEgress }
+        let validatedPath = response == "text" && resolved != "/" && resolved.hasSuffix("/") ? String(resolved.dropLast()) : resolved
+        guard resolved.utf8.count <= 512,
+              (response == "text" && resolved == "/") || PublicReadDeclaration.safePath(validatedPath) else {
+            throw ConnectionFailure.deniedEgress
+        }
         return (resolved, query)
     }
 }
@@ -89,9 +107,12 @@ public struct PublicReadDeclaration: Codable, Equatable, Sendable {
               (1...256).contains(userAgent.utf8.count), userAgent.unicodeScalars.allSatisfy({ (32...126).contains($0.value) }),
               (1...16).contains(operations.count), Set(operations.map(\.name)).count == operations.count else { throw ConnectionFailure.validationFailed }
         for operation in operations {
-            guard Self.safeComponent(operation.name), ["json", "raster"].contains(operation.response),
+            guard Self.safeComponent(operation.name), ["json", "raster", "text"].contains(operation.response),
                   (1...86400).contains(operation.maxAgeSeconds), (0...604800).contains(operation.staleSeconds),
                   operation.parameters.count <= 12, operation.path.utf8.count <= 512 else { throw ConnectionFailure.validationFailed }
+            if operation.response == "text", operation.parameters.values.contains(where: { $0.location != "query" }) {
+                throw ConnectionFailure.validationFailed
+            }
             if operation.parameters.values.contains(where: { $0.pathSegment != nil }) {
                 // Require an approved literal top-level directory and raster decoding.
                 let prefix = operation.path.split(separator: "/", omittingEmptySubsequences: false)

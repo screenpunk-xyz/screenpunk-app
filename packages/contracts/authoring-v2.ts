@@ -1,5 +1,5 @@
 import definition from './generated/authoring-v2-definition';
-import { AUTHORING_DEFINITION, CUSTOM_HTTP_FEATURE, CONNECTION_PREFILL_FEATURE, CREDENTIAL_HANDOFF_FEATURE, CREDENTIAL_REGISTRATION_FEATURE, AuthoringContractError, canonicalJSON, checkAuthoringManifestScreenData, sealAuthoringRequest, validateAuthoringRequest, validateAuthoringResult, validateAuthoringScreen, type AuthoringRequestV1, type AuthoringResultV1, type AuthoringScreen, type JSONSchema } from './authoring';
+import { AUTHORING_DEFINITION, CUSTOM_HTTP_FEATURE, CONNECTION_PREFILL_FEATURE, CREDENTIAL_HANDOFF_FEATURE, CREDENTIAL_REGISTRATION_FEATURE, PUBLIC_PAGE_TEXT_FEATURE, AuthoringContractError, canonicalJSON, checkAuthoringManifestScreenData, sealAuthoringRequest, validateAuthoringRequest, validateAuthoringResult, validateAuthoringScreen, type AuthoringRequestV1, type AuthoringResultV1, type AuthoringScreen, type JSONSchema } from './authoring';
 export interface AuthoringSourceFileV2 { path: string; mediaType: string; byteLength: number; digest: string; reference: string; content?: string }
 export interface AuthoringSourceScreenV2 { title: string; entry: 'index.html'; files: AuthoringSourceFileV2[]; packageSchema?: 3 }
 export interface AuthoringContextV2 extends Omit<AuthoringRequestV1['context'],'currentScreen'> { libraryID: string; currentScreen?: AuthoringSourceScreenV2 }
@@ -8,7 +8,7 @@ export type AuthoringFileMutationV2 = {kind:'write';path:string;content:string} 
 export interface AuthoringScreenMutationV2 { title:string;entry:'index.html';files:AuthoringFileMutationV2[];deletedPaths:string[];requiredAssets?:string[] }
 export interface AuthoringResultV2 extends Omit<AuthoringResultV1,'schemaVersion'|'screen'> { schemaVersion:2;screen?:AuthoringScreenMutationV2;connectionSetupProposals?:CustomHTTPSetupProposal[] }
 export interface AuthoringCapabilitiesV2 { contractVersions: string[]; features: string[] }
-export const AUTHORING_V2_CAPABILITIES: Readonly<AuthoringCapabilitiesV2> = Object.freeze({contractVersions:Object.freeze(['1','2']) as unknown as string[],features:Object.freeze(['asset-references-v2','package-assets-v2',CUSTOM_HTTP_FEATURE,CONNECTION_PREFILL_FEATURE,CREDENTIAL_HANDOFF_FEATURE,CREDENTIAL_REGISTRATION_FEATURE]) as unknown as string[]});
+export const AUTHORING_V2_CAPABILITIES: Readonly<AuthoringCapabilitiesV2> = Object.freeze({contractVersions:Object.freeze(['1','2']) as unknown as string[],features:Object.freeze(['asset-references-v2','package-assets-v2',CUSTOM_HTTP_FEATURE,CONNECTION_PREFILL_FEATURE,CREDENTIAL_HANDOFF_FEATURE,CREDENTIAL_REGISTRATION_FEATURE,PUBLIC_PAGE_TEXT_FEATURE]) as unknown as string[]});
 export function supportsAuthoringV2(value: unknown): boolean { const v = value as AuthoringCapabilitiesV2 | null; return !!v && Array.isArray(v.contractVersions) && v.contractVersions.includes('2') && Array.isArray(v.features) && v.features.includes('asset-references-v2'); }
 export function supportsAuthoringPackageAssets(value: unknown): boolean {
   return supportsAuthoringV2(value) && (value as AuthoringCapabilitiesV2).features.includes('package-assets-v2');

@@ -33,13 +33,13 @@ export function browserAuthoringDesignGuidance(): AuthoringDesignGuidanceV1 {
 function isBrowserRuntime(runtime: AuthoringRuntimeV1): boolean {
   return canonicalJSON(runtime) === canonicalJSON(AUTHORING_DEFINITION.browser.runtime);
 }
-export function authoringRuntime(supportsScreenData: boolean, supportsCustomHTTP = false, supportsConnectionPrefill = false, supportsCredentialHandoff = false, supportsCredentialRegistration = false): AuthoringRuntimeV1 {
+export function authoringRuntime(supportsScreenData: boolean, supportsCustomHTTP = false, supportsConnectionPrefill = false, supportsCredentialHandoff = false, supportsCredentialRegistration = false, supportsPublicPageText = false): AuthoringRuntimeV1 {
   const { runtime, screenData } = AUTHORING_DEFINITION;
-  return { ...runtime, features: [...runtime.features, ...(supportsScreenData ? screenData.features : []), ...(supportsCustomHTTP ? [CUSTOM_HTTP_FEATURE] : []), ...(supportsConnectionPrefill ? [CONNECTION_PREFILL_FEATURE] : []), ...(supportsCredentialHandoff ? [CREDENTIAL_HANDOFF_FEATURE] : []), ...(supportsCredentialRegistration ? [CREDENTIAL_REGISTRATION_FEATURE] : [])] };
+  return { ...runtime, features: [...runtime.features, ...(supportsScreenData ? screenData.features : []), ...(supportsCustomHTTP ? [CUSTOM_HTTP_FEATURE] : []), ...(supportsConnectionPrefill ? [CONNECTION_PREFILL_FEATURE] : []), ...(supportsCredentialHandoff ? [CREDENTIAL_HANDOFF_FEATURE] : []), ...(supportsCredentialRegistration ? [CREDENTIAL_REGISTRATION_FEATURE] : []), ...(supportsPublicPageText ? [PUBLIC_PAGE_TEXT_FEATURE] : [])] };
 }
-export function authoringDesignGuidance(supportsScreenData: boolean, supportsCustomHTTP = false, supportsConnectionPrefill = false, supportsCredentialHandoff = false, supportsCredentialRegistration = false): AuthoringDesignGuidanceV1 {
+export function authoringDesignGuidance(supportsScreenData: boolean, supportsCustomHTTP = false, supportsConnectionPrefill = false, supportsCredentialHandoff = false, supportsCredentialRegistration = false, supportsPublicPageText = false): AuthoringDesignGuidanceV1 {
   const { designGuidance, screenData } = AUTHORING_DEFINITION;
-  return { ...designGuidance, rules: [...designGuidance.rules, ...(supportsScreenData ? screenData.rules : []), ...(supportsCustomHTTP ? AUTHORING_DEFINITION.customHTTP.rules : []), ...(supportsConnectionPrefill ? [CONNECTION_PREFILL_RULE] : []), ...(supportsCredentialHandoff ? [CREDENTIAL_HANDOFF_RULE] : []), ...(supportsCredentialRegistration ? [CREDENTIAL_REGISTRATION_RULE] : [])] };
+  return { ...designGuidance, rules: [...designGuidance.rules, ...(supportsScreenData ? screenData.rules : []), ...(supportsCustomHTTP ? AUTHORING_DEFINITION.customHTTP.rules : []), ...(supportsConnectionPrefill ? [CONNECTION_PREFILL_RULE] : []), ...(supportsCredentialHandoff ? [CREDENTIAL_HANDOFF_RULE] : []), ...(supportsCredentialRegistration ? [CREDENTIAL_REGISTRATION_RULE] : []), ...(supportsPublicPageText ? [PUBLIC_PAGE_TEXT_RULE] : [])] };
 }
 function inlineSchema(schema: JSONSchema, defs: JSONSchema = schema.$defs): JSONSchema {
   if (schema.$ref) return inlineSchema(defs[schema.$ref.split("/").pop()!], defs);
@@ -127,6 +127,8 @@ function screenBounds(screen: AuthoringScreen): void {
   const manifest = screen.files.find(f => f.path === "manifest.json");
   if (manifest) checkAuthoringManifestScreenData(manifest.content);
 }
+export const PUBLIC_PAGE_TEXT_FEATURE = "public-page-text-v1";
+export const PUBLIC_PAGE_TEXT_RULE = "Prefer a documented structured feed when it provides the same information. With public-page-text-v1, a server-rendered public HTTPS page can use publicHTTP with an operation such as {\"name\":\"status\",\"path\":\"/status\",\"response\":\"text\",\"parameters\":{},\"maxAgeSeconds\":900,\"staleSeconds\":3600}. Use the actual fixed path without query or fragment and mark the connection required for an inline approval prompt. If a documented month-paged calendar requires cal_date, declare it as a bounded integer query parameter and pass the documented date value as a string. Call await screenpunk.connections.read(alias, operation, parameters, {signal}) with {} for unparameterized pages and read result.text. The native host fetches UTF-8 HTML or plain text directly and returns the decoded response as text, up to 256 KiB. Website scripts, subresources, forms, sign-in and redirects are unavailable. Parse expected labels or values as inert data. Render only the extracted values with textContent. Never insert response markup into a document. Keep private data in supported native integrations or documented custom HTTP JSON operations whose origin and credentials the user configures in Settings. Refresh on open and when visible on the requested cadence, honor retryAfterSeconds, keep one read in flight, and stop while inactive. After a stale result or transient error, show the timestamped last valid reading, or an unavailable state if there is none. Ask the user to approve the source when permission is required.";
 export const CREDENTIAL_REGISTRATION_FEATURE = "credential-registration-v1";
 export const CREDENTIAL_REGISTRATION_LEGACY_RULE = "For a Cloud V2 request advertising credential-registration-v1, first complete the request with the matching HTTPS bearer connectionSetupProposals entry. If this is a source you are independently authorized and able to configure to accept a device-generated SHA-256 verifier, call announce_credential_registration with the request ID and alias. Do not announce provider-issued credentials as configurable. The device must separately initiate registration. Do not request or handle the bearer. The agent must independently confirm source configuration and the exact endpoint certificate before reporting success. Manual entry remains available.";
 export const CREDENTIAL_REGISTRATION_RULE = "For a Cloud V2 request advertising credential-registration-v1, complete the request with a matching eligible HTTPS bearer connectionSetupProposals entry. Setup starts only after an explicit action on the device. No advance agent announcement is needed. After receiving assigned registration work, independently verify source authorization and support for device-generated SHA-256 verifiers before making any change. Report unsupported if you verified that no source write was attempted. Do not request or handle the bearer. Confirm source configuration and the exact endpoint certificate before reporting success. Manual entry remains available.";
@@ -250,13 +252,14 @@ export function validateAuthoringRequest(value: unknown, validatingV2 = false): 
   const prefill = request.runtime.features.includes(CONNECTION_PREFILL_FEATURE);
   const handoff = request.runtime.features.includes(CREDENTIAL_HANDOFF_FEATURE);
   const registration = request.runtime.features.includes(CREDENTIAL_REGISTRATION_FEATURE);
+  const pageText = request.runtime.features.includes(PUBLIC_PAGE_TEXT_FEATURE);
   if (registration && (!validatingV2 || !prefill || request.delivery.route !== "cloud"))
     fail("credential registration requires Cloud V2 connection prefill");
   if (handoff && (!prefill || request.delivery.route !== "cloud")) fail("credential handoff requires Cloud connection prefill");
   if (prefill && !customHTTP) fail("prefill requires custom HTTP");
   const browser = isBrowserRuntime(request.runtime);
-  const expectedRuntime = browser ? browserAuthoringRuntime() : authoringRuntime(screenData, customHTTP, prefill, handoff, registration);
-  const expectedGuidance = browser ? browserAuthoringDesignGuidance() : authoringDesignGuidance(screenData, customHTTP, prefill, handoff, registration);
+  const expectedRuntime = browser ? browserAuthoringRuntime() : authoringRuntime(screenData, customHTTP, prefill, handoff, registration, pageText);
+  const expectedGuidance = browser ? browserAuthoringDesignGuidance() : authoringDesignGuidance(screenData, customHTTP, prefill, handoff, registration, pageText);
   const guidance = canonicalJSON(request.designGuidance);
   const legacyRegistrationGuidance = registration ? canonicalJSON({...expectedGuidance,
     rules:expectedGuidance.rules.map(rule => rule === CREDENTIAL_REGISTRATION_RULE ? CREDENTIAL_REGISTRATION_LEGACY_RULE : rule),

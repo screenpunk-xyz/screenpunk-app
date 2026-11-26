@@ -556,6 +556,8 @@ public final class HomeAssistantHTTPTransport: HTTPTransport, @unchecked Sendabl
         config.timeoutIntervalForRequest = 10
         config.timeoutIntervalForResource = 12
         config.httpCookieStorage = nil
+        config.httpShouldSetCookies = false
+        config.urlCredentialStorage = nil
         config.urlCache = nil
         session = URLSession(configuration: config, delegate: RedirectDenyingDelegate(), delegateQueue: nil)
     }
