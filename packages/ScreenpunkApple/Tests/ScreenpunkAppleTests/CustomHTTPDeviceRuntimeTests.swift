@@ -218,7 +218,6 @@ final class CustomHTTPDeviceRuntimeTests: XCTestCase {
     }
 
     func testVerifierRegistrationStagesWithoutReplacingAndRequiresExactReview() throws {
-        guard #available(iOS 18, macOS 15, *) else { throw XCTSkip("Certificate pin reviews unavailable") }
         let (vault, manifest, declaration) = try configured()
         let saved = try XCTUnwrap(vault.status(owner: owner, declaration: declaration))
         let context = try registrationContext(declaration: declaration, origin: "https://new.test",
@@ -258,7 +257,6 @@ final class CustomHTTPDeviceRuntimeTests: XCTestCase {
     }
 
     func testInlineCertificateReviewSavesAndGrantsOnlyTheBoundScreenAtomically() throws {
-        guard #available(iOS 18, macOS 15, *) else { throw XCTSkip("Certificate pin reviews unavailable") }
         let (vault, manifest, declaration) = try configured()
         try vault.remove(owner: owner, serviceID: declaration.id)
         let origin = "https://ready.test"

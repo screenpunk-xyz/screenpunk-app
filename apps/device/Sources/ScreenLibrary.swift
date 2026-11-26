@@ -36,6 +36,7 @@ import ScreenpunkCore
         var catalogPackageSchema: Int? = nil
         var catalogAssetPaths: [String]? = nil
         var displayNameOverride: String? = nil
+        var catalogInstallSource: CatalogCredentialRegistrationSource? = nil
         var displayName: String { displayNameOverride ?? artifact.title }
         var packagePaths: [String] { catalogAssetPaths ?? artifact.files.map(\.path) }
         var hasNativeAssets: Bool { catalogAssetPaths != nil || catalogPackageSchema == 2 }
@@ -314,7 +315,7 @@ import ScreenpunkCore
         try commit(next)
     }
     func store(for screen: Saved) throws -> PackageAssetStore { try PackageAssetStore.load(directory: root.appendingPathComponent(screen.revision)) }
-    func install(_ artifact: ScreenArtifact, requestID: String, replacing id: String?, selectInstalled: Bool = true, preserveRequestHistory: Bool = false, catalogScreenID: String? = nil) throws {
+    func install(_ artifact: ScreenArtifact, requestID: String, replacing id: String?, selectInstalled: Bool = true, preserveRequestHistory: Bool = false, catalogInstallSource: CatalogCredentialRegistrationSource? = nil) throws {
         guard state.lastRequest != requestID else { return }
         guard !(state.cancelledRequests ?? []).contains(requestID), !(state.authoring?.cancelledRequestIDs ?? []).contains(requestID) else { throw DeviceError.message("This request was cancelled on this device.") }
         try Self.validate(artifact)
@@ -330,10 +331,10 @@ import ScreenpunkCore
             }
             _ = try PackageAssetStore.load(directory: directory)
             var next = state
-            let saved = Saved(id: id ?? UUID().uuidString, revision: revision, artifact: artifact)
+            let saved = Saved(id: id ?? UUID().uuidString, revision: revision, artifact: artifact, catalogInstallSource: catalogInstallSource)
             if let position = next.screens.firstIndex(where: { $0.id == saved.id }) { next.previous = next.screens[position]; next.screens[position] = saved }
             else { next.screens.append(saved) }
-            if let catalogScreenID {
+            if let catalogScreenID = catalogInstallSource?.catalogScreenID {
                 if next.catalogScreenIDs == nil { next.catalogScreenIDs = [:] }
                 next.catalogScreenIDs?[saved.id, default: []].insert(catalogScreenID)
             }
@@ -469,6 +470,20 @@ import ScreenpunkCore
 
     var linkedCatalogScreens: [LinkedCatalogInstall] { state.screens.compactMap { state.catalogLinks?[$0.id] } }
     var pendingCatalogUnlinks: [LinkedCatalogInstall] { state.catalogUnlinks ?? [] }
+
+    func catalogCredentialSource(screenID: String, revision: String, binding: CatalogBinding) -> CatalogCredentialRegistrationSource? {
+        guard let screen = state.screens.first(where: { $0.id == screenID && $0.revision == revision }) else { return nil }
+        if let source = screen.catalogInstallSource { return source }
+        // Earlier releases retained the exact version only for linked copies.
+        guard let link = state.catalogLinks?[screenID], link.binding == binding,
+              link.localRevision == revision, link.pendingRevision == nil, !link.conflict else { return nil }
+        return .init(catalogScreenID: link.catalogScreenID, versionID: link.versionID,
+                     sourceRevisionID: link.sourceRevisionID, packageDigest: link.packageDigest)
+    }
+
+    func hasCatalogAssociation(screenID: String) -> Bool {
+        state.catalogScreenIDs?[screenID]?.isEmpty == false
+    }
 
     func hasDiscoverableCatalogProducerCopies(binding: CatalogBinding) -> Bool {
         guard state.catalog?.binding == binding else { return false }
@@ -609,7 +624,9 @@ import ScreenpunkCore
             link.pendingRevision == nil && !link.conflict && state.pendingID == nil && state.submissionKey == nil
     }
 
-    private func commitCatalogInstallation(_ saved: Saved, screen: CatalogScreen, linkedBinding: CatalogBinding?, replacing link: LinkedCatalogInstall?) throws {
+    private func commitCatalogInstallation(_ installed: Saved, screen: CatalogScreen, linkedBinding: CatalogBinding?, replacing link: LinkedCatalogInstall?) throws {
+        var saved = installed
+        saved.catalogInstallSource = Self.catalogRegistrationSource(screen.latest)
         var next = state
         if let link, let index = next.screens.firstIndex(where: { $0.id == link.screenID }) {
             next.screens[index] = saved
@@ -677,11 +694,16 @@ import ScreenpunkCore
         return true
     }
 
+    private static func catalogRegistrationSource(_ version: CatalogVersion) -> CatalogCredentialRegistrationSource {
+        .init(catalogScreenID: version.catalogScreenID, versionID: version.versionID,
+              sourceRevisionID: version.sourceRevisionID, packageDigest: version.packageDigest)
+    }
+
     private func stageCatalogPackage(_ screen: CatalogScreen, package: CatalogPackage, linkedBinding: CatalogBinding?, replacing link: LinkedCatalogInstall?) throws {
         let encoded = try CatalogContract.encodePackage(package)
-        if linkedBinding != nil || link != nil {
-            guard screen.latest.catalogScreenID == screen.catalogScreenID, encoded.count == screen.latest.sizeBytes,
-                  CatalogContract.digest(encoded) == screen.latest.packageDigest else { throw DeviceError.message("The catalog package did not match this version.") }
+        guard screen.latest.catalogScreenID == screen.catalogScreenID, encoded.count == screen.latest.sizeBytes,
+              CatalogContract.digest(encoded) == screen.latest.packageDigest else {
+            throw DeviceError.message("The catalog package did not match this version.")
         }
         guard package.schemaVersion == screen.latest.packageSchema else { throw DeviceError.message("The catalog package format changed.") }
         if package.schemaVersion == 1, linkedBinding == nil, link == nil {
@@ -689,7 +711,7 @@ import ScreenpunkCore
                 guard let bytes = Data(base64Encoded: file.contentBase64), let content = String(data: bytes, encoding: .utf8) else { throw DeviceError.message("The catalog screen contains an invalid file.") }
                 return .init(path: file.path, content: content)
             }
-            try install(.init(title: package.screen.title, entry: package.screen.entry, files: files), requestID: UUID().uuidString, replacing: nil, selectInstalled: false, preserveRequestHistory: true, catalogScreenID: screen.catalogScreenID)
+            try install(.init(title: package.screen.title, entry: package.screen.entry, files: files), requestID: UUID().uuidString, replacing: nil, selectInstalled: false, preserveRequestHistory: true, catalogInstallSource: Self.catalogRegistrationSource(screen.latest))
             return
         }
         // The committed directory owns the exact package bytes.

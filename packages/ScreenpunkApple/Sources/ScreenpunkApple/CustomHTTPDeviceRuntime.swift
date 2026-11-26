@@ -248,7 +248,7 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
                                              registrationID: String, fingerprint: String,
                                              certificatePin: ReviewedCertificatePin, now: Int64,
                                              approveScreenRead: Bool = false, approvalScreenID: String? = nil) throws {
-        guard #available(iOS 18, macOS 15, *), declaration.auth?.mode == "bearer",
+        guard declaration.auth?.mode == "bearer",
               fingerprint == certificatePin.fingerprint else { throw ConnectionFailure.certificateRejected }
         try save(owner: owner, declaration: declaration, fields: fields, secret: nil, allowInsecureHTTP: false,
                  certificatePin: certificatePin, registration: (registrationID, now, approveScreenRead, approvalScreenID))

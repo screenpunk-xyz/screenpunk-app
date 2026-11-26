@@ -1412,10 +1412,7 @@ import ScreenpunkLocalTransport
         let supportsScreenData = remoteIntent == nil && (route == .local || screenDataSocketID != nil)
         let supportsCustomHTTP = remoteIntent == nil && preparingV2 && (route == .local || cloudSupportsCustomHTTP)
         let supportsConnectionPrefill = supportsCustomHTTP && route == .cloud && cloudSupportsConnectionPrefill
-        let supportsCredentialRegistration: Bool
-        if #available(iOS 18, *) {
-            supportsCredentialRegistration = supportsConnectionPrefill && preparingV2 && cloudSupportsCredentialRegistration
-        } else { supportsCredentialRegistration = false }
+        let supportsCredentialRegistration = supportsConnectionPrefill && cloudSupportsCredentialRegistration
         let request = AuthoringRequestV1(requestID: remoteIntent?.operationID ?? UUID().uuidString, createdAt: now, deadlineAt: remoteIntent?.expiresAt ?? now + 10 * 60 * 1000, designGuidance: AuthoringContract.designGuidance(supportsScreenData: supportsScreenData, supportsCustomHTTP: supportsCustomHTTP, supportsConnectionPrefill: supportsConnectionPrefill, supportsCredentialRegistration: supportsCredentialRegistration), runtime: AuthoringContract.runtime(supportsScreenData: supportsScreenData, supportsCustomHTTP: supportsCustomHTTP, supportsConnectionPrefill: supportsConnectionPrefill, supportsCredentialRegistration: supportsCredentialRegistration), services: services, preferences: remoteIntent == nil ? library.preferences(profileID: profileID, deviceID: deviceID, screenID: screenID) : [], context: .init(profileID: profileID, deviceID: deviceID, screenID: screenID, baseRevision: screen?.revision, userRequest: text, currentScreen: source, viewport: .init(width: size.width, height: size.height, scale: scale, orientation: size.width > size.height ? "landscape" : "portrait")), delivery: .init(route: route.rawValue))
         return preparingV2 ? request : try AuthoringContract.seal(request)
     }
@@ -1723,12 +1720,20 @@ import ScreenpunkLocalTransport
     }
     @Published var customConnectionPrompt: CustomConnectionPrompt?
 
-    private func offerCustomConnectionAccess(alias: String, owner: String, revision: String) {
+    private func offerCustomConnectionAccess(alias: String, owner: String, revision: String) async {
         guard !settingsOpen, !accountOperationInProgress, permissionOwner == owner, screen?.revision == revision,
               customConnectionPrompt == nil,
               let use = customConnectionUses().first(where: { $0.alias == alias && $0.screen.revision == revision }),
               !customConnectionApproved(use),
               customHTTPVault.shouldOfferAccess(owner: owner, screenID: customHTTPApprovalScope(use.screen.id), alias: alias, declaration: use.declaration) else { return }
+        if customConnectionStatus(use.declaration) == nil {
+            await discoverCatalogConnectionSetup(use, owner: owner)
+        }
+        guard !settingsOpen, permissionOwner == owner, screen?.revision == revision,
+              customConnectionPrompt == nil, !customConnectionApproved(use),
+              (try? requireCurrentCustomConnection(use, owner: owner)) != nil,
+              customHTTPVault.shouldOfferAccess(owner: owner, screenID: customHTTPApprovalScope(use.screen.id),
+                                               alias: alias, declaration: use.declaration) else { return }
         let status = customConnectionStatus(use.declaration)
         let setupOrigin = status == nil && savedCustomConnections.allSatisfy({ $0.id != use.declaration.id })
             ? suggestedCredentialRegistrationOrigin(use, owner: owner) : nil
@@ -1803,7 +1808,89 @@ import ScreenpunkLocalTransport
         let fingerprint: String?
     }
 
+    private struct CatalogCredentialOffer: Decodable {
+        let status: String
+        let alias: String?
+        let requestID: String?
+        let inputDigest: String?
+        let operationID: String?
+        let origin: String?
+        let readPath: String?
+        let serviceID: String?
+        let declarationDigest: String?
+    }
+
+    private struct CatalogConnectionSetup {
+        let binding: ScreenLibrary.CatalogBinding
+        let generation: UUID
+        let revision: String
+        let installation: CatalogCredentialRegistrationSource
+        let source: ScreenLibrary.CredentialRegistrationSource
+        let proposal: CustomHTTPSetupProposal
+    }
+
+    private var catalogConnectionSetups: [String: CatalogConnectionSetup] = [:]
     private var credentialRegistrationRemovalTask: Task<Void, Never>?
+
+    private func catalogConnectionSetup(_ use: CustomConnectionUse) -> CatalogConnectionSetup? {
+        guard let setup = catalogConnectionSetups[use.id],
+              setup.binding == catalogBinding, setup.generation == connectionGeneration,
+              setup.revision == use.screen.revision, setup.proposal.declaration == use.declaration,
+              setup.installation == catalogCredentialSource(use) else { return nil }
+        return setup
+    }
+
+    private func catalogCredentialBody(_ use: CustomConnectionUse) throws -> [String: Any]? {
+        guard let install = catalogCredentialSource(use) else { return nil }
+        return ["catalogScreenID": install.catalogScreenID, "versionID": install.versionID,
+                "sourceRevisionID": install.sourceRevisionID, "packageDigest": install.packageDigest,
+                "screenID": use.screen.id, "screenRevision": use.screen.revision, "alias": use.alias,
+                "declarationDigest": try CredentialRegistrationContext.declarationDigest(use.declaration)]
+    }
+
+    private func catalogCredentialSource(_ use: CustomConnectionUse) -> CatalogCredentialRegistrationSource? {
+        guard let binding = catalogBinding else { return nil }
+        return library?.catalogCredentialSource(screenID: use.screen.id, revision: use.screen.revision, binding: binding)
+    }
+
+    func discoverCatalogConnectionSetup(_ use: CustomConnectionUse, owner: String) async {
+        guard use.declaration.auth?.mode == "bearer", use.declaration.operations.count == 1,
+              let operation = use.declaration.operations.first, operation.method == "GET", operation.parameters.isEmpty,
+              use.declaration.fields.filter({ $0.type != "secret" }).allSatisfy({ $0.id == use.declaration.originField }),
+              library?.connectionCredentialRegistrationSource(screenID: use.screen.id, revision: use.screen.revision) == nil,
+              (try? requireCurrentCustomConnection(use, owner: owner)) != nil,
+              let installation = catalogCredentialSource(use), let body = try? catalogCredentialBody(use),
+              let binding = catalogBinding,
+              let session = cloud.session, catalogConnectionSetup(use) == nil else { return }
+
+        let generation = connectionGeneration
+        do {
+            try await syncInventory()
+            guard !Task.isCancelled, cloud.session?.accessToken == session.accessToken,
+                  catalogBinding == binding, connectionGeneration == generation else { return }
+            let reply: CatalogCredentialOffer = try await cloud.call(Self.catalogCredentialRegistrationPath,
+                method: "POST", body: body, authorizationToken: session.accessToken, authoringVersion: 2)
+            guard !Task.isCancelled, cloud.session?.accessToken == session.accessToken,
+                  catalogBinding == binding, connectionGeneration == generation,
+                  catalogCredentialSource(use) == installation, reply.status == "available", reply.alias == use.alias, reply.readPath == operation.path,
+                  reply.serviceID == use.declaration.id,
+                  reply.declarationDigest == (body["declarationDigest"] as? String),
+                  let origin = reply.origin, try CredentialRegistrationContext.canonicalHTTPSOrigin(origin) == origin,
+                  let requestID = reply.requestID, CloudClient.validCatalogIdentifier(requestID),
+                  let operationID = reply.operationID, CloudClient.validCatalogIdentifier(operationID),
+                  let digest = reply.inputDigest,
+                  digest.utf8.count == 64,
+                  digest.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else { return }
+            try requireCurrentCustomConnection(use, owner: owner)
+            catalogConnectionSetups[use.id] = .init(binding: binding, generation: generation,
+                revision: use.screen.revision, installation: installation,
+                source: .init(requestID: requestID, inputDigest: digest,
+                    operationID: operationID, deviceID: session.deviceId),
+                proposal: .init(alias: use.alias, declaration: use.declaration, fields: [use.declaration.originField: origin]))
+        } catch {
+            // Cloud availability does not affect restoring or manually configuring a screen.
+        }
+    }
 
     func canProvisionConnectionCredential(_ use: CustomConnectionUse, owner: String, server: String) -> Bool {
         (try? credentialRegistrationContext(use, owner: owner, server: server, deadlineAt: Self.credentialRegistrationNow + 900_000)) != nil
@@ -1830,7 +1917,8 @@ import ScreenpunkLocalTransport
     func beginConnectionCredentialProvisioning(_ use: CustomConnectionUse, owner: String, server: String) async throws -> ProvisioningStatus {
         guard let session = cloud.session else { throw ConnectionFailure.permissionRequired }
         var context = try credentialRegistrationContext(use, owner: owner, server: server, deadlineAt: Self.credentialRegistrationNow + 900_000)
-        let path = Self.credentialRegistrationRequestPath(context.requestID)
+        let catalogBody = catalogConnectionSetup(use) == nil ? nil : try catalogCredentialBody(use)
+        let path = catalogBody == nil ? Self.credentialRegistrationRequestPath(context.requestID) : Self.catalogCredentialRegistrationPath
         if let pending = try customHTTPVault.pendingCredentialRegistration(owner: owner, requestID: context.requestID, alias: use.alias) {
             context = try credentialRegistrationContext(use, owner: owner, server: server, deadlineAt: pending.context.deadlineAt)
             guard pending.context == context, !pending.removalRequested else { throw ConnectionFailure.permissionRequired }
@@ -1839,8 +1927,14 @@ import ScreenpunkLocalTransport
         try await syncInventory()
         try requireCurrentCredentialRegistration(context, use: use, owner: owner, server: server, sessionToken: session.accessToken)
         let pending = try customHTTPVault.prepareCredentialRegistration(owner: owner, context: context, now: Self.credentialRegistrationNow)
-        let body: [String: Any] = ["registrationID": pending.registrationID, "alias": use.alias, "screenRevision": context.revision,
-                                   "verifier": pending.verifier, "deadlineAt": context.deadlineAt]
+        var body = catalogBody ?? ["alias": use.alias, "screenRevision": context.revision]
+        body["registrationID"] = pending.registrationID
+        body["verifier"] = pending.verifier
+        body["deadlineAt"] = context.deadlineAt
+        if catalogBody != nil {
+            body["requestID"] = context.requestID
+            body["origin"] = context.origin
+        }
         let reply: CloudCredentialRegistration = try await cloud.call(path, method: "POST",
             body: body, authorizationToken: session.accessToken, authoringVersion: 2)
         try requireCurrentCredentialRegistration(context, use: use, owner: owner, server: server, sessionToken: session.accessToken)
@@ -1872,6 +1966,9 @@ import ScreenpunkLocalTransport
                 return .init(state: "retry", registrationID: pending.registrationID, origin: pending.context.origin,
                              certificateFingerprint: nil, receipt: nil)
             }
+        }
+        if catalogConnectionSetup(use) != nil {
+            return .init(state: "available", registrationID: "", origin: context.origin, certificateFingerprint: nil, receipt: nil)
         }
         let availability: CloudCredentialRegistration = try await cloud.call(Self.credentialRegistrationRequestPath(context.requestID),
             authorizationToken: session.accessToken, authoringVersion: 2, queryItems: [URLQueryItem(name: "alias", value: use.alias)])
@@ -1954,12 +2051,17 @@ import ScreenpunkLocalTransport
     private func credentialRegistrationContext(_ use: CustomConnectionUse, owner: String, server: String,
                                                deadlineAt: Int64) throws -> CredentialRegistrationContext {
         try requireCurrentCustomConnection(use, owner: owner)
-        guard #available(iOS 18, *) else { throw CredentialRegistrationEligibilityIssue.system }
         guard cloudBindingMatches, let session = cloud.session else { throw CredentialRegistrationEligibilityIssue.session }
-        guard cloudSupportsCredentialRegistration else { throw CredentialRegistrationEligibilityIssue.environment }
+        guard cloudSupportsCredentialRegistration || catalogConnectionSetup(use) != nil else {
+            throw CredentialRegistrationEligibilityIssue.environment
+        }
         guard let operation = use.declaration.operations.first, use.declaration.operations.count == 1,
               operation.method == "GET", operation.parameters.isEmpty, use.declaration.auth?.mode == "bearer" else {
             throw CredentialRegistrationEligibilityIssue.connection
+        }
+        if library?.hasCatalogAssociation(screenID: use.screen.id) == true,
+           catalogCredentialSource(use) == nil, connectionCredentialRegistrationSource(use) == nil {
+            throw CredentialRegistrationEligibilityIssue.catalogVersion
         }
         guard let source = connectionCredentialRegistrationSource(use), source.deviceID == session.deviceId,
               let proposed = customConnectionProposal(use)?.fields[use.declaration.originField] else {
@@ -1973,7 +2075,8 @@ import ScreenpunkLocalTransport
             deviceID: session.deviceId, screenID: use.screen.id, alias: use.alias, serviceID: use.declaration.id,
             origin: origin, readPath: operation.path, declarationDigest: CredentialRegistrationContext.declarationDigest(use.declaration),
             deadlineAt: deadlineAt, revision: use.screen.revision,
-            expectedGeneration: customHTTPVault.serviceGeneration(owner: owner, serviceID: use.declaration.id))
+            expectedGeneration: customHTTPVault.serviceGeneration(owner: owner, serviceID: use.declaration.id),
+            catalogSource: catalogConnectionSetup(use)?.installation)
     }
 
     private func requireCurrentCredentialRegistration(_ context: CredentialRegistrationContext, use: CustomConnectionUse,
@@ -1985,8 +2088,11 @@ import ScreenpunkLocalTransport
     }
 
     private func connectionCredentialRegistrationSource(_ use: CustomConnectionUse) -> ScreenLibrary.CredentialRegistrationSource? {
-        library?.connectionCredentialRegistrationSource(screenID: use.screen.id, revision: use.screen.revision)
+        library?.connectionCredentialRegistrationSource(screenID: use.screen.id, revision: use.screen.revision) ??
+            catalogConnectionSetup(use)?.source
     }
+
+    private static let catalogCredentialRegistrationPath = "api/device/catalog-credential-registration"
 
     private static func credentialRegistrationRequestPath(_ requestID: String) -> String {
         "api/device/requests/" + requestID + "/credential-registration"
@@ -2015,8 +2121,13 @@ import ScreenpunkLocalTransport
                 let path = Self.credentialRegistrationPath(record.registrationID)
                 do {
                     let context = record.context
-                    let binding: [String: Any] = ["requestID": context.requestID, "alias": context.alias,
+                    var binding: [String: Any] = ["requestID": context.requestID, "alias": context.alias,
                                                   "screenRevision": context.revision, "deadlineAt": context.deadlineAt]
+                    if let source = context.catalogSource {
+                        binding["catalog"] = ["catalogScreenID": source.catalogScreenID, "versionID": source.versionID,
+                                              "sourceRevisionID": source.sourceRevisionID, "packageDigest": source.packageDigest,
+                                              "screenID": context.screenID, "declarationDigest": context.declarationDigest]
+                    }
                     let reply: CredentialRegistrationRemovalAcknowledgement = try await cloud.call(path, method: "DELETE",
                         body: binding, authorizationToken: session.accessToken)
                     guard permissionOwner == owner, cloud.session?.accessToken == session.accessToken else { return }
@@ -2050,7 +2161,8 @@ import ScreenpunkLocalTransport
 
     func customConnectionProposal(_ use: CustomConnectionUse) -> CustomHTTPSetupProposal? {
         library?.connectionSetupProposal(screenID: use.screen.id, revision: use.screen.revision,
-                                         alias: use.alias, declaration: use.declaration)
+                                         alias: use.alias, declaration: use.declaration) ??
+            catalogConnectionSetup(use)?.proposal
     }
 
     func connectionName(serviceID: String, fallback: String) -> String {
@@ -2626,6 +2738,7 @@ import ScreenpunkLocalTransport
         remoteAuthoringConsentGeneration = UUID()
         stopTemporaryHomeAssistant()
         connectionGeneration = UUID()
+        catalogConnectionSetups.removeAll()
         resetScreenDataWork(disconnectSocket: false)
         if releaseCloudSocket {
             clearCloudStatusReads()

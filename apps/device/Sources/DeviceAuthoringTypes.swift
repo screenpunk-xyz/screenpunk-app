@@ -587,14 +587,14 @@ enum AuthoringRefreshPolicy {
 }
 
 enum CredentialRegistrationEligibilityIssue: LocalizedError {
-    case system, session, environment, connection, proposal, server
+    case session, environment, connection, proposal, server, catalogVersion
 
     var errorDescription: String? {
         switch self {
-        case .system: return "Automatic setup requires iPadOS 18 or later. You can enter a provider token manually."
         case .session: return "Sign in to the Cloud account that created this screen to use automatic setup."
         case .environment: return "Automatic setup isn’t available in this Screenpunk environment. You can enter a provider token manually."
         case .connection: return "Automatic setup requires a bearer connection with one fixed read operation. You can enter a provider token manually."
+        case .catalogVersion: return "Automatic setup needs the exact catalog version. If this screen follows catalog updates, let it finish syncing and reopen these settings. You can also enter a provider token here."
         case .proposal: return "There’s no matching setup proposal for this screen on this iPad. Update the screen with your Cloud agent or enter a provider token manually."
         case .server: return "Automatic setup uses the HTTPS server from this screen’s setup proposal. Use that server or enter a provider token manually."
         }

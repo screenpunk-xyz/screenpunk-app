@@ -24,6 +24,20 @@ public struct DeviceBearerCredential: Sendable {
     }
 }
 
+public struct CatalogCredentialRegistrationSource: Codable, Equatable, Sendable {
+    public let catalogScreenID: String
+    public let versionID: String
+    public let sourceRevisionID: String
+    public let packageDigest: String
+
+    public init(catalogScreenID: String, versionID: String, sourceRevisionID: String, packageDigest: String) {
+        self.catalogScreenID = catalogScreenID
+        self.versionID = versionID
+        self.sourceRevisionID = sourceRevisionID
+        self.packageDigest = packageDigest
+    }
+}
+
 public struct CredentialRegistrationContext: Codable, Equatable, Sendable {
     public let requestID: String
     public let inputDigest: String
@@ -38,14 +52,15 @@ public struct CredentialRegistrationContext: Codable, Equatable, Sendable {
     public let deadlineAt: Int64
     public let revision: String
     public let expectedGeneration: UUID?
+    public let catalogSource: CatalogCredentialRegistrationSource?
 
     public init(requestID: String, inputDigest: String, operationID: String, deviceID: String, screenID: String, alias: String,
                 serviceID: String, origin: String, readPath: String, declarationDigest: String, deadlineAt: Int64, revision: String,
-                expectedGeneration: UUID?) {
+                expectedGeneration: UUID?, catalogSource: CatalogCredentialRegistrationSource? = nil) {
         self.requestID = requestID; self.inputDigest = inputDigest; self.operationID = operationID
         self.deviceID = deviceID; self.screenID = screenID; self.alias = alias; self.serviceID = serviceID
         self.origin = origin; self.readPath = readPath; self.declarationDigest = declarationDigest; self.deadlineAt = deadlineAt
-        self.revision = revision; self.expectedGeneration = expectedGeneration
+        self.revision = revision; self.expectedGeneration = expectedGeneration; self.catalogSource = catalogSource
     }
 
     public static func canonicalHTTPSOrigin(_ server: String) throws -> String {
