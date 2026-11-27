@@ -47,7 +47,7 @@ public struct CustomHTTPDeclaration: Codable, Equatable, Sendable {
         } else if !secretFields.isEmpty {
             throw ConnectionFailure.validationFailed
         }
-        for operation in operations { try operation.validate(fields: byID) }
+        for operation in operations { try operation.validate(fields: byID, usesBearer: auth?.mode == "bearer") }
     }
 
     static func validateConnectionKeys(_ decoder: Decoder) throws {
@@ -70,7 +70,7 @@ public struct CustomHTTPDeclaration: Codable, Equatable, Sendable {
         }
     }
 
-    static func validateManifest(_ content: String, previous: String? = nil, supported: Bool = true) throws {
+    static func validateManifest(_ content: String, previous: String? = nil, supported: Bool = true, supportsJSONPost: Bool = true) throws {
         struct Extensions: Decodable {
             var connections: [ManifestConnection]?
         }
@@ -86,6 +86,17 @@ public struct CustomHTTPDeclaration: Codable, Equatable, Sendable {
             return decoded.filter { $0.customHTTP != nil }
         }
         let current = try read(content)
+        if !supportsJSONPost {
+            let currentPOST = current.filter { $0.customHTTP?.operations.contains(where: { $0.method == "POST" }) == true }
+            if !currentPOST.isEmpty {
+                let previousPOST = try previous.map(read)?.filter {
+                    $0.customHTTP?.operations.contains(where: { $0.method == "POST" }) == true
+                } ?? []
+                guard previousPOST == currentPOST else {
+                    throw AuthoringContractError("target runtime does not advertise custom HTTP JSON POST")
+                }
+            }
+        }
         if !supported, !current.isEmpty, try previous.map(read) != current {
             throw AuthoringContractError("target runtime does not advertise custom HTTP")
         }
@@ -144,30 +155,38 @@ public struct CustomHTTPOperation: Codable, Equatable, Sendable {
     public var path: String
     public var response: String
     public var parameters: [String: CustomHTTPParameter]
+    public var body: String?
 
     public init(name: String, method: String = "GET", path: String, response: String = "json",
-                parameters: [String: CustomHTTPParameter] = [:]) {
+                parameters: [String: CustomHTTPParameter] = [:], body: String? = nil) {
         self.name = name
         self.method = method
         self.path = path
         self.response = response
         self.parameters = parameters
+        self.body = body
     }
 
-    private enum CodingKeys: String, CodingKey, CaseIterable { case name, method, path, response, parameters }
+    private enum CodingKeys: String, CodingKey, CaseIterable { case name, method, path, response, parameters, body }
     public init(from decoder: Decoder) throws {
         let values = try strict(decoder, keys: CodingKeys.self)
         self.init(name: try values.decode(String.self, forKey: .name), method: try values.decode(String.self, forKey: .method),
                   path: try values.decode(String.self, forKey: .path), response: try values.decode(String.self, forKey: .response),
-                  parameters: try values.decode([String: CustomHTTPParameter].self, forKey: .parameters))
+                  parameters: try values.decode([String: CustomHTTPParameter].self, forKey: .parameters),
+                  body: try values.optional(String.self, .body))
     }
 
-    func validate(fields: [String: CustomHTTPField]) throws {
+    func validate(fields: [String: CustomHTTPField], usesBearer: Bool) throws {
         let components = path.split(separator: "/", omittingEmptySubsequences: false)
-        guard validName(name), method == "GET", response == "json", path.utf8.count <= 512,
+        guard validName(name), response == "json", path.utf8.count <= 512,
               path == "/" || (path.hasPrefix("/") && components.dropFirst().allSatisfy({ part in
                   part != "." && part != ".." && matches(String(part), #"^[A-Za-z0-9._~-]+\z"#, max: 256)
               })), parameters.count <= 12 else { throw ConnectionFailure.validationFailed }
+        if method == "POST" {
+            guard usesBearer, body == "json", parameters.isEmpty else { throw ConnectionFailure.validationFailed }
+            return
+        }
+        guard method == "GET", body == nil else { throw ConnectionFailure.validationFailed }
         for (key, parameter) in parameters {
             guard validName(key), !ConnectionAuthKeys.isOverride(key), !ConnectionAuthKeys.isDestination(key) else {
                 throw ConnectionFailure.validationFailed
@@ -179,6 +198,49 @@ public struct CustomHTTPOperation: Codable, Equatable, Sendable {
                 }
             }
         }
+    }
+
+    /// Bounds the exact object encoded for a native JSON POST.
+    public func validatedJSONBody(_ value: Any) throws -> Data {
+        guard method == "POST", body == "json", parameters.isEmpty, value is [String: Any] else {
+            throw ConnectionFailure.validationFailed
+        }
+        let byteLimit = 48 * 1024
+        var minimumBytes = 0
+        var nodes = 0
+        func countBytes(_ count: Int) throws {
+            guard count <= byteLimit - minimumBytes else { throw ConnectionFailure.validationFailed }
+            minimumBytes += count
+        }
+        func validate(_ item: Any, depth: Int) throws {
+            nodes += 1
+            try countBytes(1)
+            guard depth <= 12, nodes <= 2048 else { throw ConnectionFailure.validationFailed }
+            switch item {
+            case let object as [String: Any]:
+                for (key, child) in object {
+                    guard key.utf8.count <= 128, !ConnectionAuthKeys.isOverride(key),
+                          !ConnectionAuthKeys.isDestination(key),
+                          !["__proto__", "constructor", "prototype"].contains(key.lowercased()) else {
+                        throw ConnectionFailure.validationFailed
+                    }
+                    try countBytes(key.utf8.count)
+                    try validate(child, depth: depth + 1)
+                }
+            case let list as [Any]:
+                for child in list { try validate(child, depth: depth + 1) }
+            case let text as String:
+                try countBytes(text.utf8.count)
+            case let number as NSNumber:
+                guard number.doubleValue.isFinite else { throw ConnectionFailure.validationFailed }
+            case is NSNull: break
+            default: throw ConnectionFailure.validationFailed
+            }
+        }
+        try validate(value, depth: 0)
+        let data = try JSONSerialization.data(withJSONObject: value, options: [.withoutEscapingSlashes])
+        guard data.count <= byteLimit else { throw ConnectionFailure.validationFailed }
+        return data
     }
 }
 

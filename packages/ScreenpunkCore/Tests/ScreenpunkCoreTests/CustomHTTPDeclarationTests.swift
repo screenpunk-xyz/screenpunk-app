@@ -39,4 +39,34 @@ final class CustomHTTPDeclarationTests: XCTestCase {
         XCTAssertNoThrow(try secret.validate("test-token_0123"))
         XCTAssertThrowsError(try secret.validate("value\r\nInjected: header"))
     }
+    func testJSONPostRequiresBearerAndRuntimeFeature() throws {
+        let post = Self.manifest.replacingOccurrences(of: #""method":"GET""#, with: #""method":"POST","body":"json""#)
+            .replacingOccurrences(of: "/telemetry", with: "/v1/chat/completions")
+        let legacy = AuthoringContract.runtime(supportsScreenData: false, supportsCustomHTTP: true)
+        let capable = AuthoringContract.runtime(supportsScreenData: false, supportsCustomHTTP: true, supportsCustomHTTPJSONPost: true)
+        XCTAssertTrue(capable.features.contains(AuthoringContract.customHTTPJSONPostFeature))
+        XCTAssertThrowsError(try AuthoringContract.validateManifest(post, runtime: legacy))
+        XCTAssertNoThrow(try AuthoringContract.validateManifest(post, previous: post, runtime: legacy))
+        XCTAssertNoThrow(try AuthoringContract.validateManifest(post, runtime: capable))
+        for invalid in [
+            post.replacingOccurrences(of: #""body":"json""#, with: #""body":null"#),
+            post.replacingOccurrences(of: #""parameters":{}"#, with: #""parameters":{"model":{"type":"text"}}"#),
+            post.replacingOccurrences(of: #","auth":{"mode":"bearer","field":"credential"}"#, with: "")
+        ] { XCTAssertThrowsError(try AuthoringContract.validateManifest(invalid, runtime: capable)) }
+    }
+
+    func testJSONPostBodyBoundsAndNestedData() throws {
+        let post = CustomHTTPOperation(name: "submit", method: "POST", path: "/v1/chat/completions", body: "json")
+        let request = #"{"model":"synthetic","messages":[{"role":"user","content":"Hello"}],"metadata":{"optional":null,"enabled":true,"score":0.25}}"#
+        let decoded = try JSONSerialization.jsonObject(with: Data(request.utf8))
+        let encoded = try post.validatedJSONBody(decoded)
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: encoded) as? NSDictionary, decoded as? NSDictionary)
+        for invalid: Any in [[], ["messages":[["Authorization":"synthetic"]]], ["Headers":[:]], ["n":Double.infinity],
+                             ["oversize":String(repeating:"x", count:48*1024)],
+                             ["nested": (0..<13).reduce(0 as Any) { child, _ in [child] }]] {
+            XCTAssertThrowsError(try post.validatedJSONBody(invalid))
+        }
+        let read = CustomHTTPOperation(name: "status", path: "/status")
+        XCTAssertThrowsError(try read.validatedJSONBody(decoded))
+    }
 }

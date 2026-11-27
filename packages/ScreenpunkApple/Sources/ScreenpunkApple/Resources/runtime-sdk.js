@@ -2,6 +2,12 @@
 "use strict";
 (function (global) {
 const BRIDGE_TIMEOUT_MS = 15000;
+const JSON_POST_TIMEOUT_MS = 65000;
+const JSON_POST_BODY_BYTES = 48 * 1024;
+const JSON_POST_RESERVED_KEYS = new Set([
+    "authorization", "x-api-key", "token", "password", "access_token", "api_key", "apikey", "secret",
+    "path", "url", "host", "origin", "method", "headers", "scheme", "port", "__proto__", "constructor", "prototype"
+]);
 const BRIDGE_MESSAGE_BYTES = 64 * 1024;
 const SCREEN_DATA_BYTES = 16 * 1024;
 const SCREEN_DATA_DEPTH = 16;
@@ -105,7 +111,7 @@ function createDashboardClient(options = {}) {
         }
         waiter.resolve(message);
     });
-    function sendRequest(method, fields = {}) {
+    function sendRequest(method, fields = {}, deadlineMs = timeoutMs) {
         if (disposed)
             return Promise.reject(new BridgeClientError("validation_failed", "disposed"));
         const parameters = fields.parameters ?? {};
@@ -132,7 +138,7 @@ function createDashboardClient(options = {}) {
                     catch { }
                 }
                 reject(new BridgeClientError("render_timeout", "bridge_timeout"));
-            }, fields.alias === "googleTV" && (fields.operation === "voice" || fields.operation === "launchChannel" || fields.operation === "togglePower") ? Math.max(timeoutMs, 45000) : timeoutMs);
+            }, fields.alias === "googleTV" && (fields.operation === "voice" || fields.operation === "launchChannel" || fields.operation === "togglePower") ? Math.max(deadlineMs, 45000) : deadlineMs);
             pending.set(id, { resolve, reject, timer });
             try {
                 transport.send(message);
@@ -301,7 +307,16 @@ function createDashboardClient(options = {}) {
                 fire("connections.release", { parameters: { resourceURL } });
             },
             async request(alias, operation, parameters = {}) {
-                const response = await sendRequest("connections.request", { alias, operation, parameters });
+                const bodyDescriptor = Object.getOwnPropertyDescriptor(parameters ?? {}, "body");
+                const isJSONPost = bodyDescriptor && typeof bodyDescriptor.value !== "string";
+                let deadline;
+                if (isJSONPost) {
+                    if (Reflect.ownKeys(parameters).length !== 1 || !bodyDescriptor.enumerable || !("value" in bodyDescriptor))
+                        throw new BridgeClientError("validation_failed");
+                    parameters = { body: jsonPostBody(bodyDescriptor.value) };
+                    deadline = options.timeoutMs ?? JSON_POST_TIMEOUT_MS;
+                }
+                const response = await sendRequest("connections.request", { alias, operation, parameters }, deadline);
                 return { value: response.value, stale: response.stale === true };
             },
             subscribe(alias, operation, parameters, listener) {
@@ -465,6 +480,53 @@ function screenDataJSON(value) {
     const json = copy(value, 0);
     if (new TextEncoder().encode(JSON.stringify(json)).length > SCREEN_DATA_BYTES) invalid();
     return json;
+}
+function jsonPostBody(value) {
+    const plain = item => item !== null && typeof item === "object" &&
+        (Object.getPrototypeOf(item) === Object.prototype || Object.getPrototypeOf(item) === null);
+    const invalid = () => { throw new BridgeClientError("validation_failed"); };
+    const encoder = new TextEncoder();
+    let nodes = 0;
+    let minimumBytes = 0;
+    const countBytes = count => { if ((minimumBytes += count) > JSON_POST_BODY_BYTES) invalid(); };
+    function copy(item, depth) {
+        countBytes(1);
+        if (++nodes > 2048 || depth > 12)
+            invalid();
+        if (item === null || typeof item === "boolean" || (typeof item === "number" && Number.isFinite(item)))
+            return item;
+        if (typeof item === "string") {
+            countBytes(encoder.encode(item).byteLength);
+            return item;
+        }
+        if (Array.isArray(item)) {
+            if (item.length > 2048 || Reflect.ownKeys(item).length !== item.length + 1)
+                invalid();
+            return Array.from({ length: item.length }, (_, index) => read(item, index, depth));
+        }
+        if (!plain(item))
+            invalid();
+        const result = Object.create(null);
+        for (const key of Reflect.ownKeys(item)) {
+            if (typeof key !== "string" || encoder.encode(key).byteLength > 128 || JSON_POST_RESERVED_KEYS.has(key.toLowerCase()))
+                invalid();
+            countBytes(encoder.encode(key).byteLength);
+            result[key] = read(item, key, depth);
+        }
+        return result;
+    }
+    function read(object, key, depth) {
+        const descriptor = Object.getOwnPropertyDescriptor(object, key);
+        if (!descriptor?.enumerable || !("value" in descriptor))
+            invalid();
+        return copy(descriptor.value, depth + 1);
+    }
+    if (!plain(value))
+        invalid();
+    const body = copy(value, 0);
+    if (encoder.encode(JSON.stringify(body)).byteLength > JSON_POST_BODY_BYTES)
+        invalid();
+    return body;
 }
 function assertSafeParameters(parameters) {
     for (const key of Object.keys(parameters)) {

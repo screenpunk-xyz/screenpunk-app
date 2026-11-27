@@ -53,8 +53,9 @@ public enum AuthoringContract {
     public static let connectionPrefillFeature = "custom-http-prefill-v1"
     public static let connectionPrefillRule = "When runtime.features includes custom-http-prefill-v1 and schemaVersion is 2, complete_request may include connectionSetupProposals: [{version:1,alias,declaration,fields}]. Write manifest.json in the same result; declaration must exactly equal that alias’s customHTTP declaration. fields contains only nonsecret declared field IDs and string values validated by their types; include the origin URL. Never include credentials, credential references, tokens, headers, or private-network approvals. These are device-local form suggestions for this request’s device and screen, never saved settings or permission. Existing settings remain unchanged. The user reviews setup and access in native UI before any request."
     public static let customHTTPFeature = "custom-http-v1"
+    public static let customHTTPJSONPostFeature = "custom-http-json-post-v1"
 
-    public static func designGuidance(supportsScreenData: Bool, supportsCustomHTTP: Bool = false, supportsConnectionPrefill: Bool = false, supportsCredentialHandoff: Bool = false, supportsCredentialRegistration: Bool = false, supportsPublicPageText: Bool = false) -> AuthoringDesignGuidanceV1 {
+    public static func designGuidance(supportsScreenData: Bool, supportsCustomHTTP: Bool = false, supportsConnectionPrefill: Bool = false, supportsCredentialHandoff: Bool = false, supportsCredentialRegistration: Bool = false, supportsPublicPageText: Bool = false, supportsCustomHTTPJSONPost: Bool = false) -> AuthoringDesignGuidanceV1 {
         var guidance = designGuidance
         if supportsScreenData { guidance.rules += definition.screenData?.rules ?? [] }
         if supportsCustomHTTP { guidance.rules += definition.customHTTP?.rules ?? [] }
@@ -62,10 +63,11 @@ public enum AuthoringContract {
         if supportsCredentialHandoff { guidance.rules.append(credentialHandoffRule) }
         if supportsCredentialRegistration { guidance.rules.append(credentialRegistrationRule) }
         if supportsPublicPageText { guidance.rules.append(publicPageTextRule) }
+        if supportsCustomHTTPJSONPost, let rule = definition.customHTTP?.jsonPostRule { guidance.rules.append(rule) }
         return guidance
     }
 
-    public static func runtime(supportsScreenData: Bool, supportsCustomHTTP: Bool = false, supportsConnectionPrefill: Bool = false, supportsCredentialHandoff: Bool = false, supportsCredentialRegistration: Bool = false, supportsPublicPageText: Bool = false) -> AuthoringRuntimeV1 {
+    public static func runtime(supportsScreenData: Bool, supportsCustomHTTP: Bool = false, supportsConnectionPrefill: Bool = false, supportsCredentialHandoff: Bool = false, supportsCredentialRegistration: Bool = false, supportsPublicPageText: Bool = false, supportsCustomHTTPJSONPost: Bool = false) -> AuthoringRuntimeV1 {
         var runtime = runtime
         if supportsScreenData { runtime.features += definition.screenData?.features ?? [] }
         if supportsCustomHTTP { runtime.features.append(customHTTPFeature) }
@@ -73,6 +75,7 @@ public enum AuthoringContract {
         if supportsCredentialHandoff { runtime.features.append(credentialHandoffFeature) }
         if supportsCredentialRegistration { runtime.features.append(credentialRegistrationFeature) }
         if supportsPublicPageText { runtime.features.append(publicPageTextFeature) }
+        if supportsCustomHTTPJSONPost { runtime.features.append(customHTTPJSONPostFeature) }
         return runtime
     }
 
@@ -81,7 +84,8 @@ public enum AuthoringContract {
             definition.screenData?.features.allSatisfy(candidate.features.contains) == true
         } ?? true
         try ScreenDataContract.validateManifestDeclaration(content, previous: previous, supportsScreenData: screenData)
-        try CustomHTTPDeclaration.validateManifest(content, previous: previous, supported: runtime?.features.contains(customHTTPFeature) ?? true)
+        try CustomHTTPDeclaration.validateManifest(content, previous: previous, supported: runtime?.features.contains(customHTTPFeature) ?? true,
+            supportsJSONPost: runtime?.features.contains(customHTTPJSONPostFeature) ?? true)
     }
 
     public static func makeServices(observedAt: Int64) -> [AuthoringServiceV1] {
@@ -109,17 +113,19 @@ public enum AuthoringContract {
         let screenData = definition.screenData?.features.allSatisfy(request.runtime.features.contains) == true
         let customHTTP = request.runtime.features.contains(customHTTPFeature)
         let prefill = request.runtime.features.contains(connectionPrefillFeature)
+        let jsonPost = request.runtime.features.contains(customHTTPJSONPostFeature)
         let handoff = request.runtime.features.contains(credentialHandoffFeature)
         let registration = request.runtime.features.contains(credentialRegistrationFeature)
         let pageText = request.runtime.features.contains(publicPageTextFeature)
         guard !(handoff || registration) || (prefill && request.delivery.route == "cloud") else {
             throw AuthoringContractError("credential handoff requires Cloud connection prefill")
         }
+        guard !jsonPost || customHTTP else { throw AuthoringContractError("JSON POST requires custom HTTP") }
         guard !prefill || customHTTP else { throw AuthoringContractError("prefill requires custom HTTP") }
         let browser = request.runtime == browserRuntime
         let guidance = browser ? browserDesignGuidance : designGuidance(supportsScreenData: screenData,
             supportsCustomHTTP: customHTTP, supportsConnectionPrefill: prefill,
-            supportsCredentialHandoff: handoff, supportsCredentialRegistration: registration, supportsPublicPageText: pageText)
+            supportsCredentialHandoff: handoff, supportsCredentialRegistration: registration, supportsPublicPageText: pageText, supportsCustomHTTPJSONPost: jsonPost)
         var legacyGuidance: AuthoringDesignGuidanceV1?
         if !browser, registration, let legacyRule = legacyCredentialRegistrationRule,
            let index = guidance.rules.firstIndex(of: credentialRegistrationRule) {
@@ -127,7 +133,7 @@ public enum AuthoringContract {
             previous.rules[index] = legacyRule
             legacyGuidance = previous
         }
-        guard request.runtime == (browser ? browserRuntime : runtime(supportsScreenData: screenData, supportsCustomHTTP: customHTTP, supportsConnectionPrefill: prefill, supportsCredentialHandoff: handoff, supportsCredentialRegistration: registration, supportsPublicPageText: pageText)),
+        guard request.runtime == (browser ? browserRuntime : runtime(supportsScreenData: screenData, supportsCustomHTTP: customHTTP, supportsConnectionPrefill: prefill, supportsCredentialHandoff: handoff, supportsCredentialRegistration: registration, supportsPublicPageText: pageText, supportsCustomHTTPJSONPost: jsonPost)),
               request.designGuidance == guidance || request.designGuidance == legacyGuidance else {
             throw AuthoringContractError("unsupported guidance/runtime definition")
         }

@@ -341,6 +341,7 @@ public struct AuthoringBrowserProfileV1: Codable, Sendable, Equatable {
 }
 
 public struct AuthoringCustomHTTPDefinition: Codable, Sendable, Equatable {
+    public var jsonPostRule: String?
     public var rules: [String]
 }
 

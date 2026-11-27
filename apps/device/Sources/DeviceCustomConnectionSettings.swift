@@ -22,6 +22,13 @@ struct DeviceCustomConnectionSettings: View {
     @State private var provisioningChecked = false
     @State private var provisioningTask: Task<Void, Never>?
     @State private var provisioningRetry = UUID()
+    @State private var postAccessReview: PostAccessReview?
+
+    private struct PostAccessReview {
+        let use: DeviceModel.CustomConnectionUse
+        let origin: String
+        let generation: UUID
+    }
 
     private struct ProvisioningReview: Identifiable {
         let credential: DeviceModel.ProvisioningStatus
@@ -114,6 +121,20 @@ struct DeviceCustomConnectionSettings: View {
         } message: {
             Text("Screenpunk will ask the source to remove the pending credential. Any currently saved connection stays available.")
         }
+        .alert("Allow sending JSON?", isPresented: Binding(
+            get: { postAccessReview != nil },
+            set: { if !$0 { postAccessReview = nil } }
+        ), presenting: postAccessReview) { review in
+            Button("Cancel", role: .cancel) {}
+            Button("Allow sending JSON") {
+                setScreenAccess(true, use: review.use, generation: review.generation, permitJSONPost: true)
+            }
+        } message: { review in
+            let operations = review.use.declaration.operations.map {
+                $0.name + " " + $0.method + " " + review.origin + $0.path
+            }.joined(separator: "\n")
+            Text("“\(review.use.screen.displayName)” can send JSON, including text you enter, to this server. Requests can incur charges.\n\n\(operations)")
+        }
         .sheet(item: $setupReview) { review in
             credentialReviewSheet(review)
         }
@@ -186,7 +207,7 @@ struct DeviceCustomConnectionSettings: View {
             .disabled(provisioningTask != nil)
             if canProvision || provisioning != nil {
                 automaticCredentialSetup
-            } else if let reason = model.credentialRegistrationUnavailableReason(use, owner: owner, server: server) {
+            } else if !use.sendsJSON, let reason = model.credentialRegistrationUnavailableReason(use, owner: owner, server: server) {
                 Text(reason).font(.footnote).foregroundStyle(.secondary)
             }
             if let error {
@@ -213,7 +234,7 @@ struct DeviceCustomConnectionSettings: View {
     }
 
     @ViewBuilder private var manualTrustFields: some View {
-        if fields[declaration.originField]?.lowercased().hasPrefix("http://") == true {
+        if !use.sendsJSON, fields[declaration.originField]?.lowercased().hasPrefix("http://") == true {
             Toggle("Allow unencrypted access on this local network", isOn: $allowInsecureHTTP)
         }
         if fields[declaration.originField]?.lowercased().hasPrefix("https://") == true {
@@ -429,10 +450,15 @@ struct DeviceCustomConnectionSettings: View {
     private var screenAccess: some View {
         Section {
             ForEach(model.customConnectionUses(serviceID: declaration.id)) { screenUse in
-                let generation = model.customConnectionStatus(screenUse.declaration)?.generation
+                let credential = model.customConnectionStatus(screenUse.declaration)
+                let generation = credential?.generation
                 let allowed = model.customConnectionApproved(screenUse)
                 Toggle(isOn: Binding(get: { model.customConnectionApproved(screenUse) }, set: { enabled in
-                    setScreenAccess(enabled, use: screenUse, generation: generation)
+                    if enabled, screenUse.sendsJSON, let credential {
+                        postAccessReview = .init(use: screenUse, origin: credential.origin, generation: credential.generation)
+                    } else {
+                        setScreenAccess(enabled, use: screenUse, generation: generation)
+                    }
                 })) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(screenUse.screen.displayName).foregroundStyle(.primary)
@@ -445,7 +471,7 @@ struct DeviceCustomConnectionSettings: View {
                 .accessibilityIdentifier("custom-connection.access." + screenUse.id)
                 .id(screenUse.id)
             }
-            if model.customConnectionApproved(use), declaration.operations.contains(where: { $0.parameters.isEmpty }) {
+            if model.customConnectionApproved(use), declaration.operations.contains(where: { $0.method == "GET" && $0.parameters.isEmpty }) {
                 Button(testInProgress ? "Testing connection…" : "Test connection") {
                     testResult = nil
                     testInProgress = true
@@ -459,7 +485,7 @@ struct DeviceCustomConnectionSettings: View {
         } footer: {
             Text(enteringSettings
                  ? "Save the connection settings before allowing a screen. You can turn off existing access here."
-                 : "Allowing a screen lets it read the listed operations using the connection saved on this device.")
+                 : "Each screen needs approval to use the listed operations with the connection saved on this device.")
         }
     }
 
@@ -533,6 +559,9 @@ struct DeviceCustomConnectionSettings: View {
     }
 
     private func validationMessage(usingAutomaticCredential: Bool) -> String? {
+        if use.sendsJSON, (try? CredentialRegistrationContext.canonicalHTTPSOrigin(server)) == nil {
+            return "Enter an HTTPS server address without an operation path."
+        }
         for field in declaration.fields {
             if field.type == "secret" && usingAutomaticCredential { continue }
             if field.type == "secret" && secret.isEmpty {
@@ -591,9 +620,11 @@ struct DeviceCustomConnectionSettings: View {
         error = nil
     }
 
-    private func setScreenAccess(_ allowed: Bool, use: DeviceModel.CustomConnectionUse, generation: UUID?) {
+    private func setScreenAccess(_ allowed: Bool, use: DeviceModel.CustomConnectionUse, generation: UUID?,
+                                 permitJSONPost: Bool = false) {
         do {
-            try model.setCustomConnectionApproved(allowed, use: use, owner: owner, expectedGeneration: generation)
+            try model.setCustomConnectionApproved(allowed, use: use, owner: owner, expectedGeneration: generation,
+                                                  permitJSONPost: permitJSONPost)
             error = nil
         } catch {
             self.error = "Couldn’t change access for this screen. Review the saved connection and try again."

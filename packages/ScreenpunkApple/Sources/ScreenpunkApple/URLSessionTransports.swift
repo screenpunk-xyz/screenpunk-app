@@ -45,6 +45,11 @@ final class RedirectDenyingDelegate: NSObject, URLSessionTaskDelegate, @unchecke
         urlSession(session, didReceive: challenge, completionHandler: completionHandler)
     }
 
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    needNewBodyStream completionHandler: @escaping (InputStream?) -> Void) {
+        completionHandler(nil)
+    }
+
     func urlSession(
         _ session: URLSession,
         task: URLSessionTask,
@@ -88,7 +93,7 @@ public final class URLSessionHTTPTransport: HTTPTransport, @unchecked Sendable {
         try await send(request, diagnose: false)
     }
 
-    func send(_ request: AuthorizedHTTPRequest, diagnose: Bool) async throws -> HTTPTransportResponse {
+    func send(_ request: AuthorizedHTTPRequest, diagnose: Bool, preventBodyReplay: Bool = false) async throws -> HTTPTransportResponse {
         if let pin = delegate.certificatePin,
            !pin.matches(scheme: request.url.scheme, host: request.url.host, port: request.url.port) {
             if diagnose { throw CustomHTTPConnectionTestFailure.certificateRejected }
@@ -96,7 +101,12 @@ public final class URLSessionHTTPTransport: HTTPTransport, @unchecked Sendable {
         }
         var urlRequest = URLRequest(url: request.url, timeoutInterval: request.timeout)
         urlRequest.httpMethod = request.method
-        urlRequest.httpBody = request.body
+        if preventBodyReplay, let body = request.body {
+            urlRequest.httpBodyStream = InputStream(data: body)
+            urlRequest.setValue(String(body.count), forHTTPHeaderField: "Content-Length")
+        } else {
+            urlRequest.httpBody = request.body
+        }
         urlRequest.httpShouldHandleCookies = false
         urlRequest.setValue("application/json", forHTTPHeaderField: "Accept")
         if request.body != nil {

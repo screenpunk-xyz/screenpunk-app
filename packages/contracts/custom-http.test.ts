@@ -46,3 +46,35 @@ describe("custom HTTP declarations", () => {
     expect(() => checkAuthoringManifestScreenData(JSON.stringify(withAuthOverride))).toThrow(/invalid custom HTTP/);
   });
 });
+
+describe("authenticated JSON POST declaration", () => {
+  const describePost = () => {
+    const input = manifest();
+    Object.assign(input.connections[0].customHTTP.operations[0],
+      {method: "POST", path: "/v1/chat/completions", body: "json"});
+    return input;
+  };
+  it("allows a fixed POST path with bearer and an exact runtime opt-in", () => {
+    const input = describePost();
+    const source = JSON.stringify(input);
+    expect(() => checkAuthoringManifestScreenData(source, undefined, true, true, true)).not.toThrow();
+    expect(() => checkAuthoringManifestScreenData(source, undefined, true, true, false)).toThrow(/does not advertise custom HTTP JSON POST/);
+    expect(() => checkAuthoringManifestScreenData(source, source, true, true, false)).not.toThrow();
+    input.connections[0].customHTTP.operations[0].path = "/v1/responses";
+    expect(() => checkAuthoringManifestScreenData(JSON.stringify(input), source, true, true, false)).toThrow(/does not advertise/);
+    expect(() => checkAuthoringManifestScreenData(JSON.stringify(input), source, true, true, true)).not.toThrow();
+  });
+  it("requires bearer, empty parameters and a distinct body mode", () => {
+    for (const changes of [{body:null}, {body:"text"}, {body:undefined}, {method:"GET"},
+      {parameters:{model:{type:"text"}}}, {path:"/v1/chat/completions?stream=false"}]) {
+      const input = describePost();
+      Object.assign(input.connections[0].customHTTP.operations[0], changes);
+      expect(() => checkAuthoringManifestScreenData(JSON.stringify(input))).toThrow(/invalid custom HTTP/);
+    }
+    const input = describePost();
+    const {auth:_, ...declaration} = input.connections[0].customHTTP;
+    declaration.fields.pop();
+    expect(() => checkAuthoringManifestScreenData(JSON.stringify({connections:[{...input.connections[0],customHTTP:declaration}]})))
+      .toThrow(/invalid custom HTTP/);
+  });
+});

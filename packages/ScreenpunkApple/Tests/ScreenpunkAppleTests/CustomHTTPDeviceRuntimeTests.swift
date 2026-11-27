@@ -12,6 +12,113 @@ final class CustomHTTPDeviceRuntimeTests: XCTestCase {
     private let screenID = "installed-one"
     private let owner = "owner"
 
+    func testJSONPostRequiresExplicitHTTPSReviewAndCannotBeRunByConnectionTest() async throws {
+        let (vault, manifest, declaration) = try postConfiguration()
+        let transport = ProbeTransport(.init(status: 200, body: Data(#"{"answer":"test"}"#.utf8)))
+        let runtime = broker(vault: vault, manifest: manifest, transport: transport)
+        let body: [String: Any] = ["model": "local-model", "messages": [["role": "user", "content": "hello"]]]
+        let generation = try XCTUnwrap(vault.status(owner: owner, declaration: declaration)?.generation)
+
+        XCTAssertThrowsError(try vault.approve(owner: owner, screenID: screenID, manifest: manifest, alias: alias,
+                                               expectedGeneration: generation))
+        XCTAssertThrowsError(try vault.approve(owner: owner, screenID: screenID, manifest: manifest, alias: alias,
+                                               permitJSONPost: true))
+        do { _ = try await runtime.requestJSONPost(alias: alias, operation: "chat", body: body); XCTFail() }
+        catch { XCTAssertEqual(error as? ConnectionFailure, .permissionRequired) }
+        let sendsBeforeApproval = await transport.sends
+        XCTAssertEqual(sendsBeforeApproval, 0)
+
+        try vault.approve(owner: owner, screenID: screenID, manifest: manifest, alias: alias,
+                          expectedGeneration: generation, permitJSONPost: true)
+        do { try await runtime.test(alias: alias, operation: "chat"); XCTFail() }
+        catch { XCTAssertEqual(error as? CustomHTTPConnectionTestFailure, .screenAccessRequired) }
+        do { _ = try await runtime.request(alias: alias, operation: "chat", parameters: [:]); XCTFail() }
+        catch { XCTAssertEqual(error as? ConnectionFailure, .permissionRequired) }
+        do { _ = try await runtime.requestJSONPost(alias: alias, operation: "telemetry", body: body); XCTFail() }
+        catch { XCTAssertEqual(error as? ConnectionFailure, .permissionRequired) }
+        do {
+            _ = try await runtime.requestJSONPost(alias: alias, operation: "chat", body: ["messages": ["fixture-token"]])
+            XCTFail("The configured bearer must remain in the Authorization header")
+        } catch { XCTAssertEqual(error as? ConnectionFailure, .permissionRequired) }
+        let sendsBeforeExplicitRequest = await transport.sends
+        XCTAssertEqual(sendsBeforeExplicitRequest, 0)
+
+        _ = try await runtime.requestJSONPost(alias: alias, operation: "chat", body: body)
+        let captured = await transport.last
+        let sent = try XCTUnwrap(captured)
+        XCTAssertEqual(sent.url.absoluteString, "https://example.test/v1/chat/completions")
+        XCTAssertEqual(sent.method, "POST")
+        XCTAssertEqual(sent.headers["Authorization"], "Bearer fixture-token")
+        XCTAssertEqual(sent.timeout, 60)
+        let decoded = try XCTUnwrap(try JSONSerialization.jsonObject(with: XCTUnwrap(sent.body)) as? [String: Any])
+        XCTAssertEqual(decoded["model"] as? String, "local-model")
+        XCTAssertEqual(decoded["messages"] as? [[String: String]], [["role": "user", "content": "hello"]])
+
+        _ = try await runtime.request(alias: alias, operation: "telemetry", parameters: [:])
+        let get = await transport.last
+        XCTAssertEqual(get?.method, "GET")
+        XCTAssertNil(get?.body)
+        XCTAssertEqual(get?.timeout, TimeInterval(ConnectionBounds.httpTimeoutSeconds))
+
+        var changed = manifest
+        changed.connections[0].customHTTP?.operations[2].path = "/another-path"
+        let changedRuntime = broker(vault: vault, manifest: changed, transport: transport)
+        do { _ = try await changedRuntime.requestJSONPost(alias: alias, operation: "chat", body: body); XCTFail() }
+        catch { XCTAssertEqual(error as? ConnectionFailure, .permissionRequired) }
+
+        try vault.save(owner: owner, declaration: declaration, fields: ["server": "https://other.example.test", "tag": "weekly"],
+                       secret: "different-fixture-token", allowInsecureHTTP: false)
+        XCTAssertFalse(vault.isApproved(owner: owner, screenID: screenID, manifest: manifest, alias: alias))
+        XCTAssertThrowsError(try vault.approve(owner: owner, screenID: screenID, manifest: manifest, alias: alias,
+                                               expectedGeneration: generation, permitJSONPost: true))
+        XCTAssertThrowsError(try vault.save(owner: owner, declaration: declaration, fields: ["server": "http://192.168.0.50", "tag": "weekly"],
+                                            secret: "fixture-token", allowInsecureHTTP: true))
+        let total = await transport.sends
+        XCTAssertEqual(total, 2)
+    }
+
+    func testJSONPostClassifiesOnlySafeUpstreamCodesAndNeverRetries() async throws {
+        let (vault, manifest, declaration) = try postConfiguration()
+        let generation = try XCTUnwrap(vault.status(owner: owner, declaration: declaration)?.generation)
+        try vault.approve(owner: owner, screenID: screenID, manifest: manifest, alias: alias,
+                          expectedGeneration: generation, permitJSONPost: true)
+        let failures: [(Int, String, CustomHTTPPostFailure)] = [
+            (404, #"{"error":{"code":"model_not_found","message":"fixture-token"}}"#, .modelUnavailable),
+            (400, #"{"error":{"code":"model_unavailable","message":"fixture-token"}}"#, .modelUnavailable),
+            (404, #"{"error":{"code":"not_found","message":"model_not_found"}}"#, .rejected),
+            (400, "fixture-token", .rejected),
+            (401, "fixture-token", .unauthorized),
+            (403, "fixture-token", .unauthorized),
+            (429, "fixture-token", .unavailable),
+            (502, "fixture-token", .unavailable)
+        ]
+        for (status, response, expected) in failures {
+            let transport = ProbeTransport(.init(status: status, body: Data(response.utf8)))
+            let runtime = broker(vault: vault, manifest: manifest, transport: transport)
+            do { _ = try await runtime.requestJSONPost(alias: alias, operation: "chat", body: [:] as [String: Any]); XCTFail() }
+            catch { XCTAssertEqual((error as? CustomHTTPPostFailure)?.rawValue, expected.rawValue) }
+            let count = await transport.sends
+            XCTAssertEqual(count, 1)
+        }
+
+        for (status, response, expected) in [(307, "{}", ConnectionFailure.deniedEgress),
+                                             (200, #"{"echo":"Bearer fixture-token"}"#, .permissionRequired)] {
+            let transport = ProbeTransport(.init(status: status, body: Data(response.utf8)))
+            let runtime = broker(vault: vault, manifest: manifest, transport: transport)
+            do { _ = try await runtime.requestJSONPost(alias: alias, operation: "chat", body: [:] as [String: Any]); XCTFail() }
+            catch { XCTAssertEqual(error as? ConnectionFailure, expected) }
+            let count = await transport.sends
+            XCTAssertEqual(count, 1)
+        }
+
+        let dropped = ProbeTransport(.init(status: 200, body: Data())) { throw ConnectionFailure.deviceOffline }
+        let offline = broker(vault: vault, manifest: manifest, transport: dropped)
+        do { _ = try await offline.requestJSONPost(alias: alias, operation: "chat", body: [:] as [String: Any]); XCTFail() }
+        catch { XCTAssertEqual((error as? CustomHTTPPostFailure)?.rawValue, CustomHTTPPostFailure.unavailable.rawValue) }
+        let droppedCount = await dropped.sends
+        XCTAssertEqual(droppedCount, 1)
+    }
+
     func testNativeDiagnosticsClassifyHTTPWithoutChangingTheScreenContract() async throws {
         let (vault, manifest, _) = try configured()
         let body = Data("fixture-token private response".utf8)
@@ -536,6 +643,76 @@ final class CustomHTTPDeviceRuntimeTests: XCTestCase {
         XCTAssertEqual(offline as? String, "device_offline")
         XCTAssertEqual(health, [true, false])
     }
+
+
+    @MainActor
+    func testBundledSDKJSONPostUsesApprovedNativeTransportInLiveWebKit() async throws {
+        _ = NSApplication.shared
+        let (vault, manifest, declaration) = try postConfiguration()
+        let transport = ProbeTransport(.init(status: 200, body: Data(#"{"choices":[{"message":{"content":"Synthetic reply"}}]}"#.utf8)))
+        let runtime = broker(vault: vault, manifest: manifest, transport: transport)
+        let assets = PackageAssetStore(assets: [
+            "index.html": .init(path: "index.html", data: Data("<!doctype html><title>Chat fixture</title>".utf8), mime: "text/html"),
+            "manifest.json": .init(path: "manifest.json", data: try JSONEncoder().encode(manifest), mime: "application/json")
+        ])
+        let coordinator = DashboardWebCoordinator(store: assets, customHTTP: runtime, revision: manifest.revision,
+            onConnectionHealth: { _ in }, onReady: {}, onUnlinkHold: {})
+        let view = coordinator.makeWebView()
+        defer { coordinator.stop() }
+        var loaded = false
+        for _ in 0..<100 {
+            if (try? await view.evaluateJavaScript("document.readyState === 'complete' && !!globalThis.screenpunk?.connections")) as? Bool == true {
+                loaded = true
+                break
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        guard loaded else { return XCTFail("Local WebKit did not load the SDK") }
+
+        let call = """
+        function submit() {
+          return screenpunk.connections.request("generator", "chat", {
+            body: {model: "synthetic-model", messages: [{role: "user", content: "Fixture prompt"}]}
+          });
+        }
+        """
+        let catchError = """
+        try { await submit(); return "unexpected_success"; }
+        catch (error) { return error.code + ":" + error.message; }
+        """
+        let denied = try await view.callAsyncJavaScript(call + "\n" + catchError, arguments: [:], in: nil, contentWorld: .page)
+        XCTAssertTrue((denied as? String)?.hasPrefix("permission_required:") == true)
+        let before = await transport.sends
+        XCTAssertEqual(before, 0)
+        let generation = try XCTUnwrap(vault.status(owner: owner, declaration: declaration)?.generation)
+        try vault.approve(owner: owner, screenID: screenID, manifest: manifest, alias: alias,
+                          expectedGeneration: generation, permitJSONPost: true)
+        let afterApproval = await transport.sends
+        XCTAssertEqual(afterApproval, 0, "Granting access alone cannot submit")
+
+        let success = try await view.callAsyncJavaScript(call + """
+        \nconst result = await submit();
+        return result.value.choices[0].message.content === "Synthetic reply" && result.stale === false;
+        """, arguments: [:], in: nil, contentWorld: .page)
+        XCTAssertEqual(success as? Bool, true)
+        let captured = await transport.last
+        let request = try XCTUnwrap(captured)
+        XCTAssertEqual(request.method, "POST")
+        XCTAssertEqual(request.url.absoluteString, "https://example.test/v1/chat/completions")
+        XCTAssertEqual(request.headers["Authorization"], "Bearer fixture-token")
+        let body = try XCTUnwrap(request.body)
+        let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: body) as? [String: Any])
+        XCTAssertEqual(json["model"] as? String, "synthetic-model")
+        XCTAssertEqual(json["messages"] as? [[String: String]], [["role": "user", "content": "Fixture prompt"]])
+        XCTAssertFalse(String(decoding: body, as: UTF8.self).contains("fixture-token"))
+
+        await transport.setResponse(.init(status: 404, body: Data(#"{"error":{"code":"model_not_found","message":"fixture-private-error"}}"#.utf8)))
+        let missingModel = try await view.callAsyncJavaScript(call + "\n" + catchError, arguments: [:], in: nil, contentWorld: .page)
+        XCTAssertTrue((missingModel as? String)?.hasPrefix("upstream_model_unavailable:") == true)
+        XCTAssertFalse((missingModel as? String)?.contains("fixture-private-error") == true)
+        let count = await transport.sends
+        XCTAssertEqual(count, 2, "The failed POST must not be replayed")
+    }
     #endif
 
     private func configured(origin: String = "https://example.test", allowInsecureHTTP: Bool = false,
@@ -555,6 +732,16 @@ final class CustomHTTPDeviceRuntimeTests: XCTestCase {
         try vault.save(owner: owner, declaration: declaration, fields: ["server": origin, "tag": "weekly"],
                        secret: authenticated ? "fixture-token" : nil, allowInsecureHTTP: allowInsecureHTTP)
         try vault.approve(owner: owner, screenID: screenID, manifest: manifest, alias: alias)
+        return (vault, manifest, declaration)
+    }
+
+    private func postConfiguration() throws -> (CustomHTTPDeviceVault, DashboardManifest, CustomHTTPDeclaration) {
+        let (vault, original, get) = try configured()
+        try vault.revoke(owner: owner, screenID: screenID, alias: alias)
+        var declaration = get
+        declaration.operations.append(.init(name: "chat", method: "POST", path: "/v1/chat/completions", body: "json"))
+        var manifest = original
+        manifest.connections[0].customHTTP = declaration
         return (vault, manifest, declaration)
     }
 

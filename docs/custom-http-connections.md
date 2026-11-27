@@ -2,8 +2,7 @@
 
 A screen can declare a connection when the authoring request advertises
 `custom-http-v1`. The device asks the user to configure the connection and
-approve the screen's declared access. Use this for an API the user asked the
-screen to read. Use the API's documented route and response.
+approve the screen's declared access. Use the API's documented route and response.
 
 ```json
 {
@@ -35,7 +34,56 @@ failures in the screen UI.
 - Supply one `url` field for the origin. Native configuration accepts a scheme, host, and optional port. Local network and insecure HTTP access require user approval. Prefer HTTPS.
 - Declare `auth` only if the API uses bearer authentication. The device asks for the associated secret field and attaches its value natively. Keep entered configuration and credentials out of the manifest, package files, and SDK calls.
 - Other field types are `text`, `number`, `toggle`, and `choice`. Only `choice` fields include an `options` array of distinct strings. All declared configuration fields need values.
-- Name the exact read operations the screen needs. This version supports fixed GET paths returning JSON. Put query inputs in `parameters`. Use `text`, `number`, `toggle`, or `choice` descriptors with `type`, plus `options` for choices. An optional `field` binds the parameter to a configuration field of the same type and options. Supply only unbound parameters as strings in the SDK call. Use decimal notation for numbers and `"true"` or `"false"` for toggles.
+- Name the exact read operations the screen needs. Use a fixed GET path returning JSON. Put query inputs in `parameters`. Use `text`, `number`, `toggle`, or `choice` descriptors with `type`, plus `options` for choices. An optional `field` binds the parameter to a configuration field of the same type and options. Supply only unbound parameters as strings in the SDK call. Use decimal notation for numbers and `"true"` or `"false"` for toggles.
+
+## Authenticated JSON POST
+
+When the authoring request also advertises `custom-http-json-post-v1`, add a
+fixed POST operation to a bearer-authenticated custom HTTP declaration. For
+example, use these operations for a chat provider that documents
+`/v1/chat/completions`:
+
+```json
+[
+  {
+    "name": "complete",
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "response": "json",
+    "parameters": {},
+    "body": "json"
+  }
+]
+```
+
+In a connection with alias `chat`, attach this call to the user’s Send action.
+The example assumes the user chooses a model and supplies the prompt.
+
+```js
+const result = await screenpunk.connections.request("chat", "complete", {
+  body: {
+    model: selectedModel,
+    messages: [{ role: "user", content: prompt }]
+  }
+});
+const answer = result.value.choices?.[0]?.message?.content;
+```
+
+The device requires an HTTPS origin, a bearer entered in native connection
+settings, and approval for the screen. Review the origin and the exact GET and
+POST operations and paths before granting access. The device sends JSON to the
+fixed path with native authorization. Approval alone never submits a request.
+The device does not automatically retry or replay a failed POST. The screen supplies a JSON object
+of up to 48 KiB, including its nested objects and arrays. Keep credentials,
+headers, URLs and other transport settings out of the body. Choose the alias
+and operation from the manifest and omit query parameters.
+
+Show failures from `error.code` in the screen UI. The device reports
+`upstream_model_unavailable`, `upstream_unauthorized`, `upstream_unavailable`
+or `upstream_rejected` for recognized upstream failures. A provider can also
+fail with the existing connection, permission or timeout errors. The call
+supports a complete JSON response. Use the provider's synchronous endpoint
+and omit streaming mode.
 
 ## Request-bound setup proposals
 

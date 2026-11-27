@@ -16,7 +16,7 @@ export interface DurablePreferenceAuthorizationV1 { requestID: string; quote: st
 export interface AuthoringRequestV1 { schemaVersion: 1; requestID: string; createdAt: number; deadlineAt: number; designGuidance: AuthoringDesignGuidanceV1; runtime: AuthoringRuntimeV1; services: AuthoringServiceV1[]; preferences: PreferenceRecordV1[]; context: { profileID: string; deviceID: string; screenID: string; baseRevision: string | null; userRequest: string; currentScreen?: AuthoringScreen; viewport: { width: number; height: number; scale: number; orientation: "portrait" | "landscape" } }; delivery: { route: "cloud" | "fixture" | "local"; contractVersion: "1"; snapshotDigest: string } }
 export interface AuthoringResultV1 { schemaVersion: 1; requestID: string; inputDigest: string; baseRevision: string | null; preferenceRevisions: Record<string, number>; operationID: string; screen?: AuthoringScreen; answer?: string; preferenceMutations?: PreferenceMutationV1[]; durablePreferenceAuthorization?: DurablePreferenceAuthorizationV1 }
 export interface ApplicationReceiptV1 { schemaVersion: 1; requestID: string; operationID: string; inputDigest: string; status: "applied" | "conflict" | "rejected"; appliedAt: number; message?: string }
-export interface AuthoringDefinitionV1 { schemaVersion: 1; designGuidance: AuthoringDesignGuidanceV1; runtime: AuthoringRuntimeV1; browser: {designGuidance: AuthoringDesignGuidanceV1; runtime: AuthoringRuntimeV1}; serviceCatalog: AuthoringServiceDefinitionV1[]; schemas: Record<"Request" | "Result" | "Preference" | "Receipt", JSONSchema>; screenData: { version: 1; features: string[]; rules: string[]; manifestSchema: JSONSchema }; customHTTP: { rules: string[] } }
+export interface AuthoringDefinitionV1 { schemaVersion: 1; designGuidance: AuthoringDesignGuidanceV1; runtime: AuthoringRuntimeV1; browser: {designGuidance: AuthoringDesignGuidanceV1; runtime: AuthoringRuntimeV1}; serviceCatalog: AuthoringServiceDefinitionV1[]; schemas: Record<"Request" | "Result" | "Preference" | "Receipt", JSONSchema>; screenData: { version: 1; features: string[]; rules: string[]; manifestSchema: JSONSchema }; customHTTP: { rules: string[]; jsonPostRule: string } }
 const baseDefinition = definition as unknown as AuthoringDefinitionV1;
 function deepFreeze<T>(value: T): T {
   if (value !== null && typeof value === "object") { for (const item of Object.values(value)) deepFreeze(item); Object.freeze(value); }
@@ -33,13 +33,13 @@ export function browserAuthoringDesignGuidance(): AuthoringDesignGuidanceV1 {
 function isBrowserRuntime(runtime: AuthoringRuntimeV1): boolean {
   return canonicalJSON(runtime) === canonicalJSON(AUTHORING_DEFINITION.browser.runtime);
 }
-export function authoringRuntime(supportsScreenData: boolean, supportsCustomHTTP = false, supportsConnectionPrefill = false, supportsCredentialHandoff = false, supportsCredentialRegistration = false, supportsPublicPageText = false): AuthoringRuntimeV1 {
+export function authoringRuntime(supportsScreenData: boolean, supportsCustomHTTP = false, supportsConnectionPrefill = false, supportsCredentialHandoff = false, supportsCredentialRegistration = false, supportsPublicPageText = false, supportsCustomHTTPJSONPost = false): AuthoringRuntimeV1 {
   const { runtime, screenData } = AUTHORING_DEFINITION;
-  return { ...runtime, features: [...runtime.features, ...(supportsScreenData ? screenData.features : []), ...(supportsCustomHTTP ? [CUSTOM_HTTP_FEATURE] : []), ...(supportsConnectionPrefill ? [CONNECTION_PREFILL_FEATURE] : []), ...(supportsCredentialHandoff ? [CREDENTIAL_HANDOFF_FEATURE] : []), ...(supportsCredentialRegistration ? [CREDENTIAL_REGISTRATION_FEATURE] : []), ...(supportsPublicPageText ? [PUBLIC_PAGE_TEXT_FEATURE] : [])] };
+  return { ...runtime, features: [...runtime.features, ...(supportsScreenData ? screenData.features : []), ...(supportsCustomHTTP ? [CUSTOM_HTTP_FEATURE] : []), ...(supportsConnectionPrefill ? [CONNECTION_PREFILL_FEATURE] : []), ...(supportsCredentialHandoff ? [CREDENTIAL_HANDOFF_FEATURE] : []), ...(supportsCredentialRegistration ? [CREDENTIAL_REGISTRATION_FEATURE] : []), ...(supportsPublicPageText ? [PUBLIC_PAGE_TEXT_FEATURE] : []), ...(supportsCustomHTTPJSONPost ? [CUSTOM_HTTP_JSON_POST_FEATURE] : [])] };
 }
-export function authoringDesignGuidance(supportsScreenData: boolean, supportsCustomHTTP = false, supportsConnectionPrefill = false, supportsCredentialHandoff = false, supportsCredentialRegistration = false, supportsPublicPageText = false): AuthoringDesignGuidanceV1 {
+export function authoringDesignGuidance(supportsScreenData: boolean, supportsCustomHTTP = false, supportsConnectionPrefill = false, supportsCredentialHandoff = false, supportsCredentialRegistration = false, supportsPublicPageText = false, supportsCustomHTTPJSONPost = false): AuthoringDesignGuidanceV1 {
   const { designGuidance, screenData } = AUTHORING_DEFINITION;
-  return { ...designGuidance, rules: [...designGuidance.rules, ...(supportsScreenData ? screenData.rules : []), ...(supportsCustomHTTP ? AUTHORING_DEFINITION.customHTTP.rules : []), ...(supportsConnectionPrefill ? [CONNECTION_PREFILL_RULE] : []), ...(supportsCredentialHandoff ? [CREDENTIAL_HANDOFF_RULE] : []), ...(supportsCredentialRegistration ? [CREDENTIAL_REGISTRATION_RULE] : []), ...(supportsPublicPageText ? [PUBLIC_PAGE_TEXT_RULE] : [])] };
+  return { ...designGuidance, rules: [...designGuidance.rules, ...(supportsScreenData ? screenData.rules : []), ...(supportsCustomHTTP ? AUTHORING_DEFINITION.customHTTP.rules : []), ...(supportsConnectionPrefill ? [CONNECTION_PREFILL_RULE] : []), ...(supportsCredentialHandoff ? [CREDENTIAL_HANDOFF_RULE] : []), ...(supportsCredentialRegistration ? [CREDENTIAL_REGISTRATION_RULE] : []), ...(supportsPublicPageText ? [PUBLIC_PAGE_TEXT_RULE] : []), ...(supportsCustomHTTPJSONPost ? [AUTHORING_DEFINITION.customHTTP.jsonPostRule] : [])] };
 }
 function inlineSchema(schema: JSONSchema, defs: JSONSchema = schema.$defs): JSONSchema {
   if (schema.$ref) return inlineSchema(defs[schema.$ref.split("/").pop()!], defs);
@@ -137,6 +137,7 @@ export const CREDENTIAL_HANDOFF_RULE = "For a Cloud V2 request advertising crede
 export const CONNECTION_PREFILL_FEATURE = "custom-http-prefill-v1";
 export const CONNECTION_PREFILL_RULE = "When runtime.features includes custom-http-prefill-v1 and schemaVersion is 2, complete_request may include connectionSetupProposals: [{version:1,alias,declaration,fields}]. Write manifest.json in the same result; declaration must exactly equal that alias’s customHTTP declaration. fields contains only nonsecret declared field IDs and string values validated by their types; include the origin URL. Never include credentials, credential references, tokens, headers, or private-network approvals. These are device-local form suggestions for this request’s device and screen, never saved settings or permission. Existing settings remain unchanged. The user reviews setup and access in native UI before any request.";
 export const CUSTOM_HTTP_FEATURE = "custom-http-v1";
+export const CUSTOM_HTTP_JSON_POST_FEATURE = "custom-http-json-post-v1";
 const customReservedAliases = new Set(["home", "googletv", "googlecalendar", "applemaps"]);
 const customReservedParameters = new Set([
   "authorization", "x-api-key", "token", "password", "access_token", "api_key", "apikey", "secret",
@@ -152,7 +153,7 @@ const customPath = (value: unknown): boolean => typeof value === "string" && (
   )
 );
 
-function checkCustomHTTPManifest(content: string, previous: string | undefined, supported: boolean): void {
+export function checkCustomHTTPManifest(content: string, previous?: string, supported = true, supportsJSONPost = true): void {
   const path = "$.screen.files.manifest.json";
   const reject = () => fail("invalid custom HTTP declaration", path);
   function object(value: unknown, required: string[], optional: string[] = []): Record<string, any> {
@@ -204,10 +205,14 @@ function checkCustomHTTPManifest(content: string, previous: string | undefined, 
       } else if (secrets.length) reject();
       const names = new Set<string>();
       for (const raw of declaration.operations) {
-        const operation = object(raw, ["name", "method", "path", "response", "parameters"]);
-        if (!customName(operation.name) || names.has(operation.name) || operation.method !== "GET" ||
+        const operation = object(raw, ["name", "method", "path", "response", "parameters"], ["body"]);
+        if (!customName(operation.name) || names.has(operation.name) ||
             operation.response !== "json" || !customPath(operation.path) || !plain(operation.parameters) ||
             Object.keys(operation.parameters).length > 12) reject();
+        if (operation.method === "POST") {
+          if (declaration.auth?.mode !== "bearer" || operation.body !== "json" ||
+              Object.keys(operation.parameters).length !== 0) reject();
+        } else if (operation.method !== "GET" || Object.hasOwn(operation, "body")) reject();
         names.add(operation.name);
         for (const [name, rawParameter] of Object.entries(operation.parameters)) {
           if (!customName(name) || customReservedParameters.has(name.toLowerCase())) reject();
@@ -224,12 +229,20 @@ function checkCustomHTTPManifest(content: string, previous: string | undefined, 
     return custom;
   }
   const current = declarations(content);
+  if (!supportsJSONPost) {
+    const withPOST = (connections: Record<string, any>[]) =>
+      connections.filter(connection => connection.customHTTP.operations.some((operation: {method: string}) => operation.method === "POST"));
+    const post = withPOST(current);
+    if (post.length && canonicalJSON(post) !== canonicalJSON(withPOST(previous === undefined ? [] : declarations(previous)))) {
+      fail("target runtime does not advertise custom HTTP JSON POST", path);
+    }
+  }
   if (!supported && current.length && canonicalJSON(current) !== canonicalJSON(previous === undefined ? [] : declarations(previous))) {
     fail("target runtime does not advertise custom HTTP", path);
   }
 }
 
-export function checkAuthoringManifestScreenData(content: string, previous?: string, supportsScreenData = true, supportsCustomHTTP = true): void {
+export function checkAuthoringManifestScreenData(content: string, previous?: string, supportsScreenData = true, supportsCustomHTTP = true, supportsCustomHTTPJSONPost = true): void {
   const read = (source: string) => {
     try { return validateManifestScreenData(source); } catch { return fail("invalid manifest or screenData declaration", "$.screen.files.manifest.json"); }
   };
@@ -237,7 +250,7 @@ export function checkAuthoringManifestScreenData(content: string, previous?: str
   if (current && !supportsScreenData && canonicalJSON(current) !== canonicalJSON((previous === undefined ? undefined : read(previous)) ?? null)) {
     fail("target runtime does not advertise screen data", "$.screen.files.manifest.json");
   }
-  checkCustomHTTPManifest(content, previous, supportsCustomHTTP);
+  checkCustomHTTPManifest(content, previous, supportsCustomHTTP, supportsCustomHTTPJSONPost);
 }
 export function makeAuthoringServices(observedAt: number): AuthoringServiceV1[] {
   return AUTHORING_DEFINITION.serviceCatalog.map(service => ({id:service.id,provider:service.provider,operations:structuredClone(service.operations),supported:{state:"yes",observedAt},configured:{state:service.provider === "googleCalendar" ? "no" : "unknown",observedAt},authorized:{state:"unknown",observedAt},entitled:{state:"unknown",observedAt},reachable:{state:"unknown",observedAt}}));
@@ -250,16 +263,18 @@ export function validateAuthoringRequest(value: unknown, validatingV2 = false): 
   const screenData = AUTHORING_DEFINITION.screenData.features.every(feature => request.runtime.features.includes(feature));
   const customHTTP = request.runtime.features.includes(CUSTOM_HTTP_FEATURE);
   const prefill = request.runtime.features.includes(CONNECTION_PREFILL_FEATURE);
+  const jsonPost = request.runtime.features.includes(CUSTOM_HTTP_JSON_POST_FEATURE);
   const handoff = request.runtime.features.includes(CREDENTIAL_HANDOFF_FEATURE);
   const registration = request.runtime.features.includes(CREDENTIAL_REGISTRATION_FEATURE);
   const pageText = request.runtime.features.includes(PUBLIC_PAGE_TEXT_FEATURE);
   if (registration && (!validatingV2 || !prefill || request.delivery.route !== "cloud"))
     fail("credential registration requires Cloud V2 connection prefill");
   if (handoff && (!prefill || request.delivery.route !== "cloud")) fail("credential handoff requires Cloud connection prefill");
+  if (jsonPost && !customHTTP) fail("JSON POST requires custom HTTP");
   if (prefill && !customHTTP) fail("prefill requires custom HTTP");
   const browser = isBrowserRuntime(request.runtime);
-  const expectedRuntime = browser ? browserAuthoringRuntime() : authoringRuntime(screenData, customHTTP, prefill, handoff, registration, pageText);
-  const expectedGuidance = browser ? browserAuthoringDesignGuidance() : authoringDesignGuidance(screenData, customHTTP, prefill, handoff, registration, pageText);
+  const expectedRuntime = browser ? browserAuthoringRuntime() : authoringRuntime(screenData, customHTTP, prefill, handoff, registration, pageText, jsonPost);
+  const expectedGuidance = browser ? browserAuthoringDesignGuidance() : authoringDesignGuidance(screenData, customHTTP, prefill, handoff, registration, pageText, jsonPost);
   const guidance = canonicalJSON(request.designGuidance);
   const legacyRegistrationGuidance = registration ? canonicalJSON({...expectedGuidance,
     rules:expectedGuidance.rules.map(rule => rule === CREDENTIAL_REGISTRATION_RULE ? CREDENTIAL_REGISTRATION_LEGACY_RULE : rule),
@@ -306,7 +321,8 @@ export function validateAuthoringResult(value: unknown, request?: AuthoringReque
     if (isBrowserRuntime(request.runtime) && mutations.length) fail("browser runtime does not support preference mutations");
     const manifest = result.screen?.files.find(f => f.path === "manifest.json");
     if (manifest) checkAuthoringManifestScreenData(manifest.content, request.context.currentScreen?.files.find(f => f.path === "manifest.json")?.content,
-      AUTHORING_DEFINITION.screenData.features.every(feature => request.runtime.features.includes(feature)), request.runtime.features.includes(CUSTOM_HTTP_FEATURE));
+      AUTHORING_DEFINITION.screenData.features.every(feature => request.runtime.features.includes(feature)), request.runtime.features.includes(CUSTOM_HTTP_FEATURE),
+      request.runtime.features.includes(CUSTOM_HTTP_JSON_POST_FEATURE));
     if (result.requestID !== request.requestID || result.inputDigest !== request.delivery.snapshotDigest || result.baseRevision !== request.context.baseRevision) fail("result is not bound to request snapshot");
     const revisions = Object.fromEntries(request.preferences.map(p => [p.id,p.revision]));
     if (canonicalJSON(revisions) !== canonicalJSON(result.preferenceRevisions)) fail("preference revisions differ from snapshot");
