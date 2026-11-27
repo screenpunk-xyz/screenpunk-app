@@ -5966,6 +5966,7 @@ export default {
     }
   },
   "customHTTP": {
+    "jsonPostRule": "When runtime.features includes custom-http-json-post-v1, a native HTTPS bearer custom HTTP declaration may add a documented fixed JSON POST operation {name,method:\"POST\",path:\"/relative/path\",response:\"json\",parameters:{},body:\"json\"}. Call await screenpunk.connections.request(alias, operation, {body:{...}}) directly after the user submits. Use a bounded JSON object with no credential or transport override fields. Enter the provider-issued bearer in native Settings and approve access for the screen. Use GET for device-generated credential registration.",
     "rules": [
       "When runtime.features includes custom-http-v1, you may declare a native customHTTP connection in manifest.json for the user’s requested API. Use only documented operations. The device prompts the user for configuration and review. Never place configured host values, credentials, or other entered values in the package. Browser fetch and arbitrary headers are unavailable.",
       "Declare a connection as {alias,required,customHTTP:{id,version,label,fields,originField,auth?,operations}}. id is a stable lowercase identifier, version a positive integer. Field descriptors are {id,label,type,options?}; supported types are url, text, number, toggle, choice and secret. Use one url field for originField. Optionally use exactly one secret field via auth:{mode:\"bearer\",field:\"credential\"}. Only choice fields have options, an array of distinct strings.",

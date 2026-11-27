@@ -132,3 +132,48 @@ describe("device browser SDK", () => {
     expect(host.messages).toHaveLength(0);
   });
 });
+
+describe("device JSON POST SDK", () => {
+  it("passes a nested body with the same request API and preserves legacy string parameters", async () => {
+    const host = sdkHost();
+    host.reply(message => message.operation === "complete" ? {value:{choices:[{message:{content:"Synthetic response"}}]}} : {value:{status:"ok"}});
+    await expect(host.run(`screenpunk.connections.request("chat","complete",{body:{model:"synthetic",
+      messages:[{role:"user",content:"Synthetic prompt"}],metadata:{score:0.5,flag:true,empty:null}}})`))
+      .resolves.toEqual({value:{choices:[{message:{content:"Synthetic response"}}]},stale:false});
+    expect(host.messages[0]).toMatchObject({method:"connections.request",alias:"chat",operation:"complete",parameters:{
+      body:{model:"synthetic",messages:[{role:"user",content:"Synthetic prompt"}],metadata:{score:0.5,flag:true,empty:null}}}});
+    await expect(host.run('screenpunk.connections.request("legacy","status",{body:"query-string"})'))
+      .resolves.toEqual({value:{status:"ok"},stale:false});
+    expect(host.messages[1]?.parameters).toEqual({body:"query-string"});
+    host.reply(() => ({kind:"error",ok:false,code:"upstream_model_unavailable"}));
+    await expect(host.run('screenpunk.connections.request("chat","complete",{body:{model:"synthetic"}})'))
+      .rejects.toMatchObject({code:"upstream_model_unavailable"});
+  });
+
+  it("rejects invalid, oversized and reserved fields before messaging the device", async () => {
+    const host = sdkHost();
+    for (const parameters of ['{body:[]}', '{body:null}', '{body:{metadata:{Authorization:"denied"}}}',
+      '{body:{headers:{}}}', '{body:{bad:NaN}}', '{body:{bad:"x".repeat(48*1024)}}',
+      '{body:{ok:true},option:"x"}', '{body:{get model(){throw new Error("getter executed")}}}']) {
+      await expect(host.run(`screenpunk.connections.request("chat","complete",${parameters})`))
+        .rejects.toMatchObject({code:"validation_failed"});
+    }
+    expect(host.messages).toHaveLength(0);
+  });
+
+  it("gives JSON POST a longer default bridge deadline while preserving GET", async () => {
+    const deadlines: number[] = [];
+    const host = createContext({
+      TextEncoder,
+      setTimeout: (_: () => void, deadline: number) => { deadlines.push(deadline); return deadlines.length; },
+      clearTimeout: () => {},
+    });
+    host.webkit = {messageHandlers:{screenpunk:{postMessage(message: {id: string}) {
+      host.__screenpunkDispatch(JSON.stringify({protocolVersion:1,id:message.id,kind:"response",ok:true,value:{}}));
+    }}}};
+    runInContext(sdk, host);
+    await runInContext('screenpunk.connections.request("legacy","status",{})', host);
+    await runInContext('screenpunk.connections.request("chat","complete",{body:{model:"synthetic"}})', host);
+    expect(deadlines).toEqual([15000, 65000]);
+  });
+});

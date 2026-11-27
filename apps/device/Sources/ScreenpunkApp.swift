@@ -1278,7 +1278,9 @@ private struct CustomConnectionAccessCard: View {
             if registration == nil {
                 let operations = prompt.use.declaration.operations.map(\.name).joined(separator: ", ")
                 let name = model.connectionName(serviceID: prompt.use.declaration.id, fallback: prompt.use.declaration.label)
-                Text("Allow “\(prompt.use.screen.displayName)” to read \(operations) from \(name)?")
+                Text(prompt.use.sendsJSON
+                     ? "Allow “\(prompt.use.screen.displayName)” to send JSON to \(name)?"
+                     : "Allow “\(prompt.use.screen.displayName)” to read \(operations) from \(name)?")
                     .font(.title2.bold()).accessibilityAddTraits(.isHeader)
             } else {
                 Text("Review the server certificate").font(.title2.bold()).accessibilityAddTraits(.isHeader)
@@ -1289,8 +1291,15 @@ private struct CustomConnectionAccessCard: View {
             VStack(alignment: .leading, spacing: 5) {
                 Text("Connection details").font(.subheadline.weight(.semibold))
                 ForEach(prompt.use.declaration.operations, id: \.name) { operation in
+                    if prompt.use.sendsJSON {
+                        Text(verbatim: operation.name).font(.subheadline)
+                    }
                     Text(verbatim: operation.method + " " + operation.path).font(.callout.monospaced())
                 }
+            }
+            if prompt.use.sendsJSON {
+                Text("This screen can send JSON, including text you enter, to the listed server. Requests can incur charges.")
+                    .font(.callout).foregroundStyle(.secondary)
             }
             if let fingerprint = registration?.certificateFingerprint {
                 Text("Your setup agent reported this SHA-256 fingerprint. Verify it belongs to this server before trusting it.")
@@ -1330,7 +1339,8 @@ private struct CustomConnectionAccessCard: View {
     private var primaryButton: some View {
         let hasCertificate = registration?.certificateFingerprint != nil
         let canApprove = !manualSetupRequired && (prompt.status != nil || prompt.setupOrigin != nil)
-        let title = hasCertificate ? "Trust and allow" : canApprove ? "Approve" : "Connection settings"
+        let approval = prompt.use.sendsJSON ? "Allow sending JSON" : "Approve"
+        let title = hasCertificate ? "Trust and allow" : canApprove ? approval : "Connection settings"
         return Button {
             if hasCertificate { action = .trust }
             else if canApprove { allow() }

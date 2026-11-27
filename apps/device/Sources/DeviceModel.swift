@@ -289,6 +289,7 @@ import ScreenpunkLocalTransport
     var supportsRemoteAuthoring: Bool { cloudSupportsRemoteAuthoring && cloudBindingMatches && !cloudAuthorizationRejected }
 
     private var cloudSupportsCustomHTTP = false
+    private var cloudSupportsCustomHTTPJSONPost = false
     private var cloudSupportsPublicPageText = false
     @Published private(set) var localAgent: LocalAgentConfiguration?
     @Published private(set) var localSettings: LocalAgentSettingsModel?
@@ -1144,6 +1145,7 @@ import ScreenpunkLocalTransport
         cloudSupportsCredentialRegistration = status.credentialRegistrationVersion == 1 &&
             status.authoringCapabilities?.features.contains(AuthoringContract.credentialRegistrationFeature) == true
         cloudSupportsCustomHTTP = status.authoringCapabilities?.features.contains("custom-http-v1") == true
+        cloudSupportsCustomHTTPJSONPost = status.authoringCapabilities?.features.contains(AuthoringContract.customHTTPJSONPostFeature) == true
         cloudSupportsPublicPageText = status.authoringCapabilities?.features.contains(AuthoringContract.publicPageTextFeature) == true
         if cloudAgentReady { agentReady = true }
         let supportsSelectedPackage = cloudSupportsV2 && (!requiresPackageAssets || status.authoringCapabilities?.supportsPackageAssets == true)
@@ -1414,10 +1416,11 @@ import ScreenpunkLocalTransport
         let source = preparingV2 ? nil : screen.map { AuthoringScreen(title: $0.artifact.title, entry: $0.artifact.entry, files: $0.artifact.files.map { .init(path: $0.path, content: $0.content) }) }
         let supportsScreenData = remoteIntent == nil && (route == .local || screenDataSocketID != nil)
         let supportsCustomHTTP = remoteIntent == nil && preparingV2 && (route == .local || cloudSupportsCustomHTTP)
+        let supportsCustomHTTPJSONPost = supportsCustomHTTP && (route == .local || cloudSupportsCustomHTTPJSONPost)
         let supportsConnectionPrefill = supportsCustomHTTP && route == .cloud && cloudSupportsConnectionPrefill
         let supportsCredentialRegistration = supportsConnectionPrefill && cloudSupportsCredentialRegistration
         let supportsPublicPageText = route == .local || (preparingV2 && cloudSupportsPublicPageText)
-        let request = AuthoringRequestV1(requestID: remoteIntent?.operationID ?? UUID().uuidString, createdAt: now, deadlineAt: remoteIntent?.expiresAt ?? now + 10 * 60 * 1000, designGuidance: AuthoringContract.designGuidance(supportsScreenData: supportsScreenData, supportsCustomHTTP: supportsCustomHTTP, supportsConnectionPrefill: supportsConnectionPrefill, supportsCredentialRegistration: supportsCredentialRegistration, supportsPublicPageText: supportsPublicPageText), runtime: AuthoringContract.runtime(supportsScreenData: supportsScreenData, supportsCustomHTTP: supportsCustomHTTP, supportsConnectionPrefill: supportsConnectionPrefill, supportsCredentialRegistration: supportsCredentialRegistration, supportsPublicPageText: supportsPublicPageText), services: services, preferences: remoteIntent == nil ? library.preferences(profileID: profileID, deviceID: deviceID, screenID: screenID) : [], context: .init(profileID: profileID, deviceID: deviceID, screenID: screenID, baseRevision: screen?.revision, userRequest: text, currentScreen: source, viewport: .init(width: size.width, height: size.height, scale: scale, orientation: size.width > size.height ? "landscape" : "portrait")), delivery: .init(route: route.rawValue))
+        let request = AuthoringRequestV1(requestID: remoteIntent?.operationID ?? UUID().uuidString, createdAt: now, deadlineAt: remoteIntent?.expiresAt ?? now + 10 * 60 * 1000, designGuidance: AuthoringContract.designGuidance(supportsScreenData: supportsScreenData, supportsCustomHTTP: supportsCustomHTTP, supportsConnectionPrefill: supportsConnectionPrefill, supportsCredentialRegistration: supportsCredentialRegistration, supportsPublicPageText: supportsPublicPageText, supportsCustomHTTPJSONPost: supportsCustomHTTPJSONPost), runtime: AuthoringContract.runtime(supportsScreenData: supportsScreenData, supportsCustomHTTP: supportsCustomHTTP, supportsConnectionPrefill: supportsConnectionPrefill, supportsCredentialRegistration: supportsCredentialRegistration, supportsPublicPageText: supportsPublicPageText, supportsCustomHTTPJSONPost: supportsCustomHTTPJSONPost), services: services, preferences: remoteIntent == nil ? library.preferences(profileID: profileID, deviceID: deviceID, screenID: screenID) : [], context: .init(profileID: profileID, deviceID: deviceID, screenID: screenID, baseRevision: screen?.revision, userRequest: text, currentScreen: source, viewport: .init(width: size.width, height: size.height, scale: scale, orientation: size.width > size.height ? "landscape" : "portrait")), delivery: .init(route: route.rawValue))
         return preparingV2 ? request : try AuthoringContract.seal(request)
     }
     private func measureRequestApply(_ requestID: String, _ apply: () throws -> ApplicationReceiptV1) rethrows -> ApplicationReceiptV1 {
@@ -1714,6 +1717,7 @@ import ScreenpunkLocalTransport
         var id: String { screen.id + "/" + alias }
         let alias: String
         let declaration: CustomHTTPDeclaration
+        var sendsJSON: Bool { declaration.operations.contains { $0.method == "POST" } }
     }
     struct CustomConnectionPrompt: Identifiable {
         let id = UUID()
@@ -1764,8 +1768,9 @@ import ScreenpunkLocalTransport
         guard let status = prompt.status else { throw ConnectionFailure.permissionRequired }
         try customHTTPVault.approve(owner: prompt.owner, screenID: customHTTPApprovalScope(prompt.use.screen.id),
                                    manifest: prompt.use.manifest, alias: prompt.use.alias,
-                                   expectedGeneration: status.generation, requireOfferedAccess: true)
-        // The denied read has already returned. Keep its renderer mounted and wait for the screen's next read.
+                                   expectedGeneration: status.generation, requireOfferedAccess: true,
+                                   permitJSONPost: prompt.use.sendsJSON)
+        // The denied operation has already returned. Approval does not resend it.
         dismissCustomConnectionPrompt(prompt)
     }
 
@@ -2203,12 +2208,13 @@ import ScreenpunkLocalTransport
         requestCredentialRegistrationRemovalSync()
     }
 
-    func setCustomConnectionApproved(_ approved: Bool, use: CustomConnectionUse, owner: String, expectedGeneration: UUID?) throws {
+    func setCustomConnectionApproved(_ approved: Bool, use: CustomConnectionUse, owner: String,
+                                     expectedGeneration: UUID?, permitJSONPost: Bool = false) throws {
         try requireCurrentCustomConnection(use, owner: owner)
         if approved {
             guard let expectedGeneration else { throw ConnectionFailure.permissionRequired }
             try customHTTPVault.approve(owner: owner, screenID: customHTTPApprovalScope(use.screen.id), manifest: use.manifest, alias: use.alias,
-                                        expectedGeneration: expectedGeneration)
+                                        expectedGeneration: expectedGeneration, permitJSONPost: permitJSONPost)
         } else {
             try customHTTPVault.deny(owner: owner, screenID: customHTTPApprovalScope(use.screen.id), alias: use.alias, declaration: use.declaration)
         }
@@ -2217,7 +2223,7 @@ import ScreenpunkLocalTransport
 
     func testCustomConnection(_ use: CustomConnectionUse, owner: String) async throws {
         try requireCurrentCustomConnection(use, owner: owner)
-        guard let operation = use.declaration.operations.first(where: { $0.parameters.isEmpty }) else {
+        guard let operation = use.declaration.operations.first(where: { $0.method == "GET" && $0.parameters.isEmpty }) else {
             throw DeviceError.message("This connection does not have a simple read to test.")
         }
         let runtime = CustomHTTPDeviceRuntime(owner: owner, screenID: customHTTPApprovalScope(use.screen.id), manifest: use.manifest, vault: customHTTPVault)
@@ -3107,6 +3113,7 @@ import ScreenpunkLocalTransport
         remoteAuthoringPump.cancel()
         credentialRegistrationRemovalTask?.cancel()
         cloudSupportsCustomHTTP = false
+        cloudSupportsCustomHTTPJSONPost = false
         cloudSupportsPublicPageText = false
         library = nil; cloudAuthoring = nil; localAuthoring = nil; localTransport = nil; cloudAuthoringV2 = nil; localAuthoringV2 = nil; localTransportV2 = nil; localTransportAuthoringProfileID = nil; cloudAgentReady = false; cloudSupportsV2 = false; pendingID = nil; pendingScreenID = nil; consumedID = nil
         cancelledLocally = []; inventorySignature = nil

@@ -41,6 +41,10 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
                  secretDeclarationDigest == (try? CredentialRegistrationContext.declarationDigest(declaration)))
         }
 
+        var supportsJSONPost: Bool {
+            origin.hasPrefix("https://") && secret != nil && credentialRegistrationID == nil
+        }
+
         var status: Status {
             .init(fields: fields, generation: generation, certificatePin: certificatePin, hasCredential: secret != nil, allowInsecureHTTP: allowInsecureHTTP, origin: origin)
         }
@@ -51,6 +55,7 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
         var declarationDigest: String
         var serviceGeneration: UUID
         var generation: UUID
+        var permitsJSONPost: Bool?
     }
 
     private struct StoredRegistration: Codable {
@@ -91,7 +96,8 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
 
     public func status(owner: String, declaration: CustomHTTPDeclaration) -> Status? {
         Self.lock.lock(); defer { Self.lock.unlock() }
-        guard let service = try? load()[owner]?.services[declaration.id], service.matches(declaration) else { return nil }
+        guard let service = try? load()[owner]?.services[declaration.id], service.matches(declaration),
+              !declaration.operations.contains(where: { $0.method == "POST" }) || service.supportsJSONPost else { return nil }
         return service.status
     }
 
@@ -266,7 +272,9 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
             guard let value = fields[field.id] else { throw ConnectionFailure.validationFailed }
             try field.validate(value)
         }
-        let origin = try CustomHTTPDestination.origin(originValue, allowInsecureHTTP: allowInsecureHTTP)
+        let usesPOST = declaration.operations.contains { $0.method == "POST" }
+        let origin = try CustomHTTPDestination.origin(originValue, allowInsecureHTTP: allowInsecureHTTP && !usesPOST)
+        guard !usesPOST || registration == nil else { throw ConnectionFailure.permissionRequired }
 
         if let certificatePin, certificatePin.origin != origin {
             throw ConnectionFailure.validationFailed
@@ -369,7 +377,7 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
     }
 
     public func approve(owner: String, screenID: String, manifest: DashboardManifest, alias: String, expectedGeneration: UUID? = nil,
-                        requireOfferedAccess: Bool = false) throws {
+                        requireOfferedAccess: Bool = false, permitJSONPost: Bool = false) throws {
         guard !screenID.isEmpty, let declaration = manifest.connections.first(where: { $0.alias == alias })?.customHTTP else {
             throw ConnectionFailure.permissionRequired
         }
@@ -381,26 +389,35 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
             throw ConnectionFailure.permissionRequired
         }
         guard expectedGeneration == nil || service.generation == expectedGeneration else { throw ConnectionFailure.permissionRequired }
+        let usesPOST = declaration.operations.contains { $0.method == "POST" }
+        if usesPOST {
+            guard permitJSONPost, expectedGeneration == service.generation, service.supportsJSONPost else {
+                throw ConnectionFailure.permissionRequired
+            }
+        }
         if requireOfferedAccess,
            account.denials?[screenID]?[alias] == declarationDigest + "/" + service.generation.uuidString {
             throw ConnectionFailure.permissionRequired
         }
         if let existing = account.approvals[screenID]?[alias],
-           existing.declarationDigest == declarationDigest, existing.serviceGeneration == service.generation { return }
+           existing.declarationDigest == declarationDigest, existing.serviceGeneration == service.generation,
+           !usesPOST || existing.permitsJSONPost == true { return }
         try Self.recordApproval(screenID: screenID, alias: alias, serviceID: declaration.id,
-                                declarationDigest: declarationDigest, generation: service.generation, in: &account)
+                                declarationDigest: declarationDigest, generation: service.generation,
+                                permitsJSONPost: usesPOST ? true : nil, in: &account)
         accounts[owner] = account
         try persist(accounts)
     }
 
     private static func recordApproval(screenID: String, alias: String, serviceID: String, declarationDigest: String,
-                                       generation: UUID, in account: inout Account) throws {
+                                       generation: UUID, permitsJSONPost: Bool? = nil, in account: inout Account) throws {
         guard account.approvals[screenID] != nil || account.approvals.count < 256 else {
             throw ConnectionFailure.sizeLimit
         }
         var dashboard = account.approvals[screenID] ?? [:]
         guard dashboard[alias] != nil || dashboard.count < 32 else { throw ConnectionFailure.sizeLimit }
-        dashboard[alias] = .init(serviceID: serviceID, declarationDigest: declarationDigest, serviceGeneration: generation, generation: UUID())
+        dashboard[alias] = .init(serviceID: serviceID, declarationDigest: declarationDigest,
+                                 serviceGeneration: generation, generation: UUID(), permitsJSONPost: permitsJSONPost)
         account.approvals[screenID] = dashboard
         account.denials?[screenID]?[alias] = nil
     }
@@ -477,6 +494,11 @@ public final class CustomHTTPDeviceVault: @unchecked Sendable {
         guard let account = try load()[owner], let service = account.services[declaration.id], service.matches(declaration),
               let approval = account.approvals[screenID]?[alias], approval.declarationDigest == declarationDigest,
               approval.serviceGeneration == service.generation else { throw ConnectionFailure.permissionRequired }
+        if declaration.operations.contains(where: { $0.method == "POST" }) {
+            guard approval.permitsJSONPost == true, service.supportsJSONPost else {
+                throw ConnectionFailure.permissionRequired
+            }
+        }
         return .init(origin: service.origin, certificatePin: service.certificatePin, secret: service.secret, fields: service.fields, generation: approval.generation)
     }
 
@@ -550,7 +572,30 @@ enum CustomHTTPDestination {
     }
 }
 
-/// Executes declared GET JSON operations without accepting endpoints, headers or secrets from WebKit.
+public enum CustomHTTPPostFailure: String, Error, Sendable {
+    case modelUnavailable = "upstream_model_unavailable"
+    case unauthorized = "upstream_unauthorized"
+    case unavailable = "upstream_unavailable"
+    case rejected = "upstream_rejected"
+
+    init(response: HTTPTransportResponse) {
+        switch response.status {
+        case 401, 403: self = .unauthorized
+        case 408, 429, 500...599: self = .unavailable
+        default:
+            let envelope = try? JSONDecoder().decode(ErrorEnvelope.self, from: response.body)
+            self = (400...499).contains(response.status) &&
+                ["model_not_found", "model_unavailable"].contains(envelope?.error.code ?? "") ? .modelUnavailable : .rejected
+        }
+    }
+
+    private struct ErrorEnvelope: Decodable {
+        struct Detail: Decodable { let code: String? }
+        let error: Detail
+    }
+}
+
+/// Executes declared JSON operations without accepting endpoints, headers or secrets from WebKit.
 public struct CustomHTTPDeviceRuntime: Sendable {
     private let owner: String
     private let screenID: String
@@ -577,13 +622,25 @@ public struct CustomHTTPDeviceRuntime: Sendable {
         manifest.connections.contains { $0.alias == alias && $0.customHTTP != nil }
     }
 
-    public func request(alias: String, operation: String, parameters: [String: String]) async throws -> Data {
-        try await performRequest(alias: alias, operation: operation, parameters: parameters, diagnose: false)
+    func permitsJSONPost(alias: String, operation: String) -> Bool {
+        manifest.connections.first(where: { $0.alias == alias })?.customHTTP?.operations
+            .contains { $0.name == operation && $0.method == "POST" } == true
     }
 
-    /// Runs the same approved operation as the screen. Only the native test receives diagnostics.
+    public func request(alias: String, operation: String, parameters: [String: String]) async throws -> Data {
+        try await performRequest(alias: alias, operation: operation, parameters: parameters, postBody: nil, diagnose: false)
+    }
+
+    public func requestJSONPost(alias: String, operation name: String, body: Any) async throws -> Data {
+        guard let operation = manifest.connections.first(where: { $0.alias == alias })?.customHTTP?.operations
+            .first(where: { $0.name == name && $0.method == "POST" }) else { throw ConnectionFailure.permissionRequired }
+        let encoded = try operation.validatedJSONBody(body)
+        return try await performRequest(alias: alias, operation: name, parameters: [:], postBody: encoded, diagnose: false)
+    }
+
+    /// Runs an approved GET. Only the native test receives diagnostics.
     public func test(alias: String, operation: String) async throws {
-        do { _ = try await performRequest(alias: alias, operation: operation, parameters: [:], diagnose: true) }
+        do { _ = try await performRequest(alias: alias, operation: operation, parameters: [:], postBody: nil, diagnose: true) }
         catch let failure as ConnectionFailure {
             switch failure {
             case .permissionRequired: throw CustomHTTPConnectionTestFailure.screenAccessRequired
@@ -597,9 +654,11 @@ public struct CustomHTTPDeviceRuntime: Sendable {
         }
     }
 
-    private func performRequest(alias: String, operation: String, parameters: [String: String], diagnose: Bool) async throws -> Data {
+    private func performRequest(alias: String, operation: String, parameters: [String: String],
+                                postBody: Data?, diagnose: Bool) async throws -> Data {
         guard let declaration = manifest.connections.first(where: { $0.alias == alias })?.customHTTP,
-              let operation = declaration.operations.first(where: { $0.name == operation }) else {
+              let operation = declaration.operations.first(where: { $0.name == operation }),
+              operation.method == (postBody == nil ? "GET" : "POST") else {
             throw ConnectionFailure.permissionRequired
         }
         try declaration.validate(alias: alias)
@@ -610,6 +669,10 @@ public struct CustomHTTPDeviceRuntime: Sendable {
             throw ConnectionFailure.permissionRequired
         }
         let approval = try vault.authorized(owner: owner, screenID: screenID, alias: alias, declaration: declaration)
+        if let postBody, let token = approval.secret,
+           let body = try? JSONSerialization.jsonObject(with: postBody), Self.contains(token, in: body) {
+            throw ConnectionFailure.permissionRequired
+        }
         let query = try Self.query(operation: operation, fields: approval.fields, parameters: parameters)
         let url = try CustomHTTPDestination.url(origin: approval.origin, path: operation.path, query: query,
                                                 resolver: resolver, diagnose: diagnose)
@@ -617,18 +680,26 @@ public struct CustomHTTPDeviceRuntime: Sendable {
         try checkApproval(alias: alias, declaration: declaration, generation: approval.generation)
         var headers = ["Accept": "application/json"]
         if let token = approval.secret { headers["Authorization"] = "Bearer \(token)" }
-        // A fresh session binds every TLS challenge and pooled connection to this one pin.
-        let requestTransport: any HTTPTransport = approval.certificatePin.map {
-            URLSessionHTTPTransport(privateRequests: true, certificatePin: $0)
-        } ?? transport
-        let request = AuthorizedHTTPRequest(url: url, method: "GET", headers: headers, body: nil,
-                                            timeout: TimeInterval(ConnectionBounds.httpTimeoutSeconds),
-                                            maxBytes: ConnectionBounds.httpResponseBytes)
-        let result: HTTPTransportResponse
-        if diagnose, let native = requestTransport as? URLSessionHTTPTransport {
-            result = try await native.send(request, diagnose: true)
+        let bounds = postBody == nil ? HTTPAdapterBounds.production :
+            HTTPAdapterBounds(timeoutSeconds: 60, maxResponseBytes: ConnectionBounds.httpResponseBytes)
+        // A fresh session binds TLS trust to this pin and gives POST its own bounded resource timeout.
+        let requestTransport: any HTTPTransport
+        if approval.certificatePin != nil || (postBody != nil && transport is URLSessionHTTPTransport) {
+            requestTransport = URLSessionHTTPTransport(bounds: bounds, privateRequests: true, certificatePin: approval.certificatePin)
         } else {
-            result = try await requestTransport.send(request)
+            requestTransport = transport
+        }
+        let request = AuthorizedHTTPRequest(url: url, method: operation.method, headers: headers, body: postBody,
+                                            timeout: bounds.timeoutSeconds, maxBytes: bounds.maxResponseBytes)
+        let result: HTTPTransportResponse
+        do {
+            if let native = requestTransport as? URLSessionHTTPTransport, diagnose || postBody != nil {
+                result = try await native.send(request, diagnose: diagnose, preventBodyReplay: postBody != nil)
+            } else {
+                result = try await requestTransport.send(request)
+            }
+        } catch ConnectionFailure.deviceOffline where postBody != nil {
+            throw CustomHTTPPostFailure.unavailable
         }
         try Task.checkCancellation()
         try checkApproval(alias: alias, declaration: declaration, generation: approval.generation)
@@ -642,8 +713,13 @@ public struct CustomHTTPDeviceRuntime: Sendable {
             }
         }
         guard !(300...399).contains(result.status) else { throw ConnectionFailure.deniedEgress }
-        guard (200...299).contains(result.status) else { throw ConnectionFailure.deviceOffline }
-        guard result.body.count <= ConnectionBounds.httpResponseBytes else { throw ConnectionFailure.sizeLimit }
+        if postBody != nil {
+            guard result.body.count <= ConnectionBounds.httpResponseBytes else { throw ConnectionFailure.sizeLimit }
+            guard (200...299).contains(result.status) else { throw CustomHTTPPostFailure(response: result) }
+        } else {
+            guard (200...299).contains(result.status) else { throw ConnectionFailure.deviceOffline }
+            guard result.body.count <= ConnectionBounds.httpResponseBytes else { throw ConnectionFailure.sizeLimit }
+        }
         guard let json = try? JSONSerialization.jsonObject(with: result.body, options: .fragmentsAllowed) else {
             if diagnose { throw CustomHTTPConnectionTestFailure.invalidResponse }
             throw ConnectionFailure.validationFailed

@@ -83,7 +83,7 @@ final class HomeAssistantWebBridge: NSObject, WKScriptMessageHandler {
 
     func status(_ value: [String: Any]) {
         dispatch(["protocolVersion": 1, "id": "runtime-status", "kind": "event", "method": "runtime.onStatus",
-                  "value": ["active": active, "navigation": value, "homeAssistantTransport": "websocket-with-http", "homeAssistantServiceCalls": 1, "cameraPlayback": 1, "publicReadHTTP": 1, "publicPageText": publicReads?.allowsPageText == true ? 1 : 0, "customHTTP": customHTTP == nil ? 0 : 1, "googleCalendar": 1, "appleMaps": 1, "appleMapsInteractive": 1, "appleMapsTap": 1, "appleMapsLocation": 1, "persistentState": 1, "persistentStateWritable": stateReadOnly ? 0 : 1, "screenData": screenData == nil ? 0 : 1, "googleTVRemote": 1, "googleTVVoice": 1, "googleTVDirectChannels": 1, "googleTVDirectPower": 1, "macIsRuntimeProxy": false]])
+                  "value": ["active": active, "navigation": value, "homeAssistantTransport": "websocket-with-http", "homeAssistantServiceCalls": 1, "cameraPlayback": 1, "publicReadHTTP": 1, "publicPageText": publicReads?.allowsPageText == true ? 1 : 0, "customHTTP": customHTTP == nil ? 0 : 1, "customHTTPJSONPost": customHTTP == nil ? 0 : 1, "googleCalendar": 1, "appleMaps": 1, "appleMapsInteractive": 1, "appleMapsTap": 1, "appleMapsLocation": 1, "persistentState": 1, "persistentStateWritable": stateReadOnly ? 0 : 1, "screenData": screenData == nil ? 0 : 1, "googleTVRemote": 1, "googleTVVoice": 1, "googleTVDirectChannels": 1, "googleTVDirectPower": 1, "macIsRuntimeProxy": false]])
     }
 
     deinit { let cameras = cameras; let interactiveMaps = interactiveMaps; Task { @MainActor in cameras?.cancel(); interactiveMaps.cancel() } }
@@ -106,7 +106,7 @@ final class HomeAssistantWebBridge: NSObject, WKScriptMessageHandler {
         switch method {
         case "runtime.ready": reply(id: id, value: NSNull())
         case "runtime.onStatus":
-            reply(id: id, value: ["publicReadHTTP": 1, "publicPageText": publicReads?.allowsPageText == true ? 1 : 0, "customHTTP": customHTTP == nil ? 0 : 1, "appleMaps": 1, "appleMapsInteractive": 1, "appleMapsTap": 1, "appleMapsLocation": 1, "persistentState": 1, "persistentStateWritable": stateReadOnly ? 0 : 1, "screenData": screenData == nil ? 0 : 1]); status(navigation?.status ?? [:])
+            reply(id: id, value: ["publicReadHTTP": 1, "publicPageText": publicReads?.allowsPageText == true ? 1 : 0, "customHTTP": customHTTP == nil ? 0 : 1, "customHTTPJSONPost": customHTTP == nil ? 0 : 1, "appleMaps": 1, "appleMapsInteractive": 1, "appleMapsTap": 1, "appleMapsLocation": 1, "persistentState": 1, "persistentStateWritable": stateReadOnly ? 0 : 1, "screenData": screenData == nil ? 0 : 1]); status(navigation?.status ?? [:])
         case "navigation.get": reply(id: id, value: navigation?.status ?? ["pageId": "default"])
         case "navigation.open":
             guard let parameters = body["parameters"] as? [String: String], parameters.count == 1,
@@ -151,15 +151,34 @@ final class HomeAssistantWebBridge: NSObject, WKScriptMessageHandler {
             tasks.removeValue(forKey: subscription)?.cancel(); reply(id: id, value: NSNull())
         case "connections.request", "connections.subscribe":
             guard let alias = body["alias"] as? String, let operation = body["operation"] as? String,
-                  let parameters = body["parameters"] as? [String: String], tasks.count < 16, tasks[id] == nil else {
+                  tasks.count < 16, tasks[id] == nil else {
                 reply(id: id, error: "validation_failed"); return
             }
             let subscribe = body["method"] as? String == "connections.subscribe"
             let generation = documentGeneration
             if let customHTTP, customHTTP.declares(alias: alias) {
                 guard !subscribe, active else { reply(id: id, error: "permission_required"); return }
-                handleCustomHTTP(customHTTP, id: id, alias: alias, operation: operation, parameters: parameters)
+                if customHTTP.permitsJSONPost(alias: alias, operation: operation) {
+                    guard Set(body.keys).isSubset(of: ["protocolVersion", "kind", "id", "method", "alias", "operation", "parameters"]),
+                          let parameters = body["parameters"] as? [String: Any],
+                          parameters.count == 1, let jsonBody = parameters["body"] else {
+                        reply(id: id, error: "validation_failed"); return
+                    }
+                    handleCustomHTTP(id: id) {
+                        try await customHTTP.requestJSONPost(alias: alias, operation: operation, body: jsonBody)
+                    }
+                } else {
+                    guard let parameters = body["parameters"] as? [String: String] else {
+                        reply(id: id, error: "validation_failed"); return
+                    }
+                    handleCustomHTTP(id: id) {
+                        try await customHTTP.request(alias: alias, operation: operation, parameters: parameters)
+                    }
+                }
                 return
+            }
+            guard let parameters = body["parameters"] as? [String: String] else {
+                reply(id: id, error: "validation_failed"); return
             }
             if alias == "appleMaps" {
                 guard !subscribe, active, let manifest = navigation?.manifest ?? mapManifest,
@@ -318,8 +337,7 @@ final class HomeAssistantWebBridge: NSObject, WKScriptMessageHandler {
         customHTTPTasks.removeAll()
     }
 
-    private func handleCustomHTTP(_ runtime: CustomHTTPDeviceRuntime, id: String, alias: String,
-                                  operation: String, parameters: [String: String]) {
+    private func handleCustomHTTP(id: String, run: @escaping @MainActor () async throws -> Data) {
         guard customHTTPTasks[id] == nil else { return }
         guard customHTTPTasks.count < 4 else { reply(id: id, error: "size_limit"); return }
         let request = UUID()
@@ -330,13 +348,18 @@ final class HomeAssistantWebBridge: NSObject, WKScriptMessageHandler {
                 if self.customHTTPTasks[id]?.generation == request { self.customHTTPTasks.removeValue(forKey: id) }
             }
             do {
-                let data = try await runtime.request(alias: alias, operation: operation, parameters: parameters)
-                guard self.active, self.current(document) else { return }
+                let data = try await run()
+                guard self.active, self.current(document), !Task.isCancelled else { return }
                 let value = try JSONSerialization.jsonObject(with: data, options: .fragmentsAllowed)
                 self.onHealth(true)
                 self.reply(id: id, value: value)
             } catch {
-                guard self.active, self.current(document) else { return }
+                guard self.active, self.current(document), !Task.isCancelled else { return }
+                if let failure = error as? CustomHTTPPostFailure {
+                    self.onHealth(failure != .unavailable)
+                    self.reply(id: id, error: failure.rawValue)
+                    return
+                }
                 let failure = error as? ConnectionFailure ?? .deviceOffline
                 // Local access review does not tell us whether the source is reachable.
                 if failure != .permissionRequired { self.onHealth(false) }
